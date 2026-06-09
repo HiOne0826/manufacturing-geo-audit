@@ -1,0 +1,14 @@
+[Unit]
+Description=Manufacturing GEO Audit Workbench
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/manufacturing-geo-audit
+ExecStart=/usr/bin/python3 /opt/manufacturing-geo-audit/app.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
