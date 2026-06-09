@@ -1,0 +1,2 @@
+run_id,batch_id,question_id,provider,model,model_version,search_enabled,temperature,requested_at,response_text,citations_json,latency_ms,cost_estimate,status,error_message
+example-run-001,batch-001,Q001,openai,gpt-4.1,,false,0,2026-06-05T00:00:00+08:00,"示例回答","[]",1200,0.00,success,

@@ -1,0 +1,6 @@
+question_id,industry,product_category,question_type,question,target_brand,competitor_brands,locale,priority,notes
+Q001,制造业,工业设备,brand_direct,请介绍一下{target_brand}这家公司和它的主要产品,{target_brand},{competitor_brands},zh-CN,high,品牌直问
+Q002,制造业,工业设备,category_recommendation,如果我要采购{product_category}，有哪些值得优先了解的品牌？,{target_brand},{competitor_brands},zh-CN,high,品类推荐
+Q003,制造业,工业设备,procurement,选择{product_category}供应商时应该重点比较哪些因素？有哪些公司可以参考？,{target_brand},{competitor_brands},zh-CN,medium,采购决策
+Q004,制造业,工业设备,comparison,{target_brand}和{competitor_brand}相比，各自更适合什么采购场景？,{target_brand},{competitor_brands},zh-CN,high,竞品对比
+Q005,制造业,工业设备,technical,{product_category}常见技术参数有哪些？哪些品牌资料比较完整？,{target_brand},{competitor_brands},zh-CN,medium,技术参数
