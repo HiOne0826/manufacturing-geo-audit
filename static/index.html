@@ -9,7 +9,7 @@
         window.location.replace(`http://127.0.0.1:8765${window.location.hash || ""}`);
       }
     </script>
-    <link rel="stylesheet" href="./styles.css?v=20260608-question-autosave" />
+    <link rel="stylesheet" href="./styles.css?v=20260609-sampling-progress" />
   </head>
   <body>
     <aside class="sidebar">
@@ -219,7 +219,7 @@
                 <div>
                   <span class="sampling-step-badge">01</span>
                   <h3>采样设置</h3>
-                  <p>先确定本次测试项目、重复次数和联网 / 思考策略。</p>
+                  <p>先确定本次测试项目和重复次数；模型级参数放到下方逐个设置。</p>
                 </div>
               </div>
               <div class="form-grid">
@@ -232,47 +232,6 @@
                   <span class="field-title">重复次数</span>
                   <span class="field-help">同一问题对同一模型重复运行的次数，用于观察稳定性。</span>
                   <input id="repeatCount" type="number" min="1" max="10" value="1" />
-                </label>
-                <label class="sampling-field">
-                  <span class="field-title">Temperature</span>
-                  <span class="field-help">控制回答随机性；0 更稳定，数值越高越发散。</span>
-                  <input id="temperature" type="number" min="0" max="1" step="0.1" value="0" />
-                </label>
-                <label class="sampling-field">
-                  <span class="field-title">联网搜索策略</span>
-                  <span class="field-help">控制是否请求模型调用搜索能力；不支持的模型会自动跳过。</span>
-                  <select id="searchMode">
-                    <option value="auto">自动</option>
-                    <option value="force">尽量强制搜索</option>
-                    <option value="off">关闭</option>
-                  </select>
-                </label>
-                <label class="sampling-field">
-                  <span class="field-title">深度思考</span>
-                  <span class="field-help">控制是否启用推理模式，用于复杂判断和推荐理由。</span>
-                  <select id="thinkingType">
-                    <option value="disabled">关闭</option>
-                    <option value="auto">自动</option>
-                    <option value="enabled">开启</option>
-                  </select>
-                </label>
-                <label class="sampling-field">
-                  <span class="field-title">推理强度</span>
-                  <span class="field-help">设置模型思考档位；留空时使用模型库中的默认配置。</span>
-                  <select id="reasoningEffort">
-                    <option value="">模型默认</option>
-                    <option value="none">none</option>
-                    <option value="minimal">minimal</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="xhigh">xhigh</option>
-                  </select>
-                </label>
-                <label class="sampling-field">
-                  <span class="field-title">思考预算</span>
-                  <span class="field-help">部分模型支持 token 预算；0 默认，-1 通常表示动态预算。</span>
-                  <input id="thinkingBudget" type="number" min="-1" step="1" placeholder="0 / -1 / 1024" />
                 </label>
               </div>
             </div>
@@ -291,6 +250,15 @@
                 <div class="sampling-runbar-copy">
                   <strong>执行本次采样</strong>
                   <p>确认已选择模型与模式后，再启动本轮采样。</p>
+                </div>
+                <div id="samplingProgressPanel" class="sampling-progress-panel">
+                  <div class="sampling-progress-meta">
+                    <strong id="samplingProgressLabel">等待采样</strong>
+                    <span id="samplingProgressText">0%</span>
+                  </div>
+                  <div class="sampling-progress-track">
+                    <div id="samplingProgressBar" class="sampling-progress-bar"></div>
+                  </div>
                 </div>
                 <div class="sampling-actions">
                   <span id="runStatus" class="run-status-pill">待启动</span>
@@ -312,6 +280,7 @@
                   <a id="exportSummary" class="button secondary" href="#">导出摘要指标 Excel</a>
                 </div>
               </div>
+              <div id="exportFeedback" class="export-feedback hidden"></div>
               <div class="table-wrap question-table-wrap">
                 <table id="runsTable"></table>
               </div>
@@ -405,6 +374,6 @@
     </dialog>
 
     <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
-    <script src="./app.js?v=20260608-sampling-runtime-config"></script>
+    <script src="./app.js?v=20260609-sampling-progress"></script>
   </body>
 </html>

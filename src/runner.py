@@ -15,7 +15,7 @@ from .db import (
 from .evaluator import evaluate_answer
 
 
-def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
+def estimate_batch_total(conn, project_id: int, config: dict[str, Any]) -> int:
     project = get_project(conn, project_id)
     if not project:
         raise ValueError("项目不存在")
@@ -25,19 +25,34 @@ def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
 
     providers = config.get("models") or []
     repeat_count = max(1, min(int(config.get("repeat_count", 1)), 10))
-    temperature = float(config.get("temperature", 0))
-    search_mode = str(config.get("search_mode", "auto")).strip() or "auto"
-    thinking_type = str(config.get("thinking_type", "disabled")).strip() or "disabled"
-    reasoning_effort = str(config.get("reasoning_effort", "")).strip()
-    raw_budget = config.get("thinking_budget")
-    thinking_budget = None
-    if raw_budget not in (None, "", "null"):
-        thinking_budget = int(raw_budget)
-    batch_id = f"batch-{uuid.uuid4().hex[:10]}"
-    total = 0
-    failed = 0
     if not providers:
         raise ValueError("请至少选择一个模型")
+    return len(questions) * len(providers) * repeat_count
+
+
+def run_batch(
+    conn,
+    project_id: int,
+    config: dict[str, Any],
+    *,
+    batch_id: str | None = None,
+    progress_callback=None,
+) -> dict[str, Any]:
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    questions = list_questions(conn, project_id)
+    if not questions:
+        raise ValueError("项目还没有问题库")
+
+    providers = config.get("models") or []
+    repeat_count = max(1, min(int(config.get("repeat_count", 1)), 10))
+    if not providers:
+        raise ValueError("请至少选择一个模型")
+    batch_id = batch_id or f"batch-{uuid.uuid4().hex[:10]}"
+    total_expected = len(questions) * len(providers) * repeat_count
+    total = 0
+    failed = 0
 
     for question in questions:
         for provider_cfg in providers:
@@ -56,11 +71,20 @@ def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
                     runtime_model_config["model_version"] = runtime_model_version
                 provider = runtime_model_config.get("provider", "")
                 model = runtime_model_config.get("model", "")
-                search_enabled = bool(provider_cfg.get("search_enabled", False)) and search_mode != "off"
+                model_search_mode = str(provider_cfg.get("search_mode", config.get("search_mode", "auto"))).strip() or "auto"
+                search_enabled = bool(provider_cfg.get("search_enabled", False)) and model_search_mode != "off"
                 model_thinking_enabled = bool(provider_cfg.get("thinking_enabled", False))
-                model_thinking_type = thinking_type if model_thinking_enabled else "disabled"
-                model_reasoning_effort = reasoning_effort if model_thinking_enabled else ""
-                model_thinking_budget = thinking_budget if model_thinking_enabled else None
+                model_thinking_type = str(
+                    provider_cfg.get("thinking_type", config.get("thinking_type", "enabled" if model_thinking_enabled else "disabled"))
+                ).strip() or ("enabled" if model_thinking_enabled else "disabled")
+                model_reasoning_effort = (
+                    str(provider_cfg.get("reasoning_effort", config.get("reasoning_effort", ""))).strip() if model_thinking_enabled else ""
+                )
+                model_temperature = float(provider_cfg.get("temperature", config.get("temperature", 0)) or 0)
+                raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
+                model_thinking_budget = None
+                if model_thinking_enabled and raw_budget not in (None, "", "null"):
+                    model_thinking_budget = int(raw_budget)
                 base = {
                     "run_id": run_id,
                     "batch_id": batch_id,
@@ -69,8 +93,8 @@ def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
                     "provider": provider,
                     "model": model or provider,
                     "search_enabled": search_enabled,
-                    "search_mode": search_mode if search_enabled else "off",
-                    "temperature": temperature,
+                    "search_mode": model_search_mode if search_enabled else "off",
+                    "temperature": model_temperature,
                     "repeat_index": repeat_index,
                     "thinking_type": model_thinking_type,
                     "reasoning_effort": model_reasoning_effort,
@@ -82,9 +106,9 @@ def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
                         runtime_model_config,
                         question["question"],
                         search_enabled,
-                        temperature,
+                        model_temperature,
                         {
-                            "search_mode": search_mode,
+                            "search_mode": model_search_mode,
                             "thinking_type": model_thinking_type,
                             "reasoning_effort": model_reasoning_effort,
                             "thinking_budget": model_thinking_budget,
@@ -133,5 +157,20 @@ def run_batch(conn, project_id: int, config: dict[str, Any]) -> dict[str, Any]:
                             "raw_response": {},
                         },
                     )
+                conn.commit()
                 total += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "batch_id": batch_id,
+                            "total": total_expected,
+                            "completed": total,
+                            "failed": failed,
+                            "success": total - failed,
+                            "provider": provider,
+                            "model": model or provider,
+                            "question_id": question["id"],
+                            "repeat_index": repeat_index,
+                        }
+                    )
     return {"batch_id": batch_id, "total": total, "failed": failed, "success": total - failed}

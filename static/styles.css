@@ -814,8 +814,8 @@ td textarea {
 
 .sampling-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
   max-height: none;
   overflow: auto;
 }
@@ -864,7 +864,7 @@ td textarea {
 }
 
 .sampling-setup-stage .form-grid {
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
 }
 
 .sampling-field {
@@ -931,6 +931,47 @@ td textarea {
   font-size: 13px;
 }
 
+.sampling-progress-panel {
+  flex: 1 1 320px;
+  display: grid;
+  gap: 8px;
+  min-width: 240px;
+}
+
+.sampling-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sampling-progress-meta strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.sampling-progress-meta span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sampling-progress-track {
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dfe9f8;
+}
+
+.sampling-progress-bar {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2f6fed 0%, #5a8cff 100%);
+  transition: width 0.24s ease;
+}
+
 .sampling-actions {
   display: flex;
   align-items: center;
@@ -979,14 +1020,97 @@ td textarea {
   font-size: 12px;
 }
 
+.export-feedback {
+  padding: 10px 12px;
+  border: 1px solid #dbe7ff;
+  border-radius: 10px;
+  background: #f8fbff;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .sampling-card {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  overflow: hidden;
+}
+
+.sampling-card[open] {
+  border-color: #cbdcff;
+  box-shadow: 0 14px 28px rgba(47, 111, 237, 0.08);
+}
+
+.sampling-card-summary {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.sampling-card-summary::-webkit-details-marker {
+  display: none;
+}
+
+.sampling-card-body {
   display: grid;
   gap: 12px;
-  align-content: start;
-  padding: 14px;
-  border: 1px solid var(--line);
+  padding: 0 16px 16px;
+  border-top: 1px solid #e7eef9;
+}
+
+.sampling-card-title {
+  display: grid;
+  gap: 10px;
+}
+
+.sampling-quick-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sampling-quick-stat {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #e2ebf7;
   border-radius: 10px;
-  background: var(--panel-muted);
+  background: #fff;
+}
+
+.sampling-quick-stat span {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.sampling-quick-stat strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.sampling-default-note {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed #d4e1f7;
+  border-radius: 10px;
+  background: #f9fbff;
+}
+
+.sampling-default-note span {
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sampling-default-note strong {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .sampling-meta,
@@ -1100,6 +1224,10 @@ td textarea {
   opacity: 0.45;
 }
 
+.sampling-card .sampling-mode {
+  min-height: 36px;
+}
+
 .status-dot {
   width: 10px;
   height: 10px;
@@ -1128,6 +1256,10 @@ td textarea {
   }
 
   .sampling-runtime-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sampling-quick-stats {
     grid-template-columns: 1fr;
   }
 

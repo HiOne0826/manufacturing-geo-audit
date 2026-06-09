@@ -4,11 +4,33 @@ const state = {
   models: [],
   presets: {},
   samplingDrafts: {},
+  samplingJob: null,
   selectedProjectId: null,
   activePage: "projects",
 };
 
 const questionAutosaveTimers = new Map();
+
+const PROVIDER_SAMPLING_DEFAULTS = {
+  openai: {
+    temperature: "1",
+    reasoning_effort: "medium",
+    defaults_note: "temperature 默认 1；reasoning.effort 默认 medium。",
+  },
+  gemini: {
+    thinking_budget: "0",
+    defaults_note: "thinkingBudget 设为 0 表示关闭思考；留空时走模型动态默认。",
+  },
+  qwen: {
+    reasoning_effort: "",
+    search_strategy: "turbo",
+    defaults_note: "联网搜索默认走 enable_search；search_strategy 预填 turbo 便于采样。",
+  },
+  kimi: {
+    temperature: "1",
+    defaults_note: "Kimi K2.5 联网搜索与深度思考不同时开启；当前运行温度固定按 1 处理。",
+  },
+};
 
 const QUESTION_TEMPLATE_ROWS = [
   {
@@ -90,16 +112,22 @@ function renderCitationList(row) {
 
 function getSamplingDraft(modelId) {
   if (!state.samplingDrafts[modelId]) {
+    const row = state.models.find((item) => Number(item.id) === Number(modelId)) || {};
+    const defaults = PROVIDER_SAMPLING_DEFAULTS[row.provider] || {};
     state.samplingDrafts[modelId] = {
       runtime_model: "",
       runtime_model_version: "",
+      expanded: false,
+      temperature: defaults.temperature || "",
+      reasoning_effort: defaults.reasoning_effort || "",
+      thinking_budget: defaults.thinking_budget || "",
       search_sources: "",
       search_limit: "",
       search_max_keyword: "",
       search_user_location: "",
       search_site_filter: "",
       search_time_filter: "",
-      search_strategy: "",
+      search_strategy: defaults.search_strategy || "",
       search_freshness: "",
       search_prompt_intervene: "",
       search_enable_source: false,
@@ -108,6 +136,36 @@ function getSamplingDraft(modelId) {
     };
   }
   return state.samplingDrafts[modelId];
+}
+
+function getProviderSamplingDefaults(row) {
+  return PROVIDER_SAMPLING_DEFAULTS[row.provider] || {};
+}
+
+function readingOrFallback(value, fallback = "模型默认") {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+}
+
+function getReasoningChoices(row) {
+  if (String(row.reasoning_levels || "").includes("budget:")) {
+    return '<option value="">模型默认</option>';
+  }
+  const levels = String(row.reasoning_levels || "")
+    .split(/[;,\n/|]+/)
+    .map((item) => item.trim())
+    .filter((item) => item && !item.startsWith("budget:") && !["按模型能力", "disabled", "enabled", "disabled + low", "enabled + low"].includes(item));
+  const unique = [...new Set(levels)];
+  const base = ['<option value="">模型默认</option>'];
+  for (const level of unique) {
+    base.push(`<option value="${escapeHtml(level)}">${escapeHtml(level)}</option>`);
+  }
+  if (unique.length < 2) {
+    for (const level of ["none", "minimal", "low", "medium", "high", "xhigh"]) {
+      if (!unique.includes(level)) base.push(`<option value="${level}">${level}</option>`);
+    }
+  }
+  return base.join("");
 }
 
 function parseModelVersionOptions(row) {
@@ -157,8 +215,122 @@ function setExportLinks() {
   const id = currentProjectId();
   const exportRunsFromHistory = document.getElementById("exportRunsFromHistory");
   const exportSummary = document.getElementById("exportSummary");
-  if (exportRunsFromHistory) exportRunsFromHistory.dataset.projectId = id || "";
-  if (exportSummary) exportSummary.dataset.projectId = id || "";
+  if (exportRunsFromHistory) {
+    exportRunsFromHistory.dataset.projectId = id || "";
+    exportRunsFromHistory.href = id ? `/api/export/runs.xls?project_id=${id}` : "#";
+    exportRunsFromHistory.setAttribute("download", "geo-runs.xls");
+    exportRunsFromHistory.setAttribute("target", "_blank");
+  }
+  if (exportSummary) {
+    exportSummary.dataset.projectId = id || "";
+    exportSummary.href = id ? `/api/export/summary.xls?project_id=${id}` : "#";
+    exportSummary.setAttribute("download", "geo-summary.xls");
+    exportSummary.setAttribute("target", "_blank");
+  }
+}
+
+function updateSamplingHistoryHint(projectId, runCount = null) {
+  const hint = document.getElementById("samplingHistoryHint");
+  if (!hint) return;
+  const project = state.projects.find((item) => Number(item.id) === Number(projectId));
+  if (!projectId || !project) {
+    hint.textContent = "未选择项目";
+    return;
+  }
+  const projectName = `${project.client_name} / ${project.brand_name}`;
+  if (runCount === null) {
+    hint.textContent = `当前项目：${projectName}`;
+    return;
+  }
+  hint.textContent = `当前项目：${projectName} · 历史结果 ${runCount} 条`;
+}
+
+function setExportFeedback(message, isError = false) {
+  const el = document.getElementById("exportFeedback");
+  if (!el) return;
+  if (!message) {
+    el.classList.add("hidden");
+    el.textContent = "";
+    el.style.borderColor = "";
+    el.style.background = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  el.textContent = message;
+  el.style.borderColor = isError ? "#f1c4bf" : "#dbe7ff";
+  el.style.background = isError ? "#fff5f4" : "#f8fbff";
+}
+
+function setSamplingProgress({ label, percent, detail }) {
+  const progressLabel = document.getElementById("samplingProgressLabel");
+  const progressText = document.getElementById("samplingProgressText");
+  const progressBar = document.getElementById("samplingProgressBar");
+  if (progressLabel) progressLabel.textContent = label || "等待采样";
+  if (progressText) progressText.textContent = detail || `${Math.round(percent || 0)}%`;
+  if (progressBar) progressBar.style.width = `${Math.max(0, Math.min(100, percent || 0))}%`;
+}
+
+function stopSamplingJobPolling() {
+  if (state.samplingJob?.timerId) {
+    clearInterval(state.samplingJob.timerId);
+  }
+  state.samplingJob = null;
+  const startBtn = document.getElementById("startRunBtn");
+  if (startBtn) startBtn.disabled = false;
+}
+
+async function pollSamplingJob(batchId, projectId) {
+  const progress = await api(`/api/runs/progress?batch_id=${encodeURIComponent(batchId)}`);
+  const total = Number(progress.total || 0);
+  const completed = Number(progress.completed || 0);
+  const percent = total > 0 ? (completed / total) * 100 : 0;
+  const detail = total > 0 ? `${completed} / ${total}` : "0%";
+  const currentModel = progress.current_model ? ` · ${progress.current_model}` : "";
+  if (progress.status === "queued") {
+    document.getElementById("runStatus").textContent = "排队中";
+    setSamplingProgress({ label: "采样任务已创建", percent: 0, detail });
+    return;
+  }
+  if (progress.status === "running") {
+    document.getElementById("runStatus").textContent = "采样中";
+    setSamplingProgress({ label: `正在采样${currentModel}`, percent, detail });
+    return;
+  }
+  if (progress.status === "completed") {
+    document.getElementById("runStatus").textContent = `完成：${progress.success}/${progress.total} 成功`;
+    setSamplingProgress({ label: "采样完成", percent: 100, detail: `${progress.total} / ${progress.total}` });
+    stopSamplingJobPolling();
+    await loadRuns();
+    await loadAnalytics();
+    document.getElementById("runsTable")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (progress.status === "failed") {
+    document.getElementById("runStatus").textContent = "采样失败";
+    setSamplingProgress({ label: "采样失败", percent, detail });
+    stopSamplingJobPolling();
+    throw new Error(progress.error || "采样任务执行失败");
+  }
+}
+
+function startSamplingJobPolling(batchId, projectId) {
+  stopSamplingJobPolling();
+  const startBtn = document.getElementById("startRunBtn");
+  if (startBtn) startBtn.disabled = true;
+  state.samplingJob = {
+    batchId,
+    projectId,
+    timerId: window.setInterval(async () => {
+      try {
+        await pollSamplingJob(batchId, projectId);
+      } catch (error) {
+        console.error("pollSamplingJob failed", error);
+        stopSamplingJobPolling();
+        document.getElementById("runStatus").textContent = "采样失败";
+        alert(error.message);
+      }
+    }, 1200),
+  };
 }
 
 function syncProjectSelectors() {
@@ -394,6 +566,13 @@ function renderSamplingModels() {
     .filter((row) => row.active)
     .map((row) => {
       const draft = getSamplingDraft(row.id);
+      const defaults = getProviderSamplingDefaults(row);
+      const summaryTemperature = readingOrFallback(draft.temperature, defaults.temperature || "模型默认");
+      const summaryReasoning = readingOrFallback(draft.reasoning_effort, defaults.reasoning_effort || "模型默认");
+      const summaryBudget = readingOrFallback(draft.thinking_budget, defaults.thinking_budget || "0 / 模型默认");
+      const officialDefaultMeta = defaults.defaults_note
+        ? `<div class="sampling-default-note"><span>官方默认</span><strong>${escapeHtml(defaults.defaults_note)}</strong></div>`
+        : "";
       const versionOptions = parseModelVersionOptions(row);
       const versionPicker =
         versionOptions.length > 1
@@ -444,6 +623,7 @@ function renderSamplingModels() {
                     <span>搜索策略</span>
                     <select data-sampling-field="search_strategy" data-model-config-id="${row.id}">
                       <option value=""${!draft.search_strategy ? " selected" : ""}>默认</option>
+                      <option value="turbo"${draft.search_strategy === "turbo" ? " selected" : ""}>turbo</option>
                       <option value="standard"${draft.search_strategy === "standard" ? " selected" : ""}>standard</option>
                       <option value="pro"${draft.search_strategy === "pro" ? " selected" : ""}>pro</option>
                     </select>
@@ -574,42 +754,89 @@ function renderSamplingModels() {
             `
         : "";
       return `
-        <div class="sampling-card">
-          <div class="sampling-head">
-            <div>
-              <strong>${escapeHtml(row.label)}</strong>
-              <div>${escapeHtml(row.model)}</div>
-              <div class="sampling-meta">${escapeHtml(row.api_family || "")}</div>
+        <details class="sampling-card" data-sampling-card="${row.id}" ${draft.expanded ? "open" : ""}>
+          <summary class="sampling-card-summary">
+            <div class="sampling-card-title">
+              <div class="sampling-head">
+                <div>
+                  <strong>${escapeHtml(row.label)}</strong>
+                  <div>${escapeHtml(row.model)}</div>
+                  <div class="sampling-meta">${escapeHtml(row.api_family || "")}</div>
+                </div>
+                <div>${row.has_key ? '<span class="status-dot"></span>' : '<span class="status-dot warn"></span>'}</div>
+              </div>
+              <div class="sampling-capabilities">${modeTags(row)} ${capabilityTags(row)}</div>
             </div>
-            <div>${row.has_key ? '<span class="status-dot"></span>' : '<span class="status-dot warn"></span>'}</div>
-          </div>
-          <div class="sampling-options">
-            <label class="sampling-mode is-primary"><input type="checkbox" data-model-config-id="${row.id}" data-sampling-option="selected" />选择模型</label>
-            ${search}
-            ${reasoning}
-          </div>
-          <div class="sampling-runtime-block">
-            <div class="sampling-runtime-title">本次运行配置</div>
-            <div class="sampling-runtime-grid">
-              ${versionPicker}
-              <label class="sampling-subfield">
-                <span>显示版本备注</span>
-                <input
-                  data-sampling-field="runtime_model_version"
-                  data-model-config-id="${row.id}"
-                  value="${escapeHtml(draft.runtime_model_version || "")}"
-                  placeholder="如 2026-06 / 250615"
-                />
-              </label>
+            <div class="sampling-quick-stats">
+              <div class="sampling-quick-stat"><span>温度</span><strong>${escapeHtml(summaryTemperature)}</strong></div>
+              <div class="sampling-quick-stat"><span>推理强度</span><strong>${escapeHtml(summaryReasoning)}</strong></div>
+              <div class="sampling-quick-stat"><span>思考预算</span><strong>${escapeHtml(summaryBudget)}</strong></div>
             </div>
-            <p class="sampling-inline-help">${escapeHtml(samplingProviderNote(row))}</p>
+          </summary>
+          <div class="sampling-card-body">
+            <div class="sampling-options">
+              <label class="sampling-mode is-primary"><input type="checkbox" data-model-config-id="${row.id}" data-sampling-option="selected" />选择模型</label>
+              ${search}
+              ${reasoning}
+            </div>
+            ${officialDefaultMeta}
+            <div class="sampling-runtime-block">
+              <div class="sampling-runtime-title">本次运行配置</div>
+              <div class="sampling-runtime-grid">
+                ${versionPicker}
+                <label class="sampling-subfield">
+                  <span>显示版本备注</span>
+                  <input
+                    data-sampling-field="runtime_model_version"
+                    data-model-config-id="${row.id}"
+                    value="${escapeHtml(draft.runtime_model_version || "")}"
+                    placeholder="如 2026-06 / 250615"
+                  />
+                </label>
+                <label class="sampling-subfield">
+                  <span>Temperature</span>
+                  <input
+                    data-sampling-field="temperature"
+                    data-model-config-id="${row.id}"
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    value="${escapeHtml(draft.temperature || "")}"
+                    placeholder="${escapeHtml(defaults.temperature || "模型默认")}"
+                  />
+                </label>
+                <label class="sampling-subfield">
+                  <span>推理强度</span>
+                  <select data-sampling-field="reasoning_effort" data-model-config-id="${row.id}">
+                    ${getReasoningChoices(row)}
+                  </select>
+                </label>
+                <label class="sampling-subfield">
+                  <span>思考预算</span>
+                  <input
+                    data-sampling-field="thinking_budget"
+                    data-model-config-id="${row.id}"
+                    type="number"
+                    step="1"
+                    value="${escapeHtml(draft.thinking_budget || "")}"
+                    placeholder="${escapeHtml(defaults.thinking_budget || "0 / -1 / 1024")}"
+                  />
+                </label>
+              </div>
+              <p class="sampling-inline-help">${escapeHtml(samplingProviderNote(row))}</p>
+            </div>
+            ${searchDetailBlock}
           </div>
-          ${searchDetailBlock}
-          <div class="sampling-capabilities">${modeTags(row)} ${capabilityTags(row)}</div>
-        </div>
+        </details>
       `;
     })
     .join("");
+  for (const row of state.models.filter((item) => item.active)) {
+    const draft = getSamplingDraft(row.id);
+    const select = root.querySelector(`[data-sampling-field="reasoning_effort"][data-model-config-id="${row.id}"]`);
+    if (select) select.value = draft.reasoning_effort || "";
+  }
   updateSamplingSelectionSummary();
 }
 
@@ -675,10 +902,12 @@ function renderQuestions() {
 async function loadRuns() {
   const id = Number(document.getElementById("samplingProjectSelect").value || currentProjectId() || 0);
   if (!id) {
+    updateSamplingHistoryHint(null);
     renderTable(document.getElementById("runsTable"), [{ label: "暂无项目" }], []);
     return;
   }
   const data = await api(`/api/runs?project_id=${id}`);
+  updateSamplingHistoryHint(id, data.runs.length);
   renderTable(
     document.getElementById("runsTable"),
     [
@@ -887,7 +1116,29 @@ function downloadWorkbook(filename, rows) {
   const wb = window.XLSX.utils.book_new();
   const ws = window.XLSX.utils.json_to_sheet(rows);
   window.XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
-  window.XLSX.writeFile(wb, filename);
+  const output = window.XLSX.write(wb, {
+    bookType: "xlsx",
+    type: "array",
+  });
+  const blob = new Blob([output], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  if (window.navigator?.msSaveOrOpenBlob) {
+    window.navigator.msSaveOrOpenBlob(blob, filename);
+    return;
+  }
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  window.setTimeout(() => {
+    link.remove();
+    window.URL.revokeObjectURL(url);
+  }, 1000);
 }
 
 async function exportRunsWorkbook(projectId) {
@@ -1281,6 +1532,13 @@ document.getElementById("samplingModelList").addEventListener("input", (event) =
   syncSamplingDraftField(event.target);
 });
 
+document.getElementById("samplingModelList").addEventListener("toggle", (event) => {
+  const target = event.target;
+  if (!target.matches("[data-sampling-card]")) return;
+  const modelId = Number(target.dataset.samplingCard);
+  getSamplingDraft(modelId).expanded = target.open;
+});
+
 document.getElementById("samplingModelList").addEventListener("change", (event) => {
   const target = event.target;
   if (syncSamplingDraftField(target)) {
@@ -1294,6 +1552,8 @@ document.getElementById("samplingModelList").addEventListener("change", (event) 
   const row = state.models.find((item) => String(item.id) === String(modelId));
   if (target.dataset.samplingOption === "selected") {
     const enabled = target.checked;
+    const card = document.querySelector(`[data-sampling-card="${modelId}"]`);
+    if (card) card.open = enabled || getSamplingDraft(modelId).expanded;
     if (search) {
       search.disabled = !enabled;
       if (!enabled) search.checked = false;
@@ -1323,71 +1583,94 @@ document.getElementById("samplingModelList").addEventListener("change", (event) 
 });
 
 document.getElementById("startRunBtn").addEventListener("click", async () => {
-  const project_id = Number(document.getElementById("samplingProjectSelect").value || currentProjectId());
-  if (!project_id) return alert("请先选择项目");
-  const searchMode = document.getElementById("searchMode").value || "auto";
-  const thinkingType = document.getElementById("thinkingType").value || "disabled";
-  const reasoningEffort = document.getElementById("reasoningEffort").value || "";
-  const thinkingBudgetRaw = document.getElementById("thinkingBudget").value.trim();
-  const models = [...document.querySelectorAll('[data-sampling-option="selected"]:checked')].map((input) => {
-    const modelId = Number(input.dataset.modelConfigId);
-    const search = document.querySelector(`[data-sampling-option="search"][data-model-config-id="${modelId}"]`);
-    const reasoning = document.querySelector(`[data-sampling-option="reasoning"][data-model-config-id="${modelId}"]`);
-    const draft = getSamplingDraft(modelId);
-    const row = state.models.find((item) => item.id === modelId);
-    return {
-      model_config_id: modelId,
-      search_enabled: Boolean(search?.checked),
-      thinking_enabled: Boolean(reasoning?.checked),
-      runtime_model: String(draft.runtime_model || row?.model || "").trim(),
-      runtime_model_version: String(draft.runtime_model_version || "").trim(),
-      search_sources: String(draft.search_sources || "").trim(),
-      search_limit: draft.search_limit === "" ? null : Number(draft.search_limit),
-      search_max_keyword: String(draft.search_max_keyword || "").trim(),
-      search_user_location: String(draft.search_user_location || "").trim(),
-      search_site_filter: String(draft.search_site_filter || "").trim(),
-      search_time_filter: String(draft.search_time_filter || "").trim(),
-      search_strategy: String(draft.search_strategy || "").trim(),
-      search_freshness: String(draft.search_freshness || "").trim(),
-      search_prompt_intervene: String(draft.search_prompt_intervene || "").trim(),
-      search_enable_source: Boolean(draft.search_enable_source),
-      search_enable_citation: Boolean(draft.search_enable_citation),
-      search_citation_format: String(draft.search_citation_format || "").trim(),
-    };
-  });
-  if (!models.length) return alert("请至少选择一个模型");
-  document.getElementById("runStatus").textContent = "采样中...";
   try {
+    const runStatus = document.getElementById("runStatus");
+    runStatus.textContent = "准备采样...";
+    setSamplingProgress({ label: "准备采样", percent: 0, detail: "0%" });
+    const project_id = Number(document.getElementById("samplingProjectSelect").value || currentProjectId());
+    if (!project_id) {
+      runStatus.textContent = "请先选择项目";
+      alert("请先选择项目");
+      return;
+    }
+    const selectedInputs = [...document.querySelectorAll('[data-sampling-option="selected"]:checked')];
+    if (!selectedInputs.length) {
+      runStatus.textContent = "请至少选择一个模型";
+      alert("请至少选择一个模型");
+      return;
+    }
+    const models = selectedInputs.map((input) => {
+      const modelId = Number(input.dataset.modelConfigId);
+      const search = document.querySelector(`[data-sampling-option="search"][data-model-config-id="${modelId}"]`);
+      const reasoning = document.querySelector(`[data-sampling-option="reasoning"][data-model-config-id="${modelId}"]`);
+      const draft = getSamplingDraft(modelId);
+      const row = state.models.find((item) => item.id === modelId);
+      if (!row) {
+        throw new Error(`未找到模型配置：${modelId}`);
+      }
+      const defaults = getProviderSamplingDefaults(row);
+      const temperature = String(draft.temperature || defaults.temperature || "").trim();
+      const thinkingBudgetRaw = String(draft.thinking_budget || defaults.thinking_budget || "").trim();
+      return {
+        model_config_id: modelId,
+        search_enabled: Boolean(search?.checked),
+        thinking_enabled: Boolean(reasoning?.checked),
+        thinking_type: reasoning?.checked ? "enabled" : "disabled",
+        search_mode: search?.checked ? "auto" : "off",
+        temperature: temperature === "" ? null : Number(temperature),
+        reasoning_effort: String(draft.reasoning_effort || defaults.reasoning_effort || "").trim(),
+        thinking_budget: thinkingBudgetRaw === "" ? null : Number(thinkingBudgetRaw),
+        runtime_model: String(draft.runtime_model || row.model || "").trim(),
+        runtime_model_version: String(draft.runtime_model_version || "").trim(),
+        search_sources: String(draft.search_sources || "").trim(),
+        search_limit: draft.search_limit === "" ? null : Number(draft.search_limit),
+        search_max_keyword: String(draft.search_max_keyword || "").trim(),
+        search_user_location: String(draft.search_user_location || "").trim(),
+        search_site_filter: String(draft.search_site_filter || "").trim(),
+        search_time_filter: String(draft.search_time_filter || "").trim(),
+        search_strategy: String(draft.search_strategy || "").trim(),
+        search_freshness: String(draft.search_freshness || "").trim(),
+        search_prompt_intervene: String(draft.search_prompt_intervene || "").trim(),
+        search_enable_source: Boolean(draft.search_enable_source),
+        search_enable_citation: Boolean(draft.search_enable_citation),
+        search_citation_format: String(draft.search_citation_format || "").trim(),
+      };
+    });
+    runStatus.textContent = `采样中...（${models.length} 个模型）`;
+    setSamplingProgress({ label: "创建采样任务", percent: 2, detail: `0 / ${models.length}` });
     const result = await api("/api/runs/start", {
       method: "POST",
       body: JSON.stringify({
         project_id,
         models,
         repeat_count: Number(document.getElementById("repeatCount").value || 1),
-        temperature: Number(document.getElementById("temperature").value || 0),
-        search_mode: searchMode,
-        thinking_type: thinkingType,
-        reasoning_effort: reasoningEffort,
-        thinking_budget: thinkingBudgetRaw === "" ? null : Number(thinkingBudgetRaw),
       }),
     });
-    document.getElementById("runStatus").textContent = `完成：${result.success}/${result.total} 成功`;
-    await loadRuns();
-    await loadAnalytics();
+    runStatus.textContent = "排队中";
+    setSamplingProgress({ label: "采样任务已创建", percent: 4, detail: `0 / ${result.total || 0}` });
+    startSamplingJobPolling(result.batch_id, project_id);
+    await pollSamplingJob(result.batch_id, project_id);
   } catch (error) {
     document.getElementById("runStatus").textContent = "采样失败";
+    console.error("startRun failed", error);
     alert(error.message);
   }
 });
 
-document.getElementById("exportRunsFromHistory").addEventListener("click", async (event) => {
+document.getElementById("exportRunsFromHistory").addEventListener("click", (event) => {
+  const projectId = Number(event.currentTarget.dataset.projectId || currentProjectId());
+  setExportFeedback("");
+  if (projectId) return;
   event.preventDefault();
-  await exportRunsWorkbook(Number(event.currentTarget.dataset.projectId || currentProjectId()));
+  alert("请先选择项目");
 });
 
-document.getElementById("exportSummary").addEventListener("click", async (event) => {
+document.getElementById("exportSummary").addEventListener("click", (event) => {
+  const projectId = Number(event.currentTarget.dataset.projectId || currentProjectId());
+  setExportFeedback("");
+  if (projectId) return;
   event.preventDefault();
-  await exportSummaryWorkbook(Number(event.currentTarget.dataset.projectId || currentProjectId()));
+  alert("请先选择项目");
 });
 
 const projectCompetitorTags = initTagInput("projectCompetitorInput", "projectCompetitorsHidden");

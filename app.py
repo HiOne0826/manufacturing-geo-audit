@@ -1,5 +1,8 @@
 import json
+import threading
+import uuid
 from base64 import b64decode
+from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,13 +31,81 @@ from src.db import (
     update_project,
     update_question,
 )
-from src.exporter import analytics_to_csv, runs_to_csv
+from src.exporter import (
+    analytics_to_csv,
+    analytics_to_excel_html,
+    runs_to_csv,
+    runs_to_excel_html,
+)
 from src.runtime_env import load_dotenv_file
-from src.runner import run_batch
+from src.runner import estimate_batch_total, run_batch
+from src.db import utc_now
 
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+EXPORT_DIR = ROOT / "exports"
+SAMPLING_JOBS: dict[str, dict] = {}
+SAMPLING_JOBS_LOCK = threading.Lock()
+
+
+def set_sampling_job(batch_id: str, **updates):
+    with SAMPLING_JOBS_LOCK:
+        current = SAMPLING_JOBS.get(batch_id, {}).copy()
+        current.update(updates)
+        SAMPLING_JOBS[batch_id] = current
+        return current.copy()
+
+
+def get_sampling_job(batch_id: str) -> dict | None:
+    with SAMPLING_JOBS_LOCK:
+        job = SAMPLING_JOBS.get(batch_id)
+        return job.copy() if job else None
+
+
+def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
+    set_sampling_job(batch_id, status="running", started_at=utc_now())
+
+    def on_progress(progress: dict):
+        set_sampling_job(
+            batch_id,
+            status="running",
+            total=progress["total"],
+            completed=progress["completed"],
+            failed=progress["failed"],
+            success=progress["success"],
+            current_provider=progress["provider"],
+            current_model=progress["model"],
+            current_question_id=progress["question_id"],
+            current_repeat_index=progress["repeat_index"],
+            updated_at=utc_now(),
+        )
+
+    try:
+        with get_conn(DEFAULT_DB_PATH) as conn:
+            result = run_batch(conn, project_id, payload, batch_id=batch_id, progress_callback=on_progress)
+        set_sampling_job(
+            batch_id,
+            status="completed",
+            total=result["total"],
+            completed=result["total"],
+            failed=result["failed"],
+            success=result["success"],
+            finished_at=utc_now(),
+            updated_at=utc_now(),
+        )
+    except Exception as exc:
+        job = get_sampling_job(batch_id) or {}
+        set_sampling_job(
+            batch_id,
+            status="failed",
+            error=str(exc),
+            finished_at=utc_now(),
+            updated_at=utc_now(),
+            completed=job.get("completed", 0),
+            failed=job.get("failed", 0),
+            success=job.get("success", 0),
+        )
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -84,6 +155,21 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def excel_html_response(self, body: str, filename: str):
+        raw = body.encode("utf-8-sig")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.ms-excel; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def save_export_file(self, filename: str, body: str) -> str:
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        path = EXPORT_DIR / filename
+        path.write_text(body, encoding="utf-8-sig")
+        return str(path)
+
     def handle_api_get(self, parsed):
         query = parse_qs(parsed.query)
         try:
@@ -106,6 +192,15 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/runs":
                     project_id = int(query.get("project_id", [0])[0])
                     self.json_response({"runs": list_runs(conn, project_id)})
+                elif parsed.path == "/api/runs/progress":
+                    batch_id = str(query.get("batch_id", [""])[0]).strip()
+                    if not batch_id:
+                        raise ValueError("缺少 batch_id")
+                    job = get_sampling_job(batch_id)
+                    if not job:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    self.json_response(job)
                 elif parsed.path == "/api/analytics":
                     project_id = int(query.get("project_id", [0])[0])
                     self.json_response(analytics(conn, project_id))
@@ -115,6 +210,24 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/export/summary.csv":
                     project_id = int(query.get("project_id", [0])[0])
                     self.csv_response(analytics_to_csv(analytics(conn, project_id)), "geo-summary.csv")
+                elif parsed.path == "/api/export/runs.xls":
+                    project_id = int(query.get("project_id", [0])[0])
+                    self.excel_html_response(runs_to_excel_html(list_runs(conn, project_id, limit=10000)), "geo-runs.xls")
+                elif parsed.path == "/api/export/summary.xls":
+                    project_id = int(query.get("project_id", [0])[0])
+                    self.excel_html_response(analytics_to_excel_html(analytics(conn, project_id)), "geo-summary.xls")
+                elif parsed.path == "/api/export/runs/save":
+                    project_id = int(query.get("project_id", [0])[0])
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    filename = f"geo-runs-{project_id}-{stamp}.xls"
+                    path = self.save_export_file(filename, runs_to_excel_html(list_runs(conn, project_id, limit=10000)))
+                    self.json_response({"ok": True, "path": path, "filename": filename})
+                elif parsed.path == "/api/export/summary/save":
+                    project_id = int(query.get("project_id", [0])[0])
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    filename = f"geo-summary-{project_id}-{stamp}.xls"
+                    path = self.save_export_file(filename, analytics_to_excel_html(analytics(conn, project_id)))
+                    self.json_response({"ok": True, "path": path, "filename": filename})
                 else:
                     self.json_response({"error": "接口不存在"}, 404)
         except Exception as exc:
@@ -179,7 +292,26 @@ class Handler(SimpleHTTPRequestHandler):
                     delete_question(conn, int(payload.get("id", 0)))
                     self.json_response({"ok": True})
                 elif parsed.path == "/api/runs/start":
-                    result = run_batch(conn, int(payload.get("project_id", 0)), payload)
+                    project_id = int(payload.get("project_id", 0))
+                    total = estimate_batch_total(conn, project_id, payload)
+                    batch_id = payload.get("batch_id") or f"batch-{uuid.uuid4().hex[:10]}"
+                    set_sampling_job(
+                        batch_id,
+                        project_id=project_id,
+                        total=total,
+                        completed=0,
+                        failed=0,
+                        success=0,
+                        status="queued",
+                        created_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                    threading.Thread(
+                        target=run_batch_in_background,
+                        args=(batch_id, project_id, payload),
+                        daemon=True,
+                    ).start()
+                    result = {"batch_id": batch_id, "total": total, "failed": 0, "success": 0, "status": "queued"}
                     self.json_response(result)
                 else:
                     self.json_response({"error": "接口不存在"}, 404)

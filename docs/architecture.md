@@ -4,6 +4,27 @@
 
 这是一个“制造业品牌 GEO 现状审计系统”：前端负责配置客户、问题库、模型和查看报告；后端负责批量采样、数据归档、结构化评估和报告生成。
 
+## 系统边界
+
+本项目是 **GEO 效果检测 / 审计系统**，不是 GEO 内容生产系统。
+
+当前服务器上存在两套独立系统：
+
+- `geoflow`
+  - 目录：`/opt/geoflow`
+  - 技术栈：`Laravel + Docker`
+  - 用途：GEO 内容生产 / 流程系统
+- `manufacturing-geo-audit`
+  - 目录：`/opt/manufacturing-geo-audit`
+  - 技术栈：`Python 标准库 + SQLite + 静态前端`
+  - 用途：GEO 效果检测 / 审计系统
+
+结论：
+
+- 两套系统必须独立部署
+- 禁止把本项目覆盖到 `/opt/geoflow`
+- 文档、仓库、服务名和端口都应单独维护
+
 ## 总体架构
 
 ```text
@@ -344,6 +365,20 @@ for project in projects
 - 多批次定时复测。
 - 采样任务耗时明显增加。
 - 需要账号和权限。
+
+## 当前部署形态
+
+截至 `2026-06-09`，线上已落地的是本项目的轻量独立部署版本：
+
+```text
+GitHub：HiOne0826/manufacturing-geo-audit
+服务器目录：/opt/manufacturing-geo-audit
+应用服务：manufacturing-geo-audit.service
+本机监听：127.0.0.1:8765
+Nginx 代理：18082
+```
+
+这套部署形态用于快速验证 GEO 审计工作台，不依赖 Docker，也不与 `/opt/geoflow` 共享运行目录。
 
 ## 页面信息架构
 

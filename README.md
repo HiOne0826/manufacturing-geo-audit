@@ -2,6 +2,21 @@
 
 这个项目用于批量测试制造业品牌在各大模型中的搜索结果呈现，并将问题、模型回答、引用来源、品牌出现情况和评估指标归档成表格，作为客户 GEO 现状报告的数据底稿。
 
+## 项目背景
+
+这是一套独立的 **GEO 效果检测 / 审计系统**，不是内容生产系统。
+
+- 当前仓库：[`HiOne0826/manufacturing-geo-audit`](https://github.com/HiOne0826/manufacturing-geo-audit)
+- 本地技术栈：`Python 标准库 + SQLite + 静态前端`
+- 核心用途：面向制造业客户做问题库管理、模型采样、引用归档和 GEO 呈现分析
+
+需要特别区分：
+
+- `/opt/geoflow`：服务器上现有的 **GEO 内容生产系统**，技术栈为 `Laravel + Docker`
+- `/opt/manufacturing-geo-audit`：本项目的 **GEO 效果检测 / 审计系统**
+
+两者用途不同，部署目录和服务端口必须隔离，不能互相覆盖。
+
 ## 核心目标
 
 - 用统一问题库批量询问多个大模型。
@@ -58,6 +73,22 @@ python3 app.py
 ```text
 http://127.0.0.1:8765
 ```
+
+## 当前部署现状
+
+截至 `2026-06-09`，本项目已经独立部署到鸵鸟 GEO 服务器：
+
+- 代码目录：`/opt/manufacturing-geo-audit`
+- systemd 服务：`manufacturing-geo-audit.service`
+- 应用监听：`127.0.0.1:8765`
+- Nginx 代理端口：`18082`
+- 健康检查：`http://127.0.0.1:18082/api/health`
+
+服务器内还写入了单独备注文件：
+
+- `/opt/manufacturing-geo-audit/DEPLOY_NOTE.md`
+
+用于明确说明：本项目不是 `/opt/geoflow`，禁止混用部署目录。
 
 ## API Key
 
