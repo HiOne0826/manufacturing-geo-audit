@@ -65,13 +65,13 @@ python3 scripts/smoke_test.py --base-url http://127.0.0.1:8765 --password "$APP_
 不需要启动服务，直接使用临时 SQLite 数据库和 Mock adapter：
 
 ```bash
-python3 scripts/load_test_local.py --questions 150 --models 3
+python3 scripts/load_test_local.py --questions 150 --models 3 --workers 8
 ```
 
 保留测试数据库用于排查：
 
 ```bash
-python3 scripts/load_test_local.py --questions 150 --models 3 --keep-db /tmp/geo-load-test.db
+python3 scripts/load_test_local.py --questions 150 --models 3 --workers 8 --keep-db /tmp/geo-load-test.db
 ```
 
 ## 测试数据库隔离
