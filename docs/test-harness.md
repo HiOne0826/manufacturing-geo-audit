@@ -54,6 +54,12 @@ python3 scripts/smoke_test.py
 python3 scripts/smoke_test.py --base-url http://127.0.0.1:8765
 ```
 
+如果服务启用了应用全局密码：
+
+```bash
+python3 scripts/smoke_test.py --base-url http://127.0.0.1:8765 --password "$APP_PASSWORD"
+```
+
 ## 本地负载测试
 
 不需要启动服务，直接使用临时 SQLite 数据库和 Mock adapter：

@@ -12,6 +12,22 @@
     <link rel="stylesheet" href="./styles.css?v=20260609-sampling-progress" />
   </head>
   <body>
+    <section id="authGate" class="auth-gate hidden" aria-live="polite">
+      <form id="authLoginForm" class="auth-card">
+        <div class="brand auth-brand">
+          <div class="mark"></div>
+          <div>
+            <strong>GEO 审计</strong>
+            <span>内部访问</span>
+          </div>
+        </div>
+        <label>应用密码
+          <input id="authPasswordInput" type="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit">进入工作台</button>
+        <p id="authMessage" class="auth-message"></p>
+      </form>
+    </section>
     <aside class="sidebar">
       <div class="brand">
         <div class="mark"></div>
@@ -35,6 +51,7 @@
           <h1>制造业品牌 GEO 审计工作台</h1>
           <p>管理项目、维护问题库、配置模型、发起采样并输出 GEO 分析表格。</p>
         </div>
+        <button id="logoutBtn" class="ghost-btn" type="button">退出</button>
       </section>
 
       <section id="page-projects" class="page active">
