@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -20,6 +21,29 @@ OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
 
 
 PROVIDER_PRESETS = {
+    "mock": {
+        "label": "Mock / 流程演示",
+        "provider": "mock",
+        "api_family": "Local Mock",
+        "model": "mock-model",
+        "model_version": "",
+        "model_type": "mock",
+        "api_base": "",
+        "supports_pure": True,
+        "supports_search": True,
+        "web_search_mode": "本地模拟",
+        "web_search_param_path": "",
+        "supports_reasoning": False,
+        "reasoning_param_path": "",
+        "reasoning_levels": "",
+        "supports_citation": True,
+        "citation_param_path": "mock citations",
+        "supports_site_filter": False,
+        "supports_time_filter": False,
+        "supports_user_location": False,
+        "supports_tool_calling": False,
+        "notes": "本地测试和流程演示使用，不调用真实模型。",
+    },
     "openai": {
         "label": "GPT",
         "provider": "openai",
@@ -943,6 +967,37 @@ def call_configured_model(
     run_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = model_config.get("provider", "")
+    if provider == "mock":
+        start = time.time()
+        model_name = model_config.get("model", "mock-model") or "mock-model"
+        citations = [
+            {
+                "url": "https://example.com/mock-source",
+                "title": "Mock citation source",
+            }
+        ] if search_enabled else []
+        response_text = (
+            f"Mock answer for: {question}\n"
+            "目标品牌在本地模拟回答中被提及，用于验证采样、评估和导出流程。"
+        )
+        return {
+            "provider": "mock",
+            "model": model_name,
+            "configured_model": model_name,
+            "model_version": model_config.get("model_version", ""),
+            "search_enabled": search_enabled,
+            "search_mode": "auto" if search_enabled else "off",
+            "thinking_type": "disabled",
+            "reasoning_effort": "",
+            "thinking_budget": None,
+            "latency_ms": int((time.time() - start) * 1000),
+            "response_text": response_text,
+            "citations": citations,
+            "usage": {"mock": True},
+            "raw_response": {"mock": True, "question": question},
+        }
+    if os.environ.get("ALLOW_LIVE_MODEL_CALLS") != "1":
+        raise AdapterError("真实模型调用默认关闭。需要调用真实模型时请设置 ALLOW_LIVE_MODEL_CALLS=1。")
     api_key = resolve_provider_api_key(provider, model_config.get("api_key", ""))
     api_base = model_config.get("api_base", "")
     model_name = model_config.get("model", "")
