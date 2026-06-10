@@ -1,0 +1,3 @@
+question_id,question,question_type,target_brand,competitor_brands
+T001,请介绍一下测试品牌的主要产品。,brand_direct,测试品牌,竞品A;竞品B
+T002,采购测试品类时有哪些品牌值得了解？,category_recommendation,测试品牌,竞品A;竞品B

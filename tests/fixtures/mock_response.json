@@ -1,0 +1,11 @@
+{
+  "provider": "mock",
+  "model": "mock-model",
+  "response_text": "Mock answer for local harness.",
+  "citations": [
+    {
+      "url": "https://example.com/mock-source",
+      "title": "Mock citation source"
+    }
+  ]
+}

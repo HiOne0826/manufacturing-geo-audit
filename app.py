@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import uuid
 from base64 import b64decode
@@ -326,8 +327,10 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     load_dotenv_file(ROOT / ".env")
     init_db(DEFAULT_DB_PATH)
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    print("制造业品牌 GEO 工作台已启动：http://127.0.0.1:8765")
+    host = os.environ.get("GEO_AUDIT_HOST", "127.0.0.1")
+    port = int(os.environ.get("GEO_AUDIT_PORT", "8765"))
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"制造业品牌 GEO 工作台已启动：http://{host}:{port}")
     server.serve_forever()
 
 
