@@ -225,6 +225,18 @@ class HarnessHttpTests(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(status.get("status"), "completed")
         self.assertEqual(status["success"] + status["failed"], status["total"])
+        batches = self.request_json("GET", f"/api/batches?project_id={project_id}")["batches"]
+        batch = next(item for item in batches if item["batch_id"] == batch_id)
+        self.assertEqual(batch["status"], "completed")
+        self.assertEqual(batch["success_count"] + batch["failed_count"], batch["total_count"])
+        batch_detail = self.request_json("GET", f"/api/batches/{batch_id}")["batch"]
+        self.assertEqual(batch_detail["completed_count"], 2)
+        batch_runs = self.request_json("GET", f"/api/batches/{batch_id}/runs")["runs"]
+        self.assertEqual(len(batch_runs), 2)
+        app.SAMPLING_JOBS.clear()
+        persisted_status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        self.assertEqual(persisted_status["status"], "completed")
+        self.assertEqual(persisted_status["completed"], 2)
         runs = self.request_json("GET", f"/api/runs?project_id={project_id}")["runs"]
         self.assertEqual(len(runs), 2)
         self.assertIn("run_id", self.request_text(f"/api/export/runs.csv?project_id={project_id}"))
