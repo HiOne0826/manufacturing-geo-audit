@@ -385,6 +385,24 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                 FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS sampling_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL UNIQUE,
+                project_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                total_count INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                completed_count INTEGER DEFAULT 0,
+                config_json TEXT DEFAULT '{}',
+                error_message TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS answer_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL UNIQUE,
@@ -1003,6 +1021,113 @@ def delete_model_config(conn: sqlite3.Connection, model_id: int) -> None:
 
 def get_model_config(conn: sqlite3.Connection, model_id: int) -> dict[str, Any] | None:
     return row_to_dict(conn.execute("SELECT * FROM model_configs WHERE id = ?", (model_id,)).fetchone())
+
+
+def create_sampling_batch(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO sampling_batches (
+            batch_id, project_id, status, total_count, success_count, failed_count,
+            completed_count, config_json, error_message, created_at, started_at,
+            finished_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["batch_id"],
+            int(payload["project_id"]),
+            payload.get("status", "queued"),
+            int(payload.get("total_count", 0) or 0),
+            int(payload.get("success_count", 0) or 0),
+            int(payload.get("failed_count", 0) or 0),
+            int(payload.get("completed_count", 0) or 0),
+            json.dumps(payload.get("config", {}), ensure_ascii=False),
+            payload.get("error_message", ""),
+            payload.get("created_at", now),
+            payload.get("started_at"),
+            payload.get("finished_at"),
+            payload.get("updated_at", now),
+        ),
+    )
+
+
+def update_sampling_batch(conn: sqlite3.Connection, batch_id: str, updates: dict[str, Any]) -> None:
+    allowed = {
+        "status",
+        "total_count",
+        "success_count",
+        "failed_count",
+        "completed_count",
+        "error_message",
+        "started_at",
+        "finished_at",
+        "updated_at",
+    }
+    fields = [field for field in updates if field in allowed]
+    if not fields:
+        return
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    values = [updates[field] for field in fields]
+    conn.execute(
+        f"UPDATE sampling_batches SET {assignments} WHERE batch_id = ?",
+        (*values, batch_id),
+    )
+
+
+def get_sampling_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any] | None:
+    row = row_to_dict(conn.execute("SELECT * FROM sampling_batches WHERE batch_id = ?", (batch_id,)).fetchone())
+    if not row:
+        return None
+    row["config"] = json.loads(row.pop("config_json") or "{}")
+    return row
+
+
+def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = None) -> list[dict[str, Any]]:
+    if project_id:
+        rows = conn.execute(
+            """
+            SELECT b.*, p.client_name, p.brand_name
+            FROM sampling_batches b
+            JOIN projects p ON p.id = b.project_id
+            WHERE b.project_id = ?
+            ORDER BY b.id DESC
+            """,
+            (project_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT b.*, p.client_name, p.brand_name
+            FROM sampling_batches b
+            JOIN projects p ON p.id = b.project_id
+            ORDER BY b.id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["config"] = json.loads(item.pop("config_json") or "{}")
+        result.append(item)
+    return result
+
+
+def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT r.*, q.question, q.question_type, e.target_brand_mentioned,
+               e.target_brand_rank, e.recommendation_strength, e.competitors_mentioned,
+               e.owned_site_cited, e.third_party_cited, e.risk_level
+        FROM model_runs r
+        JOIN questions q ON q.id = r.question_id
+        LEFT JOIN answer_evaluations e ON e.run_id = r.run_id
+        WHERE r.batch_id = ?
+        ORDER BY r.id DESC
+        LIMIT ?
+        """,
+        (batch_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:

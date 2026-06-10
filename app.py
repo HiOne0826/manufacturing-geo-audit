@@ -11,18 +11,20 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from src.adapters import PROVIDER_PRESETS, enrich_model_config, test_model_config
 from src.db import (
     DEFAULT_DB_PATH,
     analytics,
+    create_sampling_batch,
     create_model_config,
     create_project,
     delete_model_config,
     delete_project,
     delete_question,
     get_model_config,
+    get_sampling_batch,
     get_conn,
     import_questions_csv,
     import_questions_rows,
@@ -30,11 +32,14 @@ from src.db import (
     list_model_configs,
     list_projects,
     list_questions,
+    list_runs_by_batch,
     list_runs,
+    list_sampling_batches,
     seed_questions,
     update_model_config,
     update_project,
     update_question,
+    update_sampling_batch,
 )
 from src.exporter import (
     analytics_to_csv,
@@ -111,27 +116,73 @@ def get_sampling_job(batch_id: str) -> dict | None:
         return job.copy() if job else None
 
 
+def sampling_batch_to_progress(batch: dict) -> dict:
+    return {
+        "batch_id": batch["batch_id"],
+        "project_id": batch["project_id"],
+        "status": batch["status"],
+        "total": batch.get("total_count", 0),
+        "completed": batch.get("completed_count", 0),
+        "failed": batch.get("failed_count", 0),
+        "success": batch.get("success_count", 0),
+        "error": batch.get("error_message", ""),
+        "created_at": batch.get("created_at"),
+        "started_at": batch.get("started_at"),
+        "finished_at": batch.get("finished_at"),
+        "updated_at": batch.get("updated_at"),
+    }
+
+
 def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
     set_sampling_job(batch_id, status="running", started_at=utc_now())
 
-    def on_progress(progress: dict):
-        set_sampling_job(
-            batch_id,
-            status="running",
-            total=progress["total"],
-            completed=progress["completed"],
-            failed=progress["failed"],
-            success=progress["success"],
-            current_provider=progress["provider"],
-            current_model=progress["model"],
-            current_question_id=progress["question_id"],
-            current_repeat_index=progress["repeat_index"],
-            updated_at=utc_now(),
-        )
-
     try:
         with get_conn(DEFAULT_DB_PATH) as conn:
+            update_sampling_batch(conn, batch_id, {"status": "running", "started_at": utc_now(), "updated_at": utc_now()})
+            conn.commit()
+
+            def on_progress(progress: dict):
+                set_sampling_job(
+                    batch_id,
+                    status="running",
+                    total=progress["total"],
+                    completed=progress["completed"],
+                    failed=progress["failed"],
+                    success=progress["success"],
+                    current_provider=progress["provider"],
+                    current_model=progress["model"],
+                    current_question_id=progress["question_id"],
+                    current_repeat_index=progress["repeat_index"],
+                    updated_at=utc_now(),
+                )
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": "running",
+                        "total_count": progress["total"],
+                        "completed_count": progress["completed"],
+                        "failed_count": progress["failed"],
+                        "success_count": progress["success"],
+                        "updated_at": utc_now(),
+                    },
+                )
+                conn.commit()
+
             result = run_batch(conn, project_id, payload, batch_id=batch_id, progress_callback=on_progress)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "completed",
+                    "total_count": result["total"],
+                    "completed_count": result["total"],
+                    "failed_count": result["failed"],
+                    "success_count": result["success"],
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
         set_sampling_job(
             batch_id,
             status="completed",
@@ -144,6 +195,20 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
         )
     except Exception as exc:
         job = get_sampling_job(batch_id) or {}
+        with get_conn(DEFAULT_DB_PATH) as conn:
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                    "completed_count": job.get("completed", 0),
+                    "failed_count": job.get("failed", 0),
+                    "success_count": job.get("success", 0),
+                },
+            )
         set_sampling_job(
             batch_id,
             status="failed",
@@ -312,9 +377,31 @@ class Handler(SimpleHTTPRequestHandler):
                         raise ValueError("缺少 batch_id")
                     job = get_sampling_job(batch_id)
                     if not job:
-                        self.json_response({"error": "批次不存在"}, 404)
+                        batch = get_sampling_batch(conn, batch_id)
+                        if not batch:
+                            self.json_response({"error": "批次不存在"}, 404)
+                            return
+                        self.json_response(sampling_batch_to_progress(batch))
                         return
                     self.json_response(job)
+                elif parsed.path == "/api/batches":
+                    project_raw = query.get("project_id", [None])[0]
+                    project_id = int(project_raw) if project_raw and project_raw != "all" else None
+                    self.json_response({"batches": list_sampling_batches(conn, project_id)})
+                elif parsed.path.startswith("/api/batches/"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) not in {3, 4}:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[2]
+                    if len(parts) == 4 and parts[3] == "runs":
+                        self.json_response({"runs": list_runs_by_batch(conn, batch_id)})
+                        return
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    self.json_response({"batch": batch})
                 elif parsed.path == "/api/analytics":
                     project_id = int(query.get("project_id", [0])[0])
                     self.json_response(analytics(conn, project_id))
@@ -415,6 +502,21 @@ class Handler(SimpleHTTPRequestHandler):
                     project_id = int(payload.get("project_id", 0))
                     total = estimate_batch_total(conn, project_id, payload)
                     batch_id = payload.get("batch_id") or f"batch-{uuid.uuid4().hex[:10]}"
+                    create_sampling_batch(
+                        conn,
+                        {
+                            "batch_id": batch_id,
+                            "project_id": project_id,
+                            "status": "queued",
+                            "total_count": total,
+                            "success_count": 0,
+                            "failed_count": 0,
+                            "completed_count": 0,
+                            "config": payload,
+                            "created_at": utc_now(),
+                            "updated_at": utc_now(),
+                        },
+                    )
                     set_sampling_job(
                         batch_id,
                         project_id=project_id,
