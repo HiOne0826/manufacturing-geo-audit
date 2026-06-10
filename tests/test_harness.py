@@ -20,6 +20,106 @@ from src.runner import run_batch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class AuthGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old_password = os.environ.get("APP_PASSWORD")
+        cls.old_secret = os.environ.get("APP_SESSION_SECRET")
+        os.environ["APP_PASSWORD"] = "test-password"
+        os.environ["APP_SESSION_SECRET"] = "test-secret"
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls.temp_dir.name) / "auth.db"
+        app.DEFAULT_DB_PATH = cls.db_path
+        app.SAMPLING_JOBS.clear()
+        init_db(cls.db_path)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.temp_dir.cleanup()
+        if cls.old_password is None:
+            os.environ.pop("APP_PASSWORD", None)
+        else:
+            os.environ["APP_PASSWORD"] = cls.old_password
+        if cls.old_secret is None:
+            os.environ.pop("APP_SESSION_SECRET", None)
+        else:
+            os.environ["APP_SESSION_SECRET"] = cls.old_secret
+
+    def request_json(self, method: str, path: str, payload: dict | None = None, cookie: str = "") -> tuple[dict, dict]:
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if cookie:
+            headers["Cookie"] = cookie
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8")), dict(response.headers)
+
+    def assert_unauthorized(self, method: str, path: str, payload: dict | None = None):
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def login_cookie(self) -> str:
+        data, headers = self.request_json("POST", "/api/auth/login", {"password": "test-password"})
+        self.assertTrue(data["authenticated"])
+        cookie = headers.get("Set-Cookie", "")
+        self.assertIn("geo_audit_session=", cookie)
+        return cookie.split(";", 1)[0]
+
+    def test_api_requires_login_and_allows_health_status(self):
+        health, _ = self.request_json("GET", "/api/health")
+        self.assertTrue(health["ok"])
+        status, _ = self.request_json("GET", "/api/auth/status")
+        self.assertTrue(status["auth_enabled"])
+        self.assertFalse(status["authenticated"])
+        self.assert_unauthorized("GET", "/api/projects")
+        self.assert_unauthorized("POST", "/api/runs/start", {"project_id": 1, "models": []})
+
+    def test_login_allows_api_and_models_still_hide_key(self):
+        cookie = self.login_cookie()
+        project, _ = self.request_json(
+            "POST",
+            "/api/projects",
+            {"client_name": "认证测试", "brand_name": "认证品牌"},
+            cookie=cookie,
+        )
+        self.assertGreater(project["id"], 0)
+        model, _ = self.request_json(
+            "POST",
+            "/api/models",
+            {
+                "provider": "mock",
+                "label": "Auth Mock",
+                "model": "auth-mock",
+                "api_key": "AUTH-SECRET-KEY",
+                "supports_pure": True,
+                "active": True,
+            },
+            cookie=cookie,
+        )
+        self.assertGreater(model["id"], 0)
+        models, _ = self.request_json("GET", "/api/models", cookie=cookie)
+        raw = json.dumps(models, ensure_ascii=False)
+        self.assertNotIn("AUTH-SECRET-KEY", raw)
+        for item in models["models"]:
+            self.assertNotIn("api_key", item)
+
+
 class HarnessHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

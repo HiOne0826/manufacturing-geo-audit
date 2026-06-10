@@ -1,3 +1,14 @@
+const APP_BASE_PATH = (() => {
+  const path = window.location.pathname || "/";
+  if (path === "/" || !path.includes("/")) return "";
+  return path.endsWith("/") ? path.slice(0, -1) : path;
+})();
+
+function withBasePath(path) {
+  if (!path.startsWith("/")) return path;
+  return APP_BASE_PATH ? `${APP_BASE_PATH}${path}` : path;
+}
+
 const state = {
   projects: [],
   questions: [],
@@ -50,10 +61,47 @@ const QUESTION_TEMPLATE_ROWS = [
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  const res = await fetch(path, { ...options, headers });
+  const res = await fetch(withBasePath(path), { ...options, headers, credentials: "same-origin" });
+  const data = await res.json();
+  if (res.status === 401) {
+    showAuthGate(data.error || "请先登录");
+  }
+  if (!res.ok || data.error) throw new Error(data.error || "请求失败");
+  return data;
+}
+
+function showAuthGate(message = "") {
+  document.body.classList.add("auth-required");
+  document.getElementById("authGate")?.classList.remove("hidden");
+  const authMessage = document.getElementById("authMessage");
+  if (authMessage) authMessage.textContent = message;
+  window.setTimeout(() => document.getElementById("authPasswordInput")?.focus(), 0);
+}
+
+function hideAuthGate() {
+  document.body.classList.remove("auth-required");
+  document.getElementById("authGate")?.classList.add("hidden");
+  const authMessage = document.getElementById("authMessage");
+  if (authMessage) authMessage.textContent = "";
+}
+
+async function authRequest(path, payload = null) {
+  const options = {
+    method: payload ? "POST" : "GET",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+  };
+  if (payload) options.body = JSON.stringify(payload);
+  const res = await fetch(withBasePath(path), options);
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || "请求失败");
   return data;
+}
+
+async function loadAuthStatus() {
+  const status = await authRequest("/api/auth/status");
+  document.getElementById("logoutBtn")?.classList.toggle("hidden", !status.auth_enabled);
+  return status;
 }
 
 function currentProjectId() {
@@ -217,13 +265,13 @@ function setExportLinks() {
   const exportSummary = document.getElementById("exportSummary");
   if (exportRunsFromHistory) {
     exportRunsFromHistory.dataset.projectId = id || "";
-    exportRunsFromHistory.href = id ? `/api/export/runs.xls?project_id=${id}` : "#";
+    exportRunsFromHistory.href = id ? withBasePath(`/api/export/runs.xls?project_id=${id}`) : "#";
     exportRunsFromHistory.setAttribute("download", "geo-runs.xls");
     exportRunsFromHistory.setAttribute("target", "_blank");
   }
   if (exportSummary) {
     exportSummary.dataset.projectId = id || "";
-    exportSummary.href = id ? `/api/export/summary.xls?project_id=${id}` : "#";
+    exportSummary.href = id ? withBasePath(`/api/export/summary.xls?project_id=${id}`) : "#";
     exportSummary.setAttribute("download", "geo-summary.xls");
     exportSummary.setAttribute("target", "_blank");
   }
@@ -1675,8 +1723,41 @@ document.getElementById("exportSummary").addEventListener("click", (event) => {
 
 const projectCompetitorTags = initTagInput("projectCompetitorInput", "projectCompetitorsHidden");
 
-initRouting();
-refreshAll().catch((error) => {
+document.getElementById("authLoginForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.getElementById("authPasswordInput");
+  const message = document.getElementById("authMessage");
+  if (message) message.textContent = "";
+  try {
+    await authRequest("/api/auth/login", { password: input.value });
+    input.value = "";
+    hideAuthGate();
+    await refreshAll();
+  } catch (error) {
+    if (message) message.textContent = error.message;
+  }
+});
+
+document.getElementById("logoutBtn").addEventListener("click", async () => {
+  try {
+    await authRequest("/api/auth/logout", {});
+  } finally {
+    showAuthGate("已退出");
+  }
+});
+
+async function boot() {
+  initRouting();
+  const status = await loadAuthStatus();
+  if (status.auth_enabled && !status.authenticated) {
+    showAuthGate("");
+    return;
+  }
+  hideAuthGate();
+  await refreshAll();
+}
+
+boot().catch((error) => {
   const runStatus = document.getElementById("runStatus");
   if (runStatus) runStatus.textContent = "加载失败";
   console.error(error);
