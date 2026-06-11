@@ -172,6 +172,7 @@ python3 scripts/check_task_system.py
 - [docs/retry-export-rerun.md](docs/retry-export-rerun.md)：重试、失败重跑和导出。
 - [docs/postgres-rq.md](docs/postgres-rq.md)：PostgreSQL + Redis/RQ。
 - [docs/agent-mcp.md](docs/agent-mcp.md)：Agent API / MCP 映射。
+- [mcp/README.md](mcp/README.md)：MCP wrapper 使用说明。
 - [docs/model-api-capabilities-2026-06-06.md](docs/model-api-capabilities-2026-06-06.md)：模型 API 能力与参数依据。
 
 ## 部署备注
