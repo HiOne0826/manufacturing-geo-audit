@@ -12,6 +12,67 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = Path(os.environ.get("GEO_AUDIT_DB_PATH", ROOT / "data" / "geo_audit.db"))
+POSTGRES_SCHEMA_PATH = ROOT / "deploy" / "postgres" / "schema.sql"
+
+
+class PostgresConnection:
+    def __init__(self, dsn: str):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("缺少 PostgreSQL 依赖，请先安装：python3 -m pip install -r requirements-worker.txt") from exc
+        self._conn = psycopg.connect(dsn, row_factory=dict_row)
+        self.is_postgres = True
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()):
+        return self._conn.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, sql: str) -> None:
+        for statement in sql.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", "").strip()
+
+
+def should_use_postgres(db_path: Path | str | None = None) -> bool:
+    if not database_url():
+        return False
+    if db_path is None:
+        return True
+    return Path(db_path) == DEFAULT_DB_PATH
+
+
+def is_postgres_conn(conn) -> bool:
+    return bool(getattr(conn, "is_postgres", False))
+
+
+def json_db_value(conn, value: Any) -> Any:
+    if is_postgres_conn(conn):
+        try:
+            from psycopg.types.json import Jsonb
+        except ImportError as exc:
+            raise RuntimeError("缺少 PostgreSQL JSON 依赖，请先安装：python3 -m pip install -r requirements-worker.txt") from exc
+        return Jsonb(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def parse_json_field(value: Any, fallback: Any) -> Any:
+    if value in (None, ""):
+        return fallback
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 DEFAULT_MODEL_CONFIGS = [
     {
@@ -264,7 +325,11 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+def connect(db_path: Path | str | None = DEFAULT_DB_PATH):
+    if should_use_postgres(db_path):
+        return PostgresConnection(database_url())
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5)
@@ -277,7 +342,7 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 @contextmanager
-def get_conn(db_path: Path | str = DEFAULT_DB_PATH):
+def get_conn(db_path: Path | str | None = DEFAULT_DB_PATH):
     conn = connect(db_path)
     try:
         yield conn
@@ -286,8 +351,12 @@ def get_conn(db_path: Path | str = DEFAULT_DB_PATH):
         conn.close()
 
 
-def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
+def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
     with get_conn(db_path) as conn:
+        if is_postgres_conn(conn):
+            conn.executescript(POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8"))
+            seed_model_configs(conn)
+            return
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS projects (
@@ -571,7 +640,7 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
     )
 
 
-def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def row_to_dict(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
@@ -592,12 +661,13 @@ def list_projects(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def create_project(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
+    returning = " RETURNING id" if is_postgres_conn(conn) else ""
     cur = conn.execute(
-        """
+        f"""
         INSERT INTO projects (
             client_name, brand_name, company_name, product_category,
             target_region, website_domain, competitors, notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?){returning}
         """,
         (
             payload.get("client_name", "").strip() or "未命名客户",
@@ -611,6 +681,8 @@ def create_project(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
             utc_now(),
         ),
     )
+    if is_postgres_conn(conn):
+        return int(cur.fetchone()["id"])
     return int(cur.lastrowid)
 
 
@@ -977,15 +1049,16 @@ def update_model_config(conn: sqlite3.Connection, payload: dict[str, Any]) -> No
 
 
 def create_model_config(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
+    returning = " RETURNING id" if is_postgres_conn(conn) else ""
     cur = conn.execute(
-        """
+        f"""
         INSERT INTO model_configs (
             provider, label, api_family, model, model_version, model_type, api_key, api_base,
             priority, daily_limit, supports_pure, supports_search, web_search_mode, web_search_param_path,
             supports_reasoning, reasoning_param_path, reasoning_levels,
             supports_citation, citation_param_path, supports_site_filter, supports_time_filter,
             supports_user_location, supports_tool_calling, active, notes, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){returning}
         """,
         (
             payload.get("provider", "").strip() or "custom",
@@ -1017,6 +1090,8 @@ def create_model_config(conn: sqlite3.Connection, payload: dict[str, Any]) -> in
             utc_now(),
         ),
     )
+    if is_postgres_conn(conn):
+        return int(cur.fetchone()["id"])
     return int(cur.lastrowid)
 
 
@@ -1046,7 +1121,7 @@ def create_sampling_batch(conn: sqlite3.Connection, payload: dict[str, Any]) -> 
             int(payload.get("success_count", 0) or 0),
             int(payload.get("failed_count", 0) or 0),
             int(payload.get("completed_count", 0) or 0),
-            json.dumps(payload.get("config", {}), ensure_ascii=False),
+            json_db_value(conn, payload.get("config", {})),
             payload.get("error_message", ""),
             payload.get("created_at", now),
             payload.get("started_at"),
@@ -1083,7 +1158,7 @@ def get_sampling_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any
     row = row_to_dict(conn.execute("SELECT * FROM sampling_batches WHERE batch_id = ?", (batch_id,)).fetchone())
     if not row:
         return None
-    row["config"] = json.loads(row.pop("config_json") or "{}")
+    row["config"] = parse_json_field(row.pop("config_json"), {})
     return row
 
 
@@ -1112,7 +1187,7 @@ def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = Non
     result = []
     for row in rows:
         item = dict(row)
-        item["config"] = json.loads(item.pop("config_json") or "{}")
+        item["config"] = parse_json_field(item.pop("config_json"), {})
         result.append(item)
     return result
 
@@ -1159,7 +1234,7 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             int(run.get("repeat_index", 1)),
             run["requested_at"],
             run.get("response_text", ""),
-            json.dumps(run.get("citations", []), ensure_ascii=False),
+            json_db_value(conn, run.get("citations", [])),
             int(run.get("latency_ms", 0)),
             float(run.get("cost_estimate", 0)),
             run.get("status", "success"),
@@ -1168,7 +1243,7 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             run.get("reasoning_effort", ""),
             run.get("thinking_budget"),
             run.get("error_message", ""),
-            json.dumps(run.get("raw_response", {}), ensure_ascii=False),
+            json_db_value(conn, run.get("raw_response", {})),
         ),
     )
 
@@ -1188,13 +1263,33 @@ def list_failed_runs_by_batch(conn: sqlite3.Connection, batch_id: str) -> list[d
 
 
 def insert_evaluation(conn: sqlite3.Connection, evaluation: dict[str, Any]) -> None:
-    conn.execute(
+    conflict_clause = ""
+    insert_prefix = "INSERT OR REPLACE INTO"
+    if is_postgres_conn(conn):
+        insert_prefix = "INSERT INTO"
+        conflict_clause = """
+        ON CONFLICT (run_id) DO UPDATE SET
+            target_brand_mentioned = EXCLUDED.target_brand_mentioned,
+            target_brand_rank = EXCLUDED.target_brand_rank,
+            recommendation_strength = EXCLUDED.recommendation_strength,
+            sentiment = EXCLUDED.sentiment,
+            competitors_mentioned = EXCLUDED.competitors_mentioned,
+            owned_site_cited = EXCLUDED.owned_site_cited,
+            third_party_cited = EXCLUDED.third_party_cited,
+            factual_errors = EXCLUDED.factual_errors,
+            risk_level = EXCLUDED.risk_level,
+            evaluator = EXCLUDED.evaluator,
+            evaluation_notes = EXCLUDED.evaluation_notes,
+            created_at = EXCLUDED.created_at
         """
-        INSERT OR REPLACE INTO answer_evaluations (
+    conn.execute(
+        f"""
+        {insert_prefix} answer_evaluations (
             run_id, target_brand_mentioned, target_brand_rank, recommendation_strength,
             sentiment, competitors_mentioned, owned_site_cited, third_party_cited,
             factual_errors, risk_level, evaluator, evaluation_notes, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        {conflict_clause}
         """,
         (
             evaluation["run_id"],

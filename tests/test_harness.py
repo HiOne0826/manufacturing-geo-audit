@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,8 +26,10 @@ class AuthGateTests(unittest.TestCase):
     def setUpClass(cls):
         cls.old_password = os.environ.get("APP_PASSWORD")
         cls.old_secret = os.environ.get("APP_SESSION_SECRET")
+        cls.old_backend = os.environ.get("TASK_QUEUE_BACKEND")
         os.environ["APP_PASSWORD"] = "test-password"
         os.environ["APP_SESSION_SECRET"] = "test-secret"
+        os.environ["TASK_QUEUE_BACKEND"] = "inline"
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.db_path = Path(cls.temp_dir.name) / "auth.db"
         app.DEFAULT_DB_PATH = cls.db_path
@@ -50,6 +53,10 @@ class AuthGateTests(unittest.TestCase):
             os.environ.pop("APP_SESSION_SECRET", None)
         else:
             os.environ["APP_SESSION_SECRET"] = cls.old_secret
+        if cls.old_backend is None:
+            os.environ.pop("TASK_QUEUE_BACKEND", None)
+        else:
+            os.environ["TASK_QUEUE_BACKEND"] = cls.old_backend
 
     def request_json(self, method: str, path: str, payload: dict | None = None, cookie: str = "") -> tuple[dict, dict]:
         data = None
@@ -124,7 +131,9 @@ class AgentApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.old_token = os.environ.get("AGENT_API_TOKEN")
+        cls.old_backend = os.environ.get("TASK_QUEUE_BACKEND")
         os.environ["AGENT_API_TOKEN"] = "agent-test-token"
+        os.environ["TASK_QUEUE_BACKEND"] = "inline"
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.db_path = Path(cls.temp_dir.name) / "agent.db"
         app.DEFAULT_DB_PATH = cls.db_path
@@ -144,6 +153,10 @@ class AgentApiTests(unittest.TestCase):
             os.environ.pop("AGENT_API_TOKEN", None)
         else:
             os.environ["AGENT_API_TOKEN"] = cls.old_token
+        if cls.old_backend is None:
+            os.environ.pop("TASK_QUEUE_BACKEND", None)
+        else:
+            os.environ["TASK_QUEUE_BACKEND"] = cls.old_backend
 
     def request_json(self, method: str, path: str, payload: dict | None = None, token: str = "agent-test-token") -> dict:
         data = None
@@ -200,6 +213,8 @@ class AgentApiTests(unittest.TestCase):
 class HarnessHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.old_backend = os.environ.get("TASK_QUEUE_BACKEND")
+        os.environ["TASK_QUEUE_BACKEND"] = "inline"
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.db_path = Path(cls.temp_dir.name) / "harness.db"
         app.DEFAULT_DB_PATH = cls.db_path
@@ -215,6 +230,10 @@ class HarnessHttpTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.temp_dir.cleanup()
+        if cls.old_backend is None:
+            os.environ.pop("TASK_QUEUE_BACKEND", None)
+        else:
+            os.environ["TASK_QUEUE_BACKEND"] = cls.old_backend
 
     def request_json(self, method: str, path: str, payload: dict | None = None) -> dict:
         data = None
@@ -320,6 +339,32 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertIn("run_id", self.request_text(f"/api/export/runs.csv?project_id={project_id}"))
         self.assertIn("<table", self.request_text(f"/api/export/runs.xls?project_id={project_id}"))
+
+    def test_rq_backend_enqueues_without_inline_thread(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        old_backend = os.environ.get("TASK_QUEUE_BACKEND")
+        os.environ["TASK_QUEUE_BACKEND"] = "rq"
+        try:
+            with mock.patch("app.enqueue_rq_task", return_value="job-test-id") as enqueue:
+                started = self.request_json(
+                    "POST",
+                    "/api/runs/start",
+                    {
+                        "project_id": project_id,
+                        "models": [{"model_config_id": model_id, "search_enabled": False}],
+                        "repeat_count": 1,
+                    },
+                )
+            self.assertEqual(started["task_queue_backend"], "rq")
+            self.assertEqual(started["job_id"], "job-test-id")
+            enqueue.assert_called_once()
+            persisted_status = self.request_json("GET", f"/api/runs/progress?batch_id={started['batch_id']}")
+            self.assertEqual(persisted_status["status"], "queued")
+        finally:
+            if old_backend is None:
+                os.environ.pop("TASK_QUEUE_BACKEND", None)
+            else:
+                os.environ["TASK_QUEUE_BACKEND"] = old_backend
 
 
 class HarnessDirectTests(unittest.TestCase):
