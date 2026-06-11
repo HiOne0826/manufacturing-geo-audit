@@ -20,6 +20,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="本地 Mock 负载测试，不调用真实模型。")
     parser.add_argument("--questions", type=int, default=150)
     parser.add_argument("--models", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--keep-db", default="")
     args = parser.parse_args()
 
@@ -76,6 +77,7 @@ def main() -> int:
             {
                 "models": [{"model_config_id": model_id, "search_enabled": False} for model_id in model_ids],
                 "repeat_count": 1,
+                "max_workers": args.workers,
             },
             batch_id="local-load-test",
         )
@@ -95,6 +97,7 @@ def main() -> int:
         "csv_generated": "run_id" in csv_body,
         "xls_generated": "<table" in xls_body,
         "elapsed_seconds": round(time.time() - started_at, 3),
+        "workers": args.workers,
         "db_path": str(db_path),
     }
     assert imported == args.questions, checks

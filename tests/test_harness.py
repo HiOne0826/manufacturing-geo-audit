@@ -317,6 +317,75 @@ class HarnessDirectTests(unittest.TestCase):
             self.assertEqual(result["success"] + result["failed"], result["total"])
             self.assertEqual(len(runs), 450)
 
+    def test_one_model_failure_does_not_stop_batch(self):
+        old_value = os.environ.pop("ALLOW_LIVE_MODEL_CALLS", None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "mixed.db"
+                init_db(db_path)
+                with get_conn(db_path) as conn:
+                    project_id = create_project(
+                        conn,
+                        {
+                            "client_name": "混合测试客户",
+                            "brand_name": "混合测试品牌",
+                            "product_category": "测试品类",
+                        },
+                    )
+                    rows = [
+                        {
+                            "question_id": f"M{idx:03d}",
+                            "question": f"第 {idx} 个混合批次问题，混合测试品牌是否出现？",
+                            "question_type": "mixed",
+                            "target_brand": "混合测试品牌",
+                        }
+                        for idx in range(1, 3)
+                    ]
+                    self.assertEqual(import_questions_rows(conn, project_id, rows), 2)
+                    mock_model_id = create_model_config(
+                        conn,
+                        {
+                            "provider": "mock",
+                            "label": "Mock",
+                            "model": "mock-model",
+                            "supports_pure": True,
+                            "active": True,
+                        },
+                    )
+                    blocked_model_id = create_model_config(
+                        conn,
+                        {
+                            "provider": "openai",
+                            "label": "Blocked OpenAI",
+                            "model": "gpt-4.1",
+                            "api_key": "fake-key",
+                            "api_base": "https://api.openai.com/v1",
+                            "supports_pure": True,
+                            "active": True,
+                        },
+                    )
+                    result = run_batch(
+                        conn,
+                        project_id,
+                        {
+                            "models": [
+                                {"model_config_id": mock_model_id, "search_enabled": False},
+                                {"model_config_id": blocked_model_id, "search_enabled": False},
+                            ],
+                            "repeat_count": 1,
+                            "max_workers": 4,
+                        },
+                        batch_id="mixed-failure-batch",
+                    )
+                    runs = list_runs(conn, project_id, limit=10)
+                self.assertEqual(result["total"], 4)
+                self.assertEqual(result["success"], 2)
+                self.assertEqual(result["failed"], 2)
+                self.assertEqual(len(runs), 4)
+        finally:
+            if old_value is not None:
+                os.environ["ALLOW_LIVE_MODEL_CALLS"] = old_value
+
 
 if __name__ == "__main__":
     unittest.main()

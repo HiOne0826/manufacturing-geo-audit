@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 from .adapters import AdapterError, call_configured_model
 from .db import (
+    get_conn,
     get_model_config,
     get_project,
     insert_evaluation,
@@ -13,6 +18,35 @@ from .db import (
     utc_now,
 )
 from .evaluator import evaluate_answer
+
+
+def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def sampling_max_workers(config: dict[str, Any] | None = None) -> int:
+    raw = (config or {}).get("max_workers")
+    if raw not in (None, "", "null"):
+        try:
+            return max(1, min(int(raw), 64))
+        except (TypeError, ValueError):
+            pass
+    return env_int("SAMPLING_MAX_WORKERS", 8, minimum=1, maximum=64)
+
+
+def provider_max_workers() -> int:
+    return env_int("SAMPLING_PROVIDER_MAX_WORKERS", 3, minimum=1, maximum=32)
+
+
+def connection_db_path(conn) -> Path:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if not row or not row[2]:
+        raise ValueError("当前数据库连接没有文件路径，不能用于并发采样")
+    return Path(row[2])
 
 
 def estimate_batch_total(conn, project_id: int, config: dict[str, Any]) -> int:
@@ -28,6 +62,138 @@ def estimate_batch_total(conn, project_id: int, config: dict[str, Any]) -> int:
     if not providers:
         raise ValueError("请至少选择一个模型")
     return len(questions) * len(providers) * repeat_count
+
+
+def prepare_runtime_task(
+    *,
+    batch_id: str,
+    project_id: int,
+    question: dict[str, Any],
+    provider_cfg: dict[str, Any],
+    model_config: dict[str, Any],
+    config: dict[str, Any],
+    repeat_index: int,
+) -> dict[str, Any]:
+    run_id = f"run-{uuid.uuid4().hex}"
+    runtime_model = str(provider_cfg.get("runtime_model", "")).strip()
+    runtime_model_version = str(provider_cfg.get("runtime_model_version", "")).strip()
+    runtime_model_config = {**model_config}
+    if runtime_model:
+        runtime_model_config["model"] = runtime_model
+    if runtime_model_version:
+        runtime_model_config["model_version"] = runtime_model_version
+    provider = runtime_model_config.get("provider", "")
+    model = runtime_model_config.get("model", "")
+    model_search_mode = str(provider_cfg.get("search_mode", config.get("search_mode", "auto"))).strip() or "auto"
+    search_enabled = bool(provider_cfg.get("search_enabled", False)) and model_search_mode != "off"
+    model_thinking_enabled = bool(provider_cfg.get("thinking_enabled", False))
+    model_thinking_type = str(
+        provider_cfg.get("thinking_type", config.get("thinking_type", "enabled" if model_thinking_enabled else "disabled"))
+    ).strip() or ("enabled" if model_thinking_enabled else "disabled")
+    model_reasoning_effort = (
+        str(provider_cfg.get("reasoning_effort", config.get("reasoning_effort", ""))).strip() if model_thinking_enabled else ""
+    )
+    model_temperature = float(provider_cfg.get("temperature", config.get("temperature", 0)) or 0)
+    raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
+    model_thinking_budget = None
+    if model_thinking_enabled and raw_budget not in (None, "", "null"):
+        model_thinking_budget = int(raw_budget)
+    base = {
+        "run_id": run_id,
+        "batch_id": batch_id,
+        "project_id": project_id,
+        "question_id": question["id"],
+        "provider": provider,
+        "model": model or provider,
+        "search_enabled": search_enabled,
+        "search_mode": model_search_mode if search_enabled else "off",
+        "temperature": model_temperature,
+        "repeat_index": repeat_index,
+        "thinking_type": model_thinking_type,
+        "reasoning_effort": model_reasoning_effort,
+        "thinking_budget": model_thinking_budget,
+        "requested_at": utc_now(),
+    }
+    run_options = {
+        "search_mode": model_search_mode,
+        "thinking_type": model_thinking_type,
+        "reasoning_effort": model_reasoning_effort,
+        "thinking_budget": model_thinking_budget,
+        "runtime_model": runtime_model,
+        "runtime_model_version": runtime_model_version,
+        "search_sources": provider_cfg.get("search_sources", ""),
+        "search_limit": provider_cfg.get("search_limit"),
+        "search_max_keyword": provider_cfg.get("search_max_keyword", ""),
+        "search_user_location": provider_cfg.get("search_user_location", ""),
+        "search_site_filter": provider_cfg.get("search_site_filter", ""),
+        "search_time_filter": provider_cfg.get("search_time_filter", ""),
+        "search_strategy": provider_cfg.get("search_strategy", ""),
+        "search_freshness": provider_cfg.get("search_freshness", ""),
+        "search_prompt_intervene": provider_cfg.get("search_prompt_intervene", ""),
+        "search_enable_source": provider_cfg.get("search_enable_source", False),
+        "search_enable_citation": provider_cfg.get("search_enable_citation", False),
+        "search_citation_format": provider_cfg.get("search_citation_format", ""),
+    }
+    return {
+        "base": base,
+        "model_config": runtime_model_config,
+        "question": question,
+        "run_options": run_options,
+        "temperature": model_temperature,
+        "search_enabled": search_enabled,
+    }
+
+
+def execute_sampling_task(task: dict[str, Any], *, db_path: Path, project: dict[str, Any], semaphore: threading.Semaphore) -> dict[str, Any]:
+    base = task["base"]
+    question = task["question"]
+    try:
+        with semaphore:
+            result = call_configured_model(
+                task["model_config"],
+                question["question"],
+                task["search_enabled"],
+                task["temperature"],
+                task["run_options"],
+            )
+        run = {
+            **base,
+            "provider": result.get("provider", base["provider"]),
+            "model": result.get("model", base["model"]),
+            "model_version": result.get("model_version", task["model_config"].get("model_version", "")),
+            "response_text": result.get("response_text", ""),
+            "citations": result.get("citations", []),
+            "latency_ms": result.get("latency_ms", 0),
+            "status": "success",
+            "raw_response": result.get("raw_response", {}),
+        }
+        evaluation = evaluate_answer(
+            run_id=base["run_id"],
+            answer=run["response_text"],
+            target_brand=question.get("target_brand") or project.get("brand_name", ""),
+            competitors=question.get("competitor_brands") or project.get("competitors", ""),
+            website_domain=project.get("website_domain", ""),
+            citations=run.get("citations", []),
+        )
+        with get_conn(db_path) as conn:
+            insert_run(conn, run)
+            insert_evaluation(conn, evaluation)
+        return {**base, "status": "success"}
+    except (AdapterError, Exception) as exc:
+        with get_conn(db_path) as conn:
+            insert_run(
+                conn,
+                {
+                    **base,
+                    "response_text": "",
+                    "citations": [],
+                    "latency_ms": 0,
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "raw_response": {},
+                },
+            )
+        return {**base, "status": "failed", "error_message": str(exc)}
 
 
 def run_batch(
@@ -49,128 +215,74 @@ def run_batch(
     repeat_count = max(1, min(int(config.get("repeat_count", 1)), 10))
     if not providers:
         raise ValueError("请至少选择一个模型")
-    batch_id = batch_id or f"batch-{uuid.uuid4().hex[:10]}"
-    total_expected = len(questions) * len(providers) * repeat_count
-    total = 0
-    failed = 0
 
+    db_path = connection_db_path(conn)
+    batch_id = batch_id or f"batch-{uuid.uuid4().hex[:10]}"
+    model_configs: dict[int, dict[str, Any]] = {}
+    for provider_cfg in providers:
+        model_config_id = int(provider_cfg.get("model_config_id", 0))
+        model_config = get_model_config(conn, model_config_id)
+        if not model_config:
+            raise ValueError("模型配置不存在")
+        model_configs[model_config_id] = model_config
+
+    tasks: list[dict[str, Any]] = []
     for question in questions:
         for provider_cfg in providers:
+            model_config_id = int(provider_cfg.get("model_config_id", 0))
             for repeat_index in range(1, repeat_count + 1):
-                run_id = f"run-{uuid.uuid4().hex}"
-                model_config_id = int(provider_cfg.get("model_config_id", 0))
-                model_config = get_model_config(conn, model_config_id)
-                if not model_config:
-                    raise ValueError("模型配置不存在")
-                runtime_model = str(provider_cfg.get("runtime_model", "")).strip()
-                runtime_model_version = str(provider_cfg.get("runtime_model_version", "")).strip()
-                runtime_model_config = {**model_config}
-                if runtime_model:
-                    runtime_model_config["model"] = runtime_model
-                if runtime_model_version:
-                    runtime_model_config["model_version"] = runtime_model_version
-                provider = runtime_model_config.get("provider", "")
-                model = runtime_model_config.get("model", "")
-                model_search_mode = str(provider_cfg.get("search_mode", config.get("search_mode", "auto"))).strip() or "auto"
-                search_enabled = bool(provider_cfg.get("search_enabled", False)) and model_search_mode != "off"
-                model_thinking_enabled = bool(provider_cfg.get("thinking_enabled", False))
-                model_thinking_type = str(
-                    provider_cfg.get("thinking_type", config.get("thinking_type", "enabled" if model_thinking_enabled else "disabled"))
-                ).strip() or ("enabled" if model_thinking_enabled else "disabled")
-                model_reasoning_effort = (
-                    str(provider_cfg.get("reasoning_effort", config.get("reasoning_effort", ""))).strip() if model_thinking_enabled else ""
+                tasks.append(
+                    prepare_runtime_task(
+                        batch_id=batch_id,
+                        project_id=project_id,
+                        question=question,
+                        provider_cfg=provider_cfg,
+                        model_config=model_configs[model_config_id],
+                        config=config,
+                        repeat_index=repeat_index,
+                    )
                 )
-                model_temperature = float(provider_cfg.get("temperature", config.get("temperature", 0)) or 0)
-                raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
-                model_thinking_budget = None
-                if model_thinking_enabled and raw_budget not in (None, "", "null"):
-                    model_thinking_budget = int(raw_budget)
-                base = {
-                    "run_id": run_id,
-                    "batch_id": batch_id,
-                    "project_id": project_id,
-                    "question_id": question["id"],
-                    "provider": provider,
-                    "model": model or provider,
-                    "search_enabled": search_enabled,
-                    "search_mode": model_search_mode if search_enabled else "off",
-                    "temperature": model_temperature,
-                    "repeat_index": repeat_index,
-                    "thinking_type": model_thinking_type,
-                    "reasoning_effort": model_reasoning_effort,
-                    "thinking_budget": model_thinking_budget,
-                    "requested_at": utc_now(),
-                }
-                try:
-                    result = call_configured_model(
-                        runtime_model_config,
-                        question["question"],
-                        search_enabled,
-                        model_temperature,
-                        {
-                            "search_mode": model_search_mode,
-                            "thinking_type": model_thinking_type,
-                            "reasoning_effort": model_reasoning_effort,
-                            "thinking_budget": model_thinking_budget,
-                            "runtime_model": runtime_model,
-                            "runtime_model_version": runtime_model_version,
-                            "search_sources": provider_cfg.get("search_sources", ""),
-                            "search_limit": provider_cfg.get("search_limit"),
-                            "search_max_keyword": provider_cfg.get("search_max_keyword", ""),
-                            "search_user_location": provider_cfg.get("search_user_location", ""),
-                            "search_site_filter": provider_cfg.get("search_site_filter", ""),
-                            "search_time_filter": provider_cfg.get("search_time_filter", ""),
-                        },
-                    )
-                    run = {
-                        **base,
-                        "provider": result.get("provider", provider),
-                        "model": result.get("model", model or provider),
-                        "model_version": result.get("model_version", runtime_model_config.get("model_version", "")),
-                        "response_text": result.get("response_text", ""),
-                        "citations": result.get("citations", []),
-                        "latency_ms": result.get("latency_ms", 0),
-                        "status": "success",
-                        "raw_response": result.get("raw_response", {}),
+
+    conn.commit()
+    total_expected = len(tasks)
+    completed = 0
+    failed = 0
+    provider_limit = provider_max_workers()
+    semaphores: dict[str, threading.Semaphore] = {}
+    for task in tasks:
+        provider = task["base"]["provider"] or "unknown"
+        semaphores.setdefault(provider, threading.Semaphore(provider_limit))
+    max_workers = min(sampling_max_workers(config), max(1, total_expected))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                execute_sampling_task,
+                task,
+                db_path=db_path,
+                project=project,
+                semaphore=semaphores[task["base"]["provider"] or "unknown"],
+            )
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            outcome = future.result()
+            completed += 1
+            if outcome["status"] == "failed":
+                failed += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "batch_id": batch_id,
+                        "total": total_expected,
+                        "completed": completed,
+                        "failed": failed,
+                        "success": completed - failed,
+                        "provider": outcome["provider"],
+                        "model": outcome["model"],
+                        "question_id": outcome["question_id"],
+                        "repeat_index": outcome["repeat_index"],
                     }
-                    insert_run(conn, run)
-                    evaluation = evaluate_answer(
-                        run_id=run_id,
-                        answer=run["response_text"],
-                        target_brand=question.get("target_brand") or project.get("brand_name", ""),
-                        competitors=question.get("competitor_brands") or project.get("competitors", ""),
-                        website_domain=project.get("website_domain", ""),
-                        citations=run.get("citations", []),
-                    )
-                    insert_evaluation(conn, evaluation)
-                except AdapterError as exc:
-                    failed += 1
-                    insert_run(
-                        conn,
-                        {
-                            **base,
-                            "response_text": "",
-                            "citations": [],
-                            "latency_ms": 0,
-                            "status": "failed",
-                            "error_message": str(exc),
-                            "raw_response": {},
-                        },
-                    )
-                conn.commit()
-                total += 1
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "batch_id": batch_id,
-                            "total": total_expected,
-                            "completed": total,
-                            "failed": failed,
-                            "success": total - failed,
-                            "provider": provider,
-                            "model": model or provider,
-                            "question_id": question["id"],
-                            "repeat_index": repeat_index,
-                        }
-                    )
-    return {"batch_id": batch_id, "total": total, "failed": failed, "success": total - failed}
+                )
+
+    return {"batch_id": batch_id, "total": completed, "failed": failed, "success": completed - failed}
