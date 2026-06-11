@@ -366,6 +366,7 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
                 batch_id TEXT NOT NULL,
                 project_id INTEGER NOT NULL,
                 question_id INTEGER NOT NULL,
+                model_config_id INTEGER DEFAULT 0,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
                 model_version TEXT DEFAULT '',
@@ -467,6 +468,7 @@ def migrate_model_runs_schema(conn: sqlite3.Connection) -> None:
         "thinking_type": "ALTER TABLE model_runs ADD COLUMN thinking_type TEXT DEFAULT 'disabled'",
         "reasoning_effort": "ALTER TABLE model_runs ADD COLUMN reasoning_effort TEXT DEFAULT ''",
         "thinking_budget": "ALTER TABLE model_runs ADD COLUMN thinking_budget INTEGER",
+        "model_config_id": "ALTER TABLE model_runs ADD COLUMN model_config_id INTEGER DEFAULT 0",
     }
     for name, sql in additions.items():
         if name not in columns:
@@ -1137,17 +1139,18 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO model_runs (
-            run_id, batch_id, project_id, question_id, provider, model, model_version,
+            run_id, batch_id, project_id, question_id, model_config_id, provider, model, model_version,
             search_enabled, temperature, repeat_index, requested_at, response_text,
             citations_json, latency_ms, cost_estimate, status, search_mode, thinking_type,
             reasoning_effort, thinking_budget, error_message, raw_response_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run["run_id"],
             run["batch_id"],
             run["project_id"],
             run["question_id"],
+            int(run.get("model_config_id", 0) or 0),
             run["provider"],
             run["model"],
             run.get("model_version", ""),
@@ -1168,6 +1171,20 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             json.dumps(run.get("raw_response", {}), ensure_ascii=False),
         ),
     )
+
+
+def list_failed_runs_by_batch(conn: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT r.*, q.question, q.target_brand, q.competitor_brands
+        FROM model_runs r
+        JOIN questions q ON q.id = r.question_id
+        WHERE r.batch_id = ? AND r.status = 'failed'
+        ORDER BY r.id ASC
+        """,
+        (batch_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def insert_evaluation(conn: sqlite3.Connection, evaluation: dict[str, Any]) -> None:

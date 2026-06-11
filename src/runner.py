@@ -42,6 +42,16 @@ def provider_max_workers() -> int:
     return env_int("SAMPLING_PROVIDER_MAX_WORKERS", 3, minimum=1, maximum=32)
 
 
+def retry_count(config: dict[str, Any] | None = None) -> int:
+    raw = (config or {}).get("retry_count")
+    if raw not in (None, "", "null"):
+        try:
+            return max(0, min(int(raw), 5))
+        except (TypeError, ValueError):
+            pass
+    return env_int("SAMPLING_RETRY_COUNT", 1, minimum=0, maximum=5)
+
+
 def connection_db_path(conn) -> Path:
     row = conn.execute("PRAGMA database_list").fetchone()
     if not row or not row[2]:
@@ -103,6 +113,7 @@ def prepare_runtime_task(
         "batch_id": batch_id,
         "project_id": project_id,
         "question_id": question["id"],
+        "model_config_id": int(model_config.get("id", provider_cfg.get("model_config_id", 0)) or 0),
         "provider": provider,
         "model": model or provider,
         "search_enabled": search_enabled,
@@ -144,18 +155,36 @@ def prepare_runtime_task(
     }
 
 
-def execute_sampling_task(task: dict[str, Any], *, db_path: Path, project: dict[str, Any], semaphore: threading.Semaphore) -> dict[str, Any]:
+def execute_sampling_task(
+    task: dict[str, Any],
+    *,
+    db_path: Path,
+    project: dict[str, Any],
+    semaphore: threading.Semaphore,
+    max_retries: int,
+) -> dict[str, Any]:
     base = task["base"]
     question = task["question"]
+    last_error = None
+    result = None
     try:
-        with semaphore:
-            result = call_configured_model(
-                task["model_config"],
-                question["question"],
-                task["search_enabled"],
-                task["temperature"],
-                task["run_options"],
-            )
+        for attempt in range(0, max_retries + 1):
+            try:
+                with semaphore:
+                    result = call_configured_model(
+                        task["model_config"],
+                        question["question"],
+                        task["search_enabled"],
+                        task["temperature"],
+                        task["run_options"],
+                    )
+                break
+            except AdapterError as exc:
+                last_error = exc
+                if attempt >= max_retries:
+                    raise
+        if result is None:
+            raise AdapterError(str(last_error or "模型调用失败"))
         run = {
             **base,
             "provider": result.get("provider", base["provider"]),
@@ -179,7 +208,7 @@ def execute_sampling_task(task: dict[str, Any], *, db_path: Path, project: dict[
             insert_run(conn, run)
             insert_evaluation(conn, evaluation)
         return {**base, "status": "success"}
-    except (AdapterError, Exception) as exc:
+    except Exception as exc:
         with get_conn(db_path) as conn:
             insert_run(
                 conn,
@@ -194,6 +223,90 @@ def execute_sampling_task(task: dict[str, Any], *, db_path: Path, project: dict[
                 },
             )
         return {**base, "status": "failed", "error_message": str(exc)}
+
+
+def build_tasks(
+    *,
+    batch_id: str,
+    project_id: int,
+    config: dict[str, Any],
+    questions: list[dict[str, Any]],
+    model_configs: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    providers = config.get("models") or []
+    repeat_count = max(1, min(int(config.get("repeat_count", 1)), 10))
+    tasks: list[dict[str, Any]] = []
+    for question in questions:
+        for provider_cfg in providers:
+            model_config_id = int(provider_cfg.get("model_config_id", 0))
+            for repeat_index in range(1, repeat_count + 1):
+                tasks.append(
+                    prepare_runtime_task(
+                        batch_id=batch_id,
+                        project_id=project_id,
+                        question=question,
+                        provider_cfg=provider_cfg,
+                        model_config=model_configs[model_config_id],
+                        config=config,
+                        repeat_index=repeat_index,
+                    )
+                )
+    return tasks
+
+
+def run_prepared_tasks(
+    *,
+    tasks: list[dict[str, Any]],
+    db_path: Path,
+    project: dict[str, Any],
+    config: dict[str, Any],
+    batch_id: str,
+    progress_callback=None,
+) -> dict[str, Any]:
+    total_expected = len(tasks)
+    completed = 0
+    failed = 0
+    provider_limit = provider_max_workers()
+    semaphores: dict[str, threading.Semaphore] = {}
+    for task in tasks:
+        provider = task["base"]["provider"] or "unknown"
+        semaphores.setdefault(provider, threading.Semaphore(provider_limit))
+    max_workers = min(sampling_max_workers(config), max(1, total_expected))
+    max_retries = retry_count(config)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                execute_sampling_task,
+                task,
+                db_path=db_path,
+                project=project,
+                semaphore=semaphores[task["base"]["provider"] or "unknown"],
+                max_retries=max_retries,
+            )
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            outcome = future.result()
+            completed += 1
+            if outcome["status"] == "failed":
+                failed += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "batch_id": batch_id,
+                        "total": total_expected,
+                        "completed": completed,
+                        "failed": failed,
+                        "success": completed - failed,
+                        "provider": outcome["provider"],
+                        "model": outcome["model"],
+                        "question_id": outcome["question_id"],
+                        "repeat_index": outcome["repeat_index"],
+                    }
+                )
+
+    return {"batch_id": batch_id, "total": completed, "failed": failed, "success": completed - failed}
 
 
 def run_batch(
@@ -226,63 +339,69 @@ def run_batch(
             raise ValueError("模型配置不存在")
         model_configs[model_config_id] = model_config
 
-    tasks: list[dict[str, Any]] = []
-    for question in questions:
-        for provider_cfg in providers:
-            model_config_id = int(provider_cfg.get("model_config_id", 0))
-            for repeat_index in range(1, repeat_count + 1):
-                tasks.append(
-                    prepare_runtime_task(
-                        batch_id=batch_id,
-                        project_id=project_id,
-                        question=question,
-                        provider_cfg=provider_cfg,
-                        model_config=model_configs[model_config_id],
-                        config=config,
-                        repeat_index=repeat_index,
-                    )
-                )
-
+    tasks = build_tasks(batch_id=batch_id, project_id=project_id, config=config, questions=questions, model_configs=model_configs)
     conn.commit()
-    total_expected = len(tasks)
-    completed = 0
-    failed = 0
-    provider_limit = provider_max_workers()
-    semaphores: dict[str, threading.Semaphore] = {}
-    for task in tasks:
-        provider = task["base"]["provider"] or "unknown"
-        semaphores.setdefault(provider, threading.Semaphore(provider_limit))
-    max_workers = min(sampling_max_workers(config), max(1, total_expected))
+    return run_prepared_tasks(
+        tasks=tasks,
+        db_path=db_path,
+        project=project,
+        config=config,
+        batch_id=batch_id,
+        progress_callback=progress_callback,
+    )
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                execute_sampling_task,
-                task,
-                db_path=db_path,
-                project=project,
-                semaphore=semaphores[task["base"]["provider"] or "unknown"],
+
+def rerun_failed_runs(conn, batch_id: str, failed_runs: list[dict[str, Any]], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not failed_runs:
+        return {"batch_id": batch_id, "total": 0, "failed": 0, "success": 0}
+    project_id = int(failed_runs[0]["project_id"])
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    questions_by_id = {item["id"]: item for item in list_questions(conn, project_id)}
+    model_configs: dict[int, dict[str, Any]] = {}
+    tasks = []
+    rerun_config = {"repeat_count": 1, **(config or {})}
+    for run in failed_runs:
+        model_config_id = int(run.get("model_config_id", 0) or 0)
+        if not model_config_id:
+            continue
+        if model_config_id not in model_configs:
+            model_config = get_model_config(conn, model_config_id)
+            if not model_config:
+                continue
+            model_configs[model_config_id] = model_config
+        question = questions_by_id.get(int(run["question_id"]))
+        if not question:
+            continue
+        provider_cfg = {
+            "model_config_id": model_config_id,
+            "runtime_model": "",
+            "runtime_model_version": run.get("model_version", ""),
+            "search_enabled": bool(run.get("search_enabled")),
+            "search_mode": run.get("search_mode", "auto"),
+            "thinking_enabled": run.get("thinking_type") != "disabled",
+            "thinking_type": run.get("thinking_type", "disabled"),
+            "reasoning_effort": run.get("reasoning_effort", ""),
+            "thinking_budget": run.get("thinking_budget"),
+            "temperature": run.get("temperature", 0),
+        }
+        tasks.append(
+            prepare_runtime_task(
+                batch_id=batch_id,
+                project_id=project_id,
+                question=question,
+                provider_cfg=provider_cfg,
+                model_config=model_configs[model_config_id],
+                config=rerun_config,
+                repeat_index=int(run.get("repeat_index", 1) or 1),
             )
-            for task in tasks
-        ]
-        for future in as_completed(futures):
-            outcome = future.result()
-            completed += 1
-            if outcome["status"] == "failed":
-                failed += 1
-            if progress_callback:
-                progress_callback(
-                    {
-                        "batch_id": batch_id,
-                        "total": total_expected,
-                        "completed": completed,
-                        "failed": failed,
-                        "success": completed - failed,
-                        "provider": outcome["provider"],
-                        "model": outcome["model"],
-                        "question_id": outcome["question_id"],
-                        "repeat_index": outcome["repeat_index"],
-                    }
-                )
-
-    return {"batch_id": batch_id, "total": completed, "failed": failed, "success": completed - failed}
+        )
+    conn.commit()
+    return run_prepared_tasks(
+        tasks=tasks,
+        db_path=connection_db_path(conn),
+        project=project,
+        config=rerun_config,
+        batch_id=batch_id,
+    )

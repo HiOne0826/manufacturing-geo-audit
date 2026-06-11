@@ -29,6 +29,7 @@ from src.db import (
     import_questions_csv,
     import_questions_rows,
     init_db,
+    list_failed_runs_by_batch,
     list_model_configs,
     list_projects,
     list_questions,
@@ -48,7 +49,7 @@ from src.exporter import (
     runs_to_excel_html,
 )
 from src.runtime_env import load_dotenv_file
-from src.runner import estimate_batch_total, run_batch
+from src.runner import estimate_batch_total, rerun_failed_runs, run_batch
 from src.db import utc_now
 
 
@@ -221,6 +222,65 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
         )
 
 
+def rerun_failed_in_background(batch_id: str, payload: dict):
+    set_sampling_job(batch_id, status="running", started_at=utc_now())
+    try:
+        with get_conn(DEFAULT_DB_PATH) as conn:
+            failed_runs = list_failed_runs_by_batch(conn, batch_id)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "running",
+                    "total_count": len(failed_runs),
+                    "completed_count": 0,
+                    "failed_count": 0,
+                    "success_count": 0,
+                    "error_message": "",
+                    "started_at": utc_now(),
+                    "finished_at": None,
+                    "updated_at": utc_now(),
+                },
+            )
+            conn.commit()
+
+            result = rerun_failed_runs(conn, batch_id, failed_runs, payload)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "completed",
+                    "total_count": result["total"],
+                    "completed_count": result["total"],
+                    "failed_count": result["failed"],
+                    "success_count": result["success"],
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+        set_sampling_job(
+            batch_id,
+            status="completed",
+            total=result["total"],
+            completed=result["total"],
+            failed=result["failed"],
+            success=result["success"],
+            finished_at=utc_now(),
+            updated_at=utc_now(),
+        )
+    except Exception as exc:
+        with get_conn(DEFAULT_DB_PATH) as conn:
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+        set_sampling_job(batch_id, status="failed", error=str(exc), finished_at=utc_now(), updated_at=utc_now())
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path)
@@ -417,6 +477,25 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/export/summary.xls":
                     project_id = int(query.get("project_id", [0])[0])
                     self.excel_html_response(analytics_to_excel_html(analytics(conn, project_id)), "geo-summary.xls")
+                elif parsed.path.startswith("/api/export/batches/"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) != 5:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[3]
+                    export_name = parts[4]
+                    rows = list_runs_by_batch(conn, batch_id)
+                    if export_name == "runs.xls":
+                        self.excel_html_response(runs_to_excel_html(rows), f"geo-batch-{batch_id}-runs.xls")
+                        return
+                    if export_name == "summary.xls":
+                        batch = get_sampling_batch(conn, batch_id)
+                        if not batch:
+                            self.json_response({"error": "批次不存在"}, 404)
+                            return
+                        self.excel_html_response(analytics_to_excel_html(analytics(conn, int(batch["project_id"]))), f"geo-batch-{batch_id}-summary.xls")
+                        return
+                    self.json_response({"error": "接口不存在"}, 404)
                 elif parsed.path == "/api/export/runs/save":
                     project_id = int(query.get("project_id", [0])[0])
                     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -535,6 +614,33 @@ class Handler(SimpleHTTPRequestHandler):
                     ).start()
                     result = {"batch_id": batch_id, "total": total, "failed": 0, "success": 0, "status": "queued"}
                     self.json_response(result)
+                elif parsed.path.startswith("/api/batches/") and parsed.path.endswith("/rerun_failed"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) != 4:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[2]
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    failed_runs = list_failed_runs_by_batch(conn, batch_id)
+                    set_sampling_job(
+                        batch_id,
+                        project_id=batch["project_id"],
+                        total=len(failed_runs),
+                        completed=0,
+                        failed=0,
+                        success=0,
+                        status="queued",
+                        updated_at=utc_now(),
+                    )
+                    threading.Thread(
+                        target=rerun_failed_in_background,
+                        args=(batch_id, payload),
+                        daemon=True,
+                    ).start()
+                    self.json_response({"batch_id": batch_id, "total": len(failed_runs), "status": "queued"})
                 else:
                     self.json_response({"error": "接口不存在"}, 404)
         except Exception as exc:
