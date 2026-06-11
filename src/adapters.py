@@ -20,6 +20,62 @@ class AdapterError(RuntimeError):
 
 OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
 
+PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
+    "openai": {
+        "temperature": 1,
+        "reasoning_effort": "medium",
+        "defaults_note": "OpenAI Responses API：temperature 默认 1；reasoning.effort 未指定时按 medium 处理。",
+    },
+    "gemini": {
+        "temperature": 1,
+        "thinking_budget": 0,
+        "defaults_note": "Gemini：temperature 默认 1；thinkingBudget=0 用于关闭思考，留空可走模型动态默认。",
+    },
+    "doubao": {
+        "temperature": 1,
+        "reasoning_effort": "",
+        "defaults_note": "豆包：普通对话按 temperature=1；联网搜索走 Responses API，思考默认关闭。",
+    },
+    "deepseek": {
+        "temperature": 1,
+        "reasoning_effort": "",
+        "defaults_note": "DeepSeek 官方 Chat Completions：temperature 默认 1，top_p 默认 1。",
+    },
+    "qwen": {
+        "temperature": 0.1,
+        "reasoning_effort": "",
+        "search_strategy": "turbo",
+        "defaults_note": "通义千问：事实问答推荐 temperature=0.1；联网搜索 search_strategy 预填 turbo。",
+    },
+    "hunyuan": {
+        "temperature": 0,
+        "reasoning_effort": "",
+        "defaults_note": "腾讯混元：确定性审计默认 temperature=0；官方限制 temperature <= 2。",
+    },
+    "kimi": {
+        "temperature": 0.6,
+        "reasoning_effort": "",
+        "defaults_note": "Kimi K2.5 当前 API 仅接受 temperature=0.6；联网搜索需关闭深度思考。",
+    },
+    "ernie": {
+        "temperature": 0.1,
+        "reasoning_effort": "",
+        "defaults_note": "文心/千帆：事实问答默认 temperature=0.1；思考默认关闭。",
+    },
+    "minimax": {
+        "temperature": 0.1,
+        "reasoning_effort": "",
+        "defaults_note": "MiniMax：事实问答默认 temperature=0.1；思考默认关闭。",
+    },
+}
+
+
+def provider_sampling_defaults(provider: str, model: str = "") -> dict[str, Any]:
+    defaults = dict(PROVIDER_SAMPLING_DEFAULTS.get(provider, {}))
+    if provider == "kimi" and str(model).startswith("kimi-k2.5"):
+        defaults["temperature"] = 0.6
+    return defaults
+
 
 PROVIDER_PRESETS = {
     "mock": {
@@ -486,7 +542,7 @@ def resolve_provider_runtime_config(provider: str, api_key: str, api_base: str, 
 
 def normalize_kimi_temperature(model: str, temperature: float) -> float:
     if str(model).startswith("kimi-k2.5"):
-        return 1
+        return 0.6
     return temperature
 
 
@@ -1089,6 +1145,7 @@ def enrich_model_config(item: dict[str, Any]) -> dict[str, Any]:
     return {
         **preset,
         **safe_item,
+        "sampling_defaults": provider_sampling_defaults(item.get("provider", ""), item.get("model", "")),
         "has_key": provider_has_credentials(item.get("provider", ""), api_key),
         "api_key_masked": mask_key(resolved_api_key),
     }

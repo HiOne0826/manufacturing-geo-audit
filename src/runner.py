@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .adapters import AdapterError, call_configured_model
+from .adapters import AdapterError, call_configured_model, provider_sampling_defaults
 from .db import (
     get_conn,
     get_model_config,
@@ -106,7 +106,11 @@ def prepare_runtime_task(
     model_reasoning_effort = (
         str(provider_cfg.get("reasoning_effort", config.get("reasoning_effort", ""))).strip() if model_thinking_enabled else ""
     )
-    model_temperature = float(provider_cfg.get("temperature", config.get("temperature", 0)) or 0)
+    sampling_defaults = provider_sampling_defaults(provider, model)
+    raw_temperature = provider_cfg.get("temperature", config.get("temperature"))
+    if raw_temperature in (None, "", "null"):
+        raw_temperature = sampling_defaults.get("temperature", 0)
+    model_temperature = float(raw_temperature or 0)
     raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
     model_thinking_budget = None
     if model_thinking_enabled and raw_budget not in (None, "", "null"):

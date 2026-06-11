@@ -300,6 +300,14 @@ class HarnessHttpTests(unittest.TestCase):
         for model in json.loads(raw)["models"]:
             self.assertNotIn("api_key", model)
 
+    def test_models_include_sampling_defaults(self):
+        self.create_mock_project()
+        models = self.request_json("GET", "/api/models")["models"]
+        kimi = next(item for item in models if item["provider"] == "kimi")
+        deepseek = next(item for item in models if item["provider"] == "deepseek")
+        self.assertEqual(kimi["sampling_defaults"]["temperature"], 0.6)
+        self.assertEqual(deepseek["sampling_defaults"]["temperature"], 1)
+
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
         started = self.request_json(
