@@ -58,6 +58,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 FRONTEND_DIST_DIR = ROOT / "frontend" / "dist"
 EXPORT_DIR = ROOT / "exports"
+APP_BASE_PATH = "/manufacturing-geo-audit"
 SAMPLING_JOBS: dict[str, dict] = {}
 SAMPLING_JOBS_LOCK = threading.Lock()
 AUTH_PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/status"}
@@ -242,21 +243,30 @@ def dispatch_rerun_failed(batch_id: str, payload: dict) -> str | None:
     ).start()
     return None
 class Handler(SimpleHTTPRequestHandler):
+    def normalize_app_path(self, path: str) -> str:
+        if path == APP_BASE_PATH:
+            return "/"
+        if path.startswith(f"{APP_BASE_PATH}/"):
+            return path[len(APP_BASE_PATH):] or "/"
+        return path
+
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path)
+        normalized_path = self.normalize_app_path(parsed.path)
         if FRONTEND_DIST_DIR.exists():
-            candidate = FRONTEND_DIST_DIR / parsed.path.lstrip("/")
-            if parsed.path == "/" or not candidate.exists() or candidate.is_dir():
+            candidate = FRONTEND_DIST_DIR / normalized_path.lstrip("/")
+            if normalized_path == "/" or not candidate.exists() or candidate.is_dir():
                 return str(FRONTEND_DIST_DIR / "index.html")
             return str(candidate)
-        if parsed.path == "/":
+        if normalized_path == "/":
             return str(STATIC_DIR / "index.html")
-        if parsed.path.startswith("/static/"):
-            return str(ROOT / parsed.path.lstrip("/"))
-        return str(STATIC_DIR / parsed.path.lstrip("/"))
+        if normalized_path.startswith("/static/"):
+            return str(ROOT / normalized_path.lstrip("/"))
+        return str(STATIC_DIR / normalized_path.lstrip("/"))
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        parsed = parsed._replace(path=self.normalize_app_path(parsed.path))
         if parsed.path.startswith("/api/"):
             if not self.ensure_api_authenticated(parsed.path):
                 return
@@ -266,6 +276,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        parsed = parsed._replace(path=self.normalize_app_path(parsed.path))
         if parsed.path.startswith("/api/"):
             if not self.ensure_api_authenticated(parsed.path):
                 return
