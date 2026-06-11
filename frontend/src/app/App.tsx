@@ -102,7 +102,7 @@ function Shell() {
 function BrandBlock({ subtitle }: { subtitle: string }) {
   return (
     <div className="brand-block">
-      <img className="brand-logo" src="/brand/ostrich-brand-logo.png" alt="鸵鸟 GEO" />
+      <img className="brand-logo" src={`${import.meta.env.BASE_URL}brand/ostrich-brand-logo.png`} alt="鸵鸟 GEO" />
       <div>
         <strong>鸵鸟 GEO</strong>
         <span>{subtitle}</span>
