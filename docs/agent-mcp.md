@@ -103,3 +103,37 @@ AGENT_API_TOKEN=... python3 scripts/agent_client.py export batch-xxx
 - `get_geo_audit_batch_status` -> `GET /api/agent/batches/{batch_id}`
 - `export_geo_audit_batch` -> `GET /api/agent/batches/{batch_id}/export`
 - `rerun_failed_geo_audit_tasks` -> `POST /api/agent/batches/{batch_id}/rerun_failed`
+
+## MCP Wrapper
+
+本仓库已提供轻量 stdio MCP wrapper：
+
+```bash
+GEO_AUDIT_BASE_URL=http://127.0.0.1:8765 \
+AGENT_API_TOKEN=... \
+python3 -m mcp.server
+```
+
+也兼容：
+
+```bash
+GEO_AUDIT_BASE_URL=http://127.0.0.1:8765 \
+AGENT_API_TOKEN=... \
+python3 mcp/server.py
+```
+
+实现位置：
+
+- `mcp/server.py`：MCP JSON-RPC stdio server。
+- `mcp/client.py`：Agent API HTTP client。
+- `mcp/schemas.py`：MCP 工具输入校验和 JSON Schema。
+- `mcp/README.md`：客户端配置和输入输出示例。
+
+当前实现不额外依赖 Python MCP SDK，避免本地 `mcp/` 目录和 SDK 包名冲突。它提供标准 `tools/list` 和 `tools/call`，适合 Codex、Claude Desktop 或其他 MCP client 通过 stdio 调用。
+
+安全边界：
+
+- MCP wrapper 不读取 `.env` 中的模型服务商 API Key。
+- MCP wrapper 不直接调用模型服务商。
+- MCP wrapper 响应不返回 `AGENT_API_TOKEN`。
+- 测试默认 mock HTTP，不触发真实模型调用。
