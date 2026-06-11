@@ -1,121 +1,192 @@
-# 制造业品牌 GEO 模型搜索呈现测试
+# 制造业 GEO 审计系统
 
-这个项目用于批量测试制造业品牌在各大模型中的搜索结果呈现，并将问题、模型回答、引用来源、品牌出现情况和评估指标归档成表格，作为客户 GEO 现状报告的数据底稿。
+这是一个面向制造业客户的 GEO 效果检测 / 审计系统，用统一问题库批量询问多个模型，记录回答、引用、品牌出现情况、竞品共现和风险评估，为客户 GEO 现状报告提供数据底稿。
 
-## 项目背景
+本项目不是 GEO 内容生产系统。它负责“采样、审计、归档、导出”，需要和服务器上的 GEOFlow 内容生产系统区分。
 
-这是一套独立的 **GEO 效果检测 / 审计系统**，不是内容生产系统。
+## 当前状态
 
-- 当前仓库：[`HiOne0826/manufacturing-geo-audit`](https://github.com/HiOne0826/manufacturing-geo-audit)
-- 本地技术栈：`Python 标准库 + SQLite + 静态前端`
-- 核心用途：面向制造业客户做问题库管理、模型采样、引用归档和 GEO 呈现分析
+截至 2026-06-11，本项目已经从轻量本地工作台升级为可公网小范围使用的内部系统：
 
-需要特别区分：
+- 使用人数预期不超过 3 人。
+- 公网入口建议使用 Nginx Basic Auth。
+- 应用层支持全局密码 `APP_PASSWORD`。
+- API Key 不在任何接口明文返回。
+- 默认测试不调用真实模型，真实调用必须显式设置 `ALLOW_LIVE_MODEL_CALLS=1`。
+- 支持批次持久化、并发采样、失败隔离、失败重跑、CSV/XLS 导出。
+- 支持 SQLite 本地模式，也支持 PostgreSQL + Redis/RQ 正式任务模式。
+- 提供内部 Agent API，可被 MCP 或其他 Agent 包装调用。
 
-- `/opt/geoflow`：服务器上现有的 **GEO 内容生产系统**，技术栈为 `Laravel + Docker`
-- `/opt/manufacturing-geo-audit`：本项目的 **GEO 效果检测 / 审计系统**
+详细当前态见：[docs/current-system-state.md](docs/current-system-state.md)。
 
-两者用途不同，部署目录和服务端口必须隔离，不能互相覆盖。
+## 核心能力
 
-## 核心目标
-
-- 用统一问题库批量询问多个大模型。
-- 每次请求保持独立上下文，尽量模拟用户单次搜索或提问。
-- 归档完整请求、回答、模型信息和运行参数。
-- 对品牌可见度、推荐位置、竞品共现、引用来源和事实错误进行分析。
-- 为制造业客户输出 GEO 现状报告和优化建议。
-
-## 初版目录
-
-```text
-manufacturing-geo-audit/
-  README.md
-  docs/
-    feasibility.md
-    workflow.md
-    data-schema.md
-  data/
-    question_bank_template.csv
-    run_records_schema.csv
-  src/
-  reports/
-```
-
-## 初步结论
-
-这条路径可行，但需要注意：API 调用“无状态”只能保证对话上下文不污染，不等于完全复刻真实用户在 ChatGPT、Perplexity、豆包、Kimi 等产品里的搜索体验。原因是很多产品端会叠加搜索、个性化、地区、时间、工具调用、引用策略和产品层排序。
-
-所以项目应分成两类测试：
-
-- `纯模型测试`：通过 API 直接提问，测模型内生认知和通用回答倾向。
-- `搜索增强测试`：通过支持联网或搜索工具的 API / 产品接口，测品牌在实时搜索型回答里的呈现。
-
-对客户报告来说，最有价值的是二者对照：品牌在模型记忆里是否存在，以及在搜索增强回答里是否能被检索、引用、推荐和正确描述。
-
-## 下一步
-
-1. 确定首批测试模型和 API：OpenAI、Anthropic、Google Gemini、Perplexity、DeepSeek、阿里通义、字节豆包、Kimi 等。
-2. 完成制造业问题库分层：品牌直问、品类推荐、采购场景、技术参数、售后场景、竞品对比、区域供应商。
-3. 写入采集脚本：读取问题库，循环调用模型，落库到 CSV / SQLite。
-4. 写分析脚本：生成品牌可见度、推荐排名、竞品共现、引用域名、错误类型等指标。
-5. 生成客户报告模板：把表格数据转成 GEO 现状报告。
+- 项目管理：创建客户 / 品牌 GEO 审计项目。
+- 问题库：生成制造业模板问题、导入 CSV / 表格行。
+- 模型库：配置多服务商模型，接口只返回掩码和 `has_key` 状态。
+- 抽样任务：按项目、问题、模型批量采样。
+- 并发执行：`ThreadPoolExecutor` 支持多模型多问题并发。
+- 批次状态：`sampling_batches` 持久化任务状态。
+- 结果归档：`model_runs` 保存回答、引用、耗时、状态、错误。
+- 规则评估：保存品牌命中、竞品共现、官网引用、风险等级。
+- 失败重跑：按 batch 只重跑失败项。
+- 导出：CSV / XLS，支持项目级和批次级运行明细。
+- Agent API：创建批次、查询状态、获取导出路径、失败重跑。
 
 ## 本地运行
 
-首版是无依赖本地工作台，使用 Python 标准库、SQLite 和原生前端。
+默认使用 SQLite 和 inline 后台线程：
 
 ```bash
 python3 app.py
 ```
 
-启动后打开：
+打开：
 
 ```text
 http://127.0.0.1:8765
 ```
 
-## 当前部署现状
-
-截至 `2026-06-09`，本项目已经独立部署到鸵鸟 GEO 服务器：
-
-- 代码目录：`/opt/manufacturing-geo-audit`
-- systemd 服务：`manufacturing-geo-audit.service`
-- 应用监听：`127.0.0.1:8765`
-- Nginx 代理端口：`18082`
-- 健康检查：`http://127.0.0.1:18082/api/health`
-
-服务器内还写入了单独备注文件：
-
-- `/opt/manufacturing-geo-audit/DEPLOY_NOTE.md`
-
-用于明确说明：本项目不是 `/opt/geoflow`，禁止混用部署目录。
-
-## API Key
-
-如果没有配置 API Key，可以用 `Mock / 流程演示` 跑完整流程。
-
-真实模型环境变量：
+如果启用应用全局密码：
 
 ```bash
-export OPENAI_API_KEY="..."
-export PERPLEXITY_API_KEY="..."
-export DEEPSEEK_API_KEY="..."
+APP_PASSWORD=your-password APP_SESSION_SECRET=your-secret python3 app.py
 ```
 
-首版接入范围：
+## 真实模型调用
 
-- OpenAI：纯模型基准测试。
-- Perplexity：搜索增强测试。
-- DeepSeek：中文模型对照。
-- Mock：无 Key 时跑通流程。
+默认不允许真实模型调用。需要人工实测时：
 
-## 当前功能
+```bash
+ALLOW_LIVE_MODEL_CALLS=1 python3 app.py
+```
 
-- 创建客户 / 品牌 GEO 审计项目。
-- 生成制造业模板问题。
-- 导入 CSV 问题库。
-- 选择模型并批量采样。
-- 保存原始回答和引用来源。
-- 规则评估品牌命中、竞品共现、官网引用和风险等级。
-- 查看分模型表现和竞品共现。
-- 导出运行明细 CSV 和摘要指标 CSV。
+API Key 可放入 `.env`。常用环境变量：
+
+```bash
+DOUBAO_API_KEY=...
+DASHSCOPE_API_KEY=...
+QWEN_API_KEY=...
+MOONSHOT_API_KEY=...
+KIMI_API_KEY=...
+DEEPSEEK_API_KEY=...
+HUNYUAN_API_KEY=...
+TENCENT_API_KEY=...
+ERNIE_API_KEY=...
+BAIDU_QIANFAN_API_KEY=...
+```
+
+不要提交 `.env`。仓库只提供 `.env.example`。
+
+## 正式任务模式
+
+安装 worker 依赖：
+
+```bash
+python3 -m pip install -r requirements-worker.txt
+```
+
+配置：
+
+```bash
+DATABASE_URL=postgresql://geo:password@127.0.0.1:5432/geo_audit
+REDIS_URL=redis://127.0.0.1:6379/0
+TASK_QUEUE_BACKEND=rq
+RQ_QUEUE_NAME=geo-audit
+RQ_JOB_TIMEOUT=3600
+```
+
+启动 Web：
+
+```bash
+python3 app.py
+```
+
+启动 worker：
+
+```bash
+python3 worker.py
+```
+
+详情见：[docs/postgres-rq.md](docs/postgres-rq.md)。
+
+## 测试
+
+单元与集成测试：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+本地 smoke：
+
+```bash
+python3 app.py
+python3 scripts/smoke_test.py
+```
+
+本地 Mock 负载：
+
+```bash
+python3 scripts/load_test_local.py --questions 150 --models 3 --workers 8
+```
+
+任务系统检测：
+
+```bash
+python3 scripts/check_task_system.py
+```
+
+测试说明见：[docs/test-harness.md](docs/test-harness.md)。
+
+## 最近验证
+
+最近真实模型并发抽样使用本地已有 3 个问题和 6 个已有 key 模型：
+
+- 豆包
+- 通义千问
+- Kimi
+- DeepSeek
+- 腾讯混元
+- 文心一言
+
+批次：`batch-73ff043ef5`
+
+结果：
+
+- 3 问题 × 6 模型 = 18 任务。
+- 成功：18。
+- 失败：0。
+- 总耗时：约 68.62 秒。
+- 数据库落库：18 条 `model_runs`。
+- 批次状态：`completed`。
+
+## 关键文档
+
+- [docs/current-system-state.md](docs/current-system-state.md)：当前系统状态总览。
+- [docs/system-optimization-implementation-plan.md](docs/system-optimization-implementation-plan.md)：阶段化优化方案。
+- [docs/test-harness.md](docs/test-harness.md)：测试 harness。
+- [docs/auth-gate.md](docs/auth-gate.md)：公网门禁与应用密码。
+- [docs/batch-persistence.md](docs/batch-persistence.md)：批次持久化。
+- [docs/concurrent-runner.md](docs/concurrent-runner.md)：并发采样。
+- [docs/retry-export-rerun.md](docs/retry-export-rerun.md)：重试、失败重跑和导出。
+- [docs/postgres-rq.md](docs/postgres-rq.md)：PostgreSQL + Redis/RQ。
+- [docs/agent-mcp.md](docs/agent-mcp.md)：Agent API / MCP 映射。
+- [docs/model-api-capabilities-2026-06-06.md](docs/model-api-capabilities-2026-06-06.md)：模型 API 能力与参数依据。
+
+## 部署备注
+
+服务器部署目录建议保持独立：
+
+```text
+/opt/manufacturing-geo-audit
+```
+
+不要和 `/opt/geoflow` 混用。
+
+已提供：
+
+- `deploy/server/manufacturing-geo-audit.service`
+- `deploy/server/manufacturing-geo-audit-worker.service`
+- `deploy/server/manufacturing-geo-audit.conf`
+- `deploy/postgres/schema.sql`
