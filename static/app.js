@@ -22,27 +22,6 @@ const state = {
 
 const questionAutosaveTimers = new Map();
 
-const PROVIDER_SAMPLING_DEFAULTS = {
-  openai: {
-    temperature: "1",
-    reasoning_effort: "medium",
-    defaults_note: "temperature 默认 1；reasoning.effort 默认 medium。",
-  },
-  gemini: {
-    thinking_budget: "0",
-    defaults_note: "thinkingBudget 设为 0 表示关闭思考；留空时走模型动态默认。",
-  },
-  qwen: {
-    reasoning_effort: "",
-    search_strategy: "turbo",
-    defaults_note: "联网搜索默认走 enable_search；search_strategy 预填 turbo 便于采样。",
-  },
-  kimi: {
-    temperature: "1",
-    defaults_note: "Kimi K2.5 联网搜索与深度思考不同时开启；当前运行温度固定按 1 处理。",
-  },
-};
-
 const QUESTION_TEMPLATE_ROWS = [
   {
     问题内容: "汽车白车身多材料连接，国内有哪些FDS热熔螺接设备品牌值得推荐？",
@@ -161,7 +140,7 @@ function renderCitationList(row) {
 function getSamplingDraft(modelId) {
   if (!state.samplingDrafts[modelId]) {
     const row = state.models.find((item) => Number(item.id) === Number(modelId)) || {};
-    const defaults = PROVIDER_SAMPLING_DEFAULTS[row.provider] || {};
+    const defaults = getProviderSamplingDefaults(row);
     state.samplingDrafts[modelId] = {
       runtime_model: "",
       runtime_model_version: "",
@@ -187,7 +166,12 @@ function getSamplingDraft(modelId) {
 }
 
 function getProviderSamplingDefaults(row) {
-  return PROVIDER_SAMPLING_DEFAULTS[row.provider] || {};
+  const defaults = row?.sampling_defaults || {};
+  return {
+    ...defaults,
+    temperature: defaults.temperature === undefined || defaults.temperature === null ? "" : String(defaults.temperature),
+    thinking_budget: defaults.thinking_budget === undefined || defaults.thinking_budget === null ? "" : String(defaults.thinking_budget),
+  };
 }
 
 function readingOrFallback(value, fallback = "模型默认") {
@@ -228,7 +212,7 @@ function parseModelVersionOptions(row) {
 
 function samplingProviderNote(row) {
   if (row.provider === "kimi") {
-    return "Kimi 联网搜索走官方 builtin_function.$web_search；开启联网搜索时必须关闭深度思考。当前 kimi-k2.5 运行时会固定使用 temperature=1。";
+    return "Kimi 联网搜索走官方 builtin_function.$web_search；开启联网搜索时必须关闭深度思考。当前 kimi-k2.5 运行时固定使用 temperature=0.6。";
   }
   if (row.provider === "doubao") {
     return "豆包联网搜索走 Responses API；高级搜索参数仅在服务商支持时生效。";
