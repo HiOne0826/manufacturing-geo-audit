@@ -78,6 +78,10 @@ def auth_enabled() -> bool:
     return bool(auth_password())
 
 
+def agent_api_token() -> str:
+    return os.environ.get("AGENT_API_TOKEN", "").strip()
+
+
 def sign_auth_payload(payload: str) -> str:
     return hmac.new(auth_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -338,12 +342,27 @@ class Handler(SimpleHTTPRequestHandler):
         return bool(morsel and verify_auth_token(morsel.value))
 
     def ensure_api_authenticated(self, path: str) -> bool:
+        if path.startswith("/api/agent/"):
+            if self.has_valid_agent_token():
+                return True
+            self.json_response({"error": "Agent token 无效或未配置"}, HTTPStatus.UNAUTHORIZED)
+            return False
         if path in AUTH_PUBLIC_PATHS:
             return True
         if self.has_valid_auth_session():
             return True
         self.json_response({"error": "未登录或会话已过期"}, HTTPStatus.UNAUTHORIZED)
         return False
+
+    def has_valid_agent_token(self) -> bool:
+        token = agent_api_token()
+        if not token:
+            return False
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):].strip(), token)
 
     def auth_cookie_header(self, value: str, *, max_age: int) -> str:
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
@@ -444,6 +463,20 @@ class Handler(SimpleHTTPRequestHandler):
                         self.json_response(sampling_batch_to_progress(batch))
                         return
                     self.json_response(job)
+                elif parsed.path.startswith("/api/agent/batches/"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) not in {4, 5}:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[3]
+                    if len(parts) == 5 and parts[4] == "export":
+                        self.json_response({"batch_id": batch_id, "format": "xls", "path": f"/api/export/batches/{batch_id}/runs.xls"})
+                        return
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    self.json_response({"batch": sampling_batch_to_progress(batch)})
                 elif parsed.path == "/api/batches":
                     project_raw = query.get("project_id", [None])[0]
                     project_id = int(project_raw) if project_raw and project_raw != "all" else None
@@ -614,6 +647,56 @@ class Handler(SimpleHTTPRequestHandler):
                     ).start()
                     result = {"batch_id": batch_id, "total": total, "failed": 0, "success": 0, "status": "queued"}
                     self.json_response(result)
+                elif parsed.path == "/api/agent/batches":
+                    project_id = int(payload.get("project_id", 0))
+                    if payload.get("csv_text"):
+                        import_questions_csv(conn, project_id, payload.get("csv_text", ""))
+                    model_ids = [int(item) for item in payload.get("model_ids", [])]
+                    if not model_ids:
+                        model_ids = [int(item.get("model_config_id", 0)) for item in payload.get("models", []) if item.get("model_config_id")]
+                    run_payload = {
+                        "project_id": project_id,
+                        "models": payload.get("models") or [{"model_config_id": model_id, "search_enabled": False} for model_id in model_ids],
+                        "repeat_count": int((payload.get("options") or {}).get("repeat_count", payload.get("repeat_count", 1)) or 1),
+                        "max_workers": (payload.get("options") or {}).get("max_workers", payload.get("max_workers")),
+                        "retry_count": (payload.get("options") or {}).get("retry_count", payload.get("retry_count")),
+                    }
+                    total = estimate_batch_total(conn, project_id, run_payload)
+                    batch_id = payload.get("batch_id") or f"batch-{uuid.uuid4().hex[:10]}"
+                    create_sampling_batch(
+                        conn,
+                        {
+                            "batch_id": batch_id,
+                            "project_id": project_id,
+                            "status": "queued",
+                            "total_count": total,
+                            "config": run_payload,
+                            "created_at": utc_now(),
+                            "updated_at": utc_now(),
+                        },
+                    )
+                    set_sampling_job(
+                        batch_id,
+                        project_id=project_id,
+                        total=total,
+                        completed=0,
+                        failed=0,
+                        success=0,
+                        status="queued",
+                        created_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                    threading.Thread(target=run_batch_in_background, args=(batch_id, project_id, run_payload), daemon=True).start()
+                    self.json_response({"batch_id": batch_id, "total": total, "status": "queued"})
+                elif parsed.path.startswith("/api/agent/batches/") and parsed.path.endswith("/rerun_failed"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) != 5:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[3]
+                    failed_runs = list_failed_runs_by_batch(conn, batch_id)
+                    threading.Thread(target=rerun_failed_in_background, args=(batch_id, payload), daemon=True).start()
+                    self.json_response({"batch_id": batch_id, "total": len(failed_runs), "status": "queued"})
                 elif parsed.path.startswith("/api/batches/") and parsed.path.endswith("/rerun_failed"):
                     parts = [unquote(item) for item in parsed.path.split("/") if item]
                     if len(parts) != 4:

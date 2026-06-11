@@ -120,6 +120,83 @@ class AuthGateTests(unittest.TestCase):
             self.assertNotIn("api_key", item)
 
 
+class AgentApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old_token = os.environ.get("AGENT_API_TOKEN")
+        os.environ["AGENT_API_TOKEN"] = "agent-test-token"
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls.temp_dir.name) / "agent.db"
+        app.DEFAULT_DB_PATH = cls.db_path
+        app.SAMPLING_JOBS.clear()
+        init_db(cls.db_path)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.temp_dir.cleanup()
+        if cls.old_token is None:
+            os.environ.pop("AGENT_API_TOKEN", None)
+        else:
+            os.environ["AGENT_API_TOKEN"] = cls.old_token
+
+    def request_json(self, method: str, path: str, payload: dict | None = None, token: str = "agent-test-token") -> dict:
+        data = None
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_agent_requires_token_and_can_create_batch(self):
+        request = urllib.request.Request(f"{self.base_url}/api/agent/batches", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(ctx.exception.code, 401)
+        with get_conn(self.db_path) as conn:
+            project_id = create_project(conn, {"client_name": "Agent", "brand_name": "Agent品牌"})
+            model_id = create_model_config(
+                conn,
+                {
+                    "provider": "mock",
+                    "label": "Agent Mock",
+                    "model": "agent-mock",
+                    "supports_pure": True,
+                    "active": True,
+                },
+            )
+        created = self.request_json(
+            "POST",
+            "/api/agent/batches",
+            {
+                "project_id": project_id,
+                "csv_text": "question_id,question,question_type,target_brand\nA001,请介绍Agent品牌,agent,Agent品牌\n",
+                "model_ids": [model_id],
+                "options": {"repeat_count": 1, "max_workers": 2},
+            },
+        )
+        self.assertEqual(created["total"], 1)
+        batch_id = created["batch_id"]
+        status = {}
+        for _ in range(50):
+            status = self.request_json("GET", f"/api/agent/batches/{batch_id}")
+            if status["batch"]["status"] == "completed":
+                break
+            time.sleep(0.1)
+        self.assertEqual(status["batch"]["status"], "completed")
+        exported = self.request_json("GET", f"/api/agent/batches/{batch_id}/export")
+        self.assertEqual(exported["path"], f"/api/export/batches/{batch_id}/runs.xls")
+
+
 class HarnessHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
