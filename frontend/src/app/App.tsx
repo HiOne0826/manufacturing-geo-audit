@@ -45,7 +45,7 @@ function AuthGate({ message, onMessage }: { message: string; onMessage: (value: 
   return (
     <main className="auth-screen">
       <form className="auth-panel" onSubmit={(event) => { event.preventDefault(); login.mutate(password); }}>
-        <div className="brand-block"><div className="logo-mark" /><div><strong>GEO 审计</strong><span>内部访问</span></div></div>
+        <BrandBlock subtitle="内部访问" />
         <label>应用密码<input type="password" autoFocus value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         <button type="submit" disabled={login.isPending}>进入工作台</button>
         <p className="danger-text">{message}</p>
@@ -65,7 +65,7 @@ function Shell() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand-block"><div className="logo-mark" /><div><strong>GEO 审计</strong><span>制造业内部系统</span></div></div>
+        <BrandBlock subtitle="制造业 GEO 审计系统" />
         <nav>{navItems.map((item) => <NavLink key={item.to} to={item.to} end={item.to === "/"}><item.icon size={17} />{item.label}</NavLink>)}</nav>
       </aside>
       <section className="workspace">
@@ -94,6 +94,18 @@ function Shell() {
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </section>
+    </div>
+  );
+}
+
+function BrandBlock({ subtitle }: { subtitle: string }) {
+  return (
+    <div className="brand-block">
+      <img className="brand-logo" src="/brand/ostrich-brand-logo.png" alt="鸵鸟 GEO" />
+      <div>
+        <strong>鸵鸟 GEO</strong>
+        <span>{subtitle}</span>
+      </div>
     </div>
   );
 }

@@ -98,17 +98,17 @@ code, pre {
 .brand-block {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   padding: 6px 8px 16px;
   border-bottom: 1px solid var(--line);
 }
-.brand-block strong { display: block; font-size: 15px; }
+.brand-block strong { display: block; font-size: 16px; font-weight: 700; letter-spacing: 0; }
 .brand-block span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
-.logo-mark {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #2868d8, #17a679);
+.brand-logo {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+  flex: 0 0 auto;
 }
 .sidebar nav { display: grid; gap: 4px; margin-top: 16px; }
 .sidebar a {
