@@ -10,6 +10,8 @@ import { asCount, formatDateTime, pct } from "../utils/format";
 import { useSelectionStore } from "../store/selectionStore";
 import { queryClient } from "./queryClient";
 
+type SamplingMode = "pure" | "search" | "compare";
+
 const navItems = [
   { to: "/", label: "总览", icon: Gauge },
   { to: "/projects", label: "项目", icon: Boxes },
@@ -211,26 +213,88 @@ function SamplingPage() {
   const { projectId } = useSelectionStore();
   const questions = useQuery({ queryKey: ["questions", projectId], queryFn: () => questionsApi.list(projectId), enabled: Boolean(projectId) });
   const models = useQuery({ queryKey: ["models"], queryFn: modelsApi.list });
-  const [selected, setSelected] = useState<Record<number, { search_enabled: boolean; reasoning_enabled: boolean }>>({});
+  const [selected, setSelected] = useState<Record<number, { mode: SamplingMode; reasoning_enabled: boolean }>>({});
   const [repeatCount, setRepeatCount] = useState(1);
   const [activeBatch, setActiveBatch] = useState<string>("");
+  const runModels = useMemo(
+    () =>
+      Object.entries(selected).flatMap(([id, cfg]) => {
+        const model_config_id = Number(id);
+        if (cfg.mode === "compare") {
+          return [
+            { model_config_id, search_enabled: false, reasoning_enabled: cfg.reasoning_enabled, comparison_mode: "pure" },
+            { model_config_id, search_enabled: true, reasoning_enabled: cfg.reasoning_enabled, comparison_mode: "search" }
+          ];
+        }
+        return [{ model_config_id, search_enabled: cfg.mode === "search", reasoning_enabled: cfg.reasoning_enabled }];
+      }),
+    [selected]
+  );
   const start = useMutation({
-    mutationFn: () => runsApi.start({ project_id: projectId, repeat_count: repeatCount, models: Object.entries(selected).map(([id, cfg]) => ({ model_config_id: Number(id), ...cfg })) }),
+    mutationFn: () => runsApi.start({ project_id: projectId, repeat_count: repeatCount, models: runModels }),
     onSuccess: (data) => { setActiveBatch(data.batch_id); queryClient.invalidateQueries({ queryKey: ["batches"] }); }
   });
   const progress = useQuery({ queryKey: ["progress", activeBatch], queryFn: () => batchesApi.progress(activeBatch), enabled: Boolean(activeBatch), refetchInterval: (query) => query.state.data?.status === "completed" || query.state.data?.status === "failed" ? false : 1200 });
   const activeModels = (models.data?.models || []).filter((m) => m.active);
-  const totalTasks = (questions.data?.questions.length || 0) * Object.keys(selected).length * repeatCount;
+  const searchTaskCount = runModels.filter((item) => item.search_enabled).length;
+  const totalTasks = (questions.data?.questions.length || 0) * runModels.length * repeatCount;
   return (
     <main className="page sampling-page">
-      <PageTitle title="采样" description="选择问题范围和模型矩阵，发起多模型并发采样。" />
+      <PageTitle title="采样" description="选择问题范围和模型矩阵，对比模型本体与联网搜索结果。" />
       <section className="sampling-grid">
         <Panel title="范围"><Metric label="当前问题数" value={questions.data?.questions.length || 0} /><label>重复次数<input type="number" min={1} max={10} value={repeatCount} onChange={(event) => setRepeatCount(Number(event.target.value) || 1)} /></label></Panel>
-        <Panel title="任务估算"><Metric label="模型数" value={Object.keys(selected).length} /><Metric label="预计任务" value={totalTasks} /><button disabled={!projectId || !totalTasks || start.isPending} onClick={() => start.mutate()}><Play size={15} />启动采样</button></Panel>
+        <Panel title="任务估算"><Metric label="已选模型" value={Object.keys(selected).length} /><Metric label="联网任务配置" value={searchTaskCount} /><Metric label="预计任务" value={totalTasks} /><button disabled={!projectId || !totalTasks || start.isPending} onClick={() => start.mutate()}><Play size={15} />启动采样</button></Panel>
         <Panel title="运行状态">{activeBatch ? <><StatusBadge status={progress.data?.status || "queued"} /><ProgressBar batch={progress.data} /><Link to={`/batches/${activeBatch}`}>查看批次详情</Link></> : <EmptyState title="尚未启动采样" />}</Panel>
       </section>
       <Panel title="模型矩阵">
-        <div className="model-matrix">{activeModels.map((model) => <label key={model.id} className="matrix-row"><input type="checkbox" checked={Boolean(selected[model.id])} onChange={(event) => setSelected((prev) => event.target.checked ? { ...prev, [model.id]: { search_enabled: false, reasoning_enabled: false } } : Object.fromEntries(Object.entries(prev).filter(([id]) => Number(id) !== model.id)) as typeof prev)} /><strong>{model.label}</strong><span>{model.provider} / {model.model}</span><span>{String(model.sampling_defaults?.temperature ?? "默认温度")}</span></label>)}</div>
+        <div className="model-matrix">
+          {activeModels.map((model) => {
+            const config = selected[model.id];
+            const enabled = Boolean(config);
+            const mode = config?.mode || "pure";
+            return (
+              <article key={model.id} className={`matrix-card ${enabled ? "is-selected" : ""}`}>
+                <header>
+                  <label className="matrix-select">
+                    <input
+                      type="checkbox"
+                      checked={enabled}
+                      onChange={(event) =>
+                        setSelected((prev) =>
+                          event.target.checked
+                            ? { ...prev, [model.id]: { mode: "pure", reasoning_enabled: false } }
+                            : (Object.fromEntries(Object.entries(prev).filter(([id]) => Number(id) !== model.id)) as typeof prev)
+                        )
+                      }
+                    />
+                    <strong>{model.label}</strong>
+                  </label>
+                  <span className={model.has_key ? "key-ok" : "key-missing"}>{model.has_key ? "Key 已配置" : "缺少 Key"}</span>
+                </header>
+                <p>{model.provider} / {model.model}</p>
+                <div className="sampling-mode-group">
+                  <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
+                  <button className={mode === "search" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "search" } }))}>联网</button>
+                  <button className={mode === "compare" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "compare" } }))}>本体+联网</button>
+                </div>
+                <label className="matrix-toggle">
+                  <input
+                    type="checkbox"
+                    disabled={!enabled || !model.supports_reasoning}
+                    checked={Boolean(config?.reasoning_enabled)}
+                    onChange={(event) => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], reasoning_enabled: event.target.checked } }))}
+                  />
+                  深度思考
+                </label>
+                <dl>
+                  <dt>默认温度</dt><dd>{String(model.sampling_defaults?.temperature ?? "模型默认")}</dd>
+                  <dt>联网能力</dt><dd>{model.supports_search ? "支持" : "不支持"}</dd>
+                  <dt>说明</dt><dd>{String(model.sampling_defaults?.defaults_note ?? "按服务商默认参数运行")}</dd>
+                </dl>
+              </article>
+            );
+          })}
+        </div>
       </Panel>
     </main>
   );
@@ -262,7 +326,43 @@ function AnalysisPage() {
 
 function SettingsPage() {
   const health = useQuery({ queryKey: ["health"], queryFn: systemApi.health });
-  return <main className="page"><PageTitle title="设置" description="运行模式、Agent/MCP 接入和安全边界。" /><section className="settings-grid"><Panel title="系统"><Metric label="数据库" value={health.data?.db || "-"} /><Metric label="任务后端" value={health.data?.task_queue_backend || "-"} /></Panel><Panel title="Agent / MCP"><p className="muted">MCP wrapper 通过 Agent API 调用，不读取模型 API Key。</p><code>python3 -m mcp.server</code></Panel><Panel title="安全"><p className="muted">公网入口建议 Nginx Basic Auth，应用层使用 APP_PASSWORD。模型 API Key 不在接口明文返回。</p></Panel></section></main>;
+  return (
+    <main className="page">
+      <PageTitle title="设置" description="运行模式、Agent/MCP 接入、安全边界和前端构建状态。" />
+      <section className="metrics-grid">
+        <Metric label="健康状态" value={health.data?.ok ? "正常" : "未知"} />
+        <Metric label="任务后端" value={health.data?.task_queue_backend || "-"} />
+        <Metric label="前端入口" value="React / Vite" />
+        <Metric label="Key 返回策略" value="脱敏" />
+      </section>
+      <section className="settings-grid">
+        <Panel title="系统运行">
+          <div className="settings-list">
+            <div><span>数据库</span><code>{health.data?.db || "-"}</code></div>
+            <div><span>任务队列</span><code>{health.data?.task_queue_backend || "-"}</code></div>
+            <div><span>本地开发</span><code>python3 app.py</code></div>
+            <div><span>前端构建</span><code>cd frontend && npm run build</code></div>
+          </div>
+        </Panel>
+        <Panel title="Agent / MCP">
+          <div className="settings-list">
+            <div><span>启动 MCP</span><code>python3 -m mcp.server</code></div>
+            <div><span>后端地址</span><code>GEO_AUDIT_BASE_URL=http://127.0.0.1:8765</code></div>
+            <div><span>鉴权</span><code>AGENT_API_TOKEN=内部 token</code></div>
+          </div>
+          <p className="muted">MCP wrapper 只调用 Agent API，不读取模型服务商 API Key。</p>
+        </Panel>
+        <Panel title="公网门禁">
+          <div className="check-list">
+            <label><input type="checkbox" checked readOnly />Nginx Basic Auth</label>
+            <label><input type="checkbox" checked readOnly />应用全局密码 APP_PASSWORD</label>
+            <label><input type="checkbox" checked readOnly />API Key 不明文返回</label>
+            <label><input type="checkbox" checked readOnly />真实模型调用受 ALLOW_LIVE_MODEL_CALLS 控制</label>
+          </div>
+        </Panel>
+      </section>
+    </main>
+  );
 }
 
 function BatchTable({ batches }: { batches: Array<{ batch_id: string; status: string; created_at?: string; total_count?: number; completed_count?: number; success_count?: number; failed_count?: number; total?: number; completed?: number; success?: number; failed?: number }> }) {

@@ -294,20 +294,75 @@ dd { margin: 0; }
 }
 .model-matrix {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
 }
-.matrix-row {
-  grid-template-columns: auto 1fr;
-  align-items: center;
-  gap: 5px 10px;
-  padding: 10px;
+.matrix-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface-muted);
 }
-.matrix-row input { width: 16px; min-height: 16px; grid-row: span 3; }
-.matrix-row span { color: var(--muted); font-size: 12px; }
+.matrix-card.is-selected {
+  border-color: #9bb9ee;
+  background: #f7faff;
+}
+.matrix-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.matrix-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.matrix-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+.matrix-select input,
+.matrix-toggle input {
+  width: 16px;
+  min-height: 16px;
+}
+.sampling-mode-group {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.sampling-mode-group button {
+  min-height: 34px;
+  padding: 0 8px;
+  border-color: var(--line);
+  background: #fff;
+  color: var(--text);
+  white-space: nowrap;
+}
+.sampling-mode-group button.is-active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+.sampling-mode-group button:disabled {
+  background: #eef1f5;
+  color: #99a3b2;
+}
+.matrix-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.matrix-card dl {
+  grid-template-columns: 74px 1fr;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
 .progress {
   position: relative;
   height: 30px;
@@ -357,6 +412,44 @@ dd { margin: 0; }
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+.settings-list,
+.check-list {
+  display: grid;
+  gap: 9px;
+}
+.settings-list div {
+  display: grid;
+  gap: 5px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-muted);
+}
+.settings-list span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.settings-list code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+}
+.check-list label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  color: var(--text);
+}
+.check-list input {
+  width: 16px;
+  min-height: 16px;
 }
 .chart-box {
   width: 100%;
