@@ -523,24 +523,28 @@ class Handler(SimpleHTTPRequestHandler):
                 self.logout_response()
                 return
             with get_conn(DEFAULT_DB_PATH) as conn:
+                def commit_json(data, status: int = 200):
+                    conn.commit()
+                    self.json_response(data, status)
+
                 if parsed.path == "/api/projects":
                     project_id = create_project(conn, payload)
-                    self.json_response({"id": project_id})
+                    commit_json({"id": project_id})
                 elif parsed.path == "/api/projects/update":
                     update_project(conn, payload)
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/projects/delete":
                     delete_project(conn, int(payload.get("id", 0)))
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/models":
                     model_id = create_model_config(conn, payload)
-                    self.json_response({"id": model_id})
+                    commit_json({"id": model_id})
                 elif parsed.path == "/api/models/update":
                     update_model_config(conn, payload)
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/models/delete":
                     delete_model_config(conn, int(payload.get("id", 0)))
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/models/test":
                     model_id = int(payload.get("id", 0))
                     model_config = get_model_config(conn, model_id)
@@ -558,25 +562,25 @@ class Handler(SimpleHTTPRequestHandler):
                     if not preset:
                         raise ValueError("未找到默认服务商模板")
                     model_id = create_model_config(conn, preset)
-                    self.json_response({"id": model_id})
+                    commit_json({"id": model_id})
                 elif parsed.path == "/api/questions/seed":
                     count = seed_questions(conn, int(payload.get("project_id", 0)))
-                    self.json_response({"count": count})
+                    commit_json({"count": count})
                 elif parsed.path == "/api/questions/import":
                     count = import_questions_csv(conn, int(payload.get("project_id", 0)), payload.get("csv_text", ""))
-                    self.json_response({"count": count})
+                    commit_json({"count": count})
                 elif parsed.path == "/api/questions/import_rows":
                     rows = payload.get("rows", [])
                     if not rows and payload.get("file_base64"):
                         rows = self.decode_csv_rows(payload["file_base64"])
                     count = import_questions_rows(conn, int(payload.get("project_id", 0)), rows)
-                    self.json_response({"count": count})
+                    commit_json({"count": count})
                 elif parsed.path == "/api/questions/update":
                     update_question(conn, payload)
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/questions/delete":
                     delete_question(conn, int(payload.get("id", 0)))
-                    self.json_response({"ok": True})
+                    commit_json({"ok": True})
                 elif parsed.path == "/api/runs/start":
                     project_id = int(payload.get("project_id", 0))
                     total = estimate_batch_total(conn, project_id, payload)
@@ -607,6 +611,7 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
+                    conn.commit()
                     job_id = dispatch_batch(batch_id, project_id, payload)
                     result = {
                         "batch_id": batch_id,
@@ -657,6 +662,7 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
+                    conn.commit()
                     job_id = dispatch_batch(batch_id, project_id, run_payload)
                     self.json_response(
                         {
@@ -705,6 +711,7 @@ class Handler(SimpleHTTPRequestHandler):
                         status="queued",
                         updated_at=utc_now(),
                     )
+                    conn.commit()
                     job_id = dispatch_rerun_failed(batch_id, payload)
                     self.json_response(
                         {
