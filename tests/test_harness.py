@@ -13,8 +13,8 @@ from pathlib import Path
 
 import app
 from src.adapters import AdapterError, call_configured_model
-from src.db import create_model_config, create_project, get_conn, import_questions_rows, init_db, list_runs
-from src.runner import run_batch
+from src.db import create_model_config, create_project, get_conn, import_questions_rows, init_db, list_failed_runs_by_batch, list_runs
+from src.runner import rerun_failed_runs, run_batch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -233,6 +233,8 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(batch_detail["completed_count"], 2)
         batch_runs = self.request_json("GET", f"/api/batches/{batch_id}/runs")["runs"]
         self.assertEqual(len(batch_runs), 2)
+        self.assertIn("<table", self.request_text(f"/api/export/batches/{batch_id}/runs.xls"))
+        self.assertIn("<table", self.request_text(f"/api/export/batches/{batch_id}/summary.xls"))
         app.SAMPLING_JOBS.clear()
         persisted_status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
         self.assertEqual(persisted_status["status"], "completed")
@@ -385,6 +387,62 @@ class HarnessDirectTests(unittest.TestCase):
         finally:
             if old_value is not None:
                 os.environ["ALLOW_LIVE_MODEL_CALLS"] = old_value
+
+    def test_rerun_failed_runs_only_creates_replacement_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "rerun.db"
+            init_db(db_path)
+            with get_conn(db_path) as conn:
+                project_id = create_project(
+                    conn,
+                    {
+                        "client_name": "重跑测试客户",
+                        "brand_name": "重跑测试品牌",
+                        "product_category": "测试品类",
+                    },
+                )
+                rows = [
+                    {
+                        "question_id": f"R{idx:03d}",
+                        "question": f"第 {idx} 个重跑问题，重跑测试品牌是否出现？",
+                        "question_type": "rerun",
+                        "target_brand": "重跑测试品牌",
+                    }
+                    for idx in range(1, 3)
+                ]
+                self.assertEqual(import_questions_rows(conn, project_id, rows), 2)
+                model_id = create_model_config(
+                    conn,
+                    {
+                        "provider": "mock",
+                        "label": "Mock Fail",
+                        "model": "mock-fail",
+                        "supports_pure": True,
+                        "active": True,
+                    },
+                )
+                result = run_batch(
+                    conn,
+                    project_id,
+                    {
+                        "models": [{"model_config_id": model_id, "search_enabled": False}],
+                        "repeat_count": 1,
+                        "max_workers": 2,
+                        "retry_count": 0,
+                    },
+                    batch_id="rerun-failed-batch",
+                )
+                self.assertEqual(result["failed"], 2)
+                failed_runs = list_failed_runs_by_batch(conn, "rerun-failed-batch")
+                self.assertEqual(len(failed_runs), 2)
+                self.assertTrue(all(row["error_message"] for row in failed_runs))
+                conn.execute("UPDATE model_configs SET model = 'mock-fixed' WHERE id = ?", (model_id,))
+                rerun_result = rerun_failed_runs(conn, "rerun-failed-batch", failed_runs, {"max_workers": 2, "retry_count": 0})
+                runs = list_runs(conn, project_id, limit=10)
+            self.assertEqual(rerun_result["total"], 2)
+            self.assertEqual(rerun_result["success"], 2)
+            self.assertEqual(rerun_result["failed"], 0)
+            self.assertEqual(len(runs), 4)
 
 
 if __name__ == "__main__":

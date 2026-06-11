@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 import time
 import urllib.error
 import urllib.parse
@@ -970,6 +971,17 @@ def call_configured_model(
     if provider == "mock":
         start = time.time()
         model_name = model_config.get("model", "mock-model") or "mock-model"
+        if str(model_name).startswith("mock-fail"):
+            raise AdapterError("Mock forced failure")
+        try:
+            failure_rate = float(os.environ.get("MOCK_FAILURE_RATE", "0") or 0)
+        except ValueError:
+            failure_rate = 0
+        if failure_rate > 0:
+            digest = hashlib.sha256(f"{model_name}:{question}".encode("utf-8")).hexdigest()
+            score = int(digest[:8], 16) / 0xFFFFFFFF
+            if score < min(max(failure_rate, 0), 1):
+                raise AdapterError(f"Mock failure rate triggered: {failure_rate}")
         citations = [
             {
                 "url": "https://example.com/mock-source",
