@@ -36,7 +36,10 @@ export type ModelConfig = {
   api_family?: string;
   api_base?: string;
   model_type?: string;
+  priority?: number;
+  daily_limit?: number;
   has_key?: boolean;
+  api_key?: string;
   api_key_masked?: string;
   active?: boolean;
   supports_pure?: boolean;
@@ -48,6 +51,10 @@ export type ModelConfig = {
   supports_user_location?: boolean;
   supports_tool_calling?: boolean;
   reasoning_levels?: string;
+  web_search_mode?: string;
+  web_search_param_path?: string;
+  reasoning_param_path?: string;
+  citation_param_path?: string;
   sampling_defaults?: Record<string, unknown>;
   notes?: string;
 };

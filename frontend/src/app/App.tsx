@@ -11,6 +11,7 @@ import { useSelectionStore } from "../store/selectionStore";
 import { queryClient } from "./queryClient";
 
 type SamplingMode = "pure" | "search" | "compare";
+type ModelFormState = Partial<ModelConfig> & { api_key?: string };
 
 const navItems = [
   { to: "/", label: "总览", icon: Gauge },
@@ -183,30 +184,107 @@ function QuestionTable({ questions, onDelete }: { questions: Question[]; onDelet
 
 function ModelsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: modelsApi.list });
-  const [draft, setDraft] = useState({ provider: "mock", label: "Mock", model: "mock-model", api_key: "", supports_pure: true, active: true });
-  const create = useMutation({ mutationFn: modelsApi.create, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["models"] }) });
+  const [draft, setDraft] = useState<ModelFormState>(newModelDraft());
+  const [editing, setEditing] = useState<ModelConfig | null>(null);
+  const create = useMutation({
+    mutationFn: modelsApi.create,
+    onSuccess: () => {
+      setDraft(newModelDraft());
+      queryClient.invalidateQueries({ queryKey: ["models"] });
+    }
+  });
+  const update = useMutation({
+    mutationFn: modelsApi.update,
+    onSuccess: () => {
+      setEditing(null);
+      queryClient.invalidateQueries({ queryKey: ["models"] });
+    }
+  });
   const test = useMutation({ mutationFn: modelsApi.test });
   return (
     <main className="page">
       <PageTitle title="模型" description="查看服务商能力、Key 状态和采样默认参数。" />
       <Panel title="新增模型">
-        <form className="form-grid compact" onSubmit={(event) => { event.preventDefault(); create.mutate(draft); }}>
-          <label>服务商<input value={draft.provider} onChange={(event) => setDraft({ ...draft, provider: event.target.value })} /></label>
-          <label>名称<input value={draft.label} onChange={(event) => setDraft({ ...draft, label: event.target.value })} /></label>
-          <label>模型 ID<input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} /></label>
-          <label>API Key<input type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} /></label>
-          <button type="submit">保存模型</button>
-        </form>
+        <div className="preset-row">
+          {Object.keys(models.data?.presets || {}).map((provider) => (
+            <button key={provider} className="ghost" type="button" onClick={() => setDraft({ ...newModelDraft(), ...(models.data?.presets[provider] || {}), api_key: "" })}>{provider}</button>
+          ))}
+        </div>
+        <ModelForm value={draft} onChange={setDraft} submitLabel="保存模型" onSubmit={() => create.mutate(draft)} />
       </Panel>
-      <div className="model-grid">{models.data?.models.map((model) => <ModelCard key={model.id} model={model} onTest={() => test.mutate({ id: model.id })} />)}</div>
+      {editing ? (
+        <Panel title={`编辑模型：${editing.label}`}>
+          <ModelForm value={{ ...editing, api_key: "" }} onChange={(value) => setEditing({ ...editing, ...value })} submitLabel="保存设置" isEdit onSubmit={() => update.mutate({ ...editing, api_key: editing.api_key || "__KEEP__" })} onCancel={() => setEditing(null)} />
+        </Panel>
+      ) : null}
+      <div className="model-grid">{models.data?.models.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div>
       {test.data ? <pre className="result-box">{JSON.stringify(test.data, null, 2)}</pre> : null}
+      {test.error ? <div className="error-box">{test.error.message.includes("真实模型调用默认关闭") ? "真实模型测试当前被后端安全开关拦截。需要本地验收真实调用时，用 ALLOW_LIVE_MODEL_CALLS=1 重启 python3 app.py。" : test.error.message}</div> : null}
     </main>
   );
 }
 
-function ModelCard({ model, onTest }: { model: ModelConfig; onTest: () => void }) {
+function newModelDraft(): ModelFormState {
+  return {
+    provider: "mock",
+    label: "Mock",
+    model: "mock-model",
+    api_key: "",
+    model_type: "chat",
+    priority: 100,
+    daily_limit: 0,
+    supports_pure: true,
+    supports_tool_calling: true,
+    active: true
+  };
+}
+
+function ModelForm({ value, onChange, onSubmit, onCancel, submitLabel, isEdit = false }: { value: ModelFormState; onChange: (value: ModelFormState) => void; onSubmit: () => void; onCancel?: () => void; submitLabel: string; isEdit?: boolean }) {
+  const set = (key: keyof ModelFormState, next: unknown) => onChange({ ...value, [key]: next });
+  const checkbox = (key: keyof ModelFormState, label: string) => (
+    <label className="checkbox-field"><input type="checkbox" checked={Boolean(value[key])} onChange={(event) => set(key, event.target.checked)} />{label}</label>
+  );
+  return (
+    <form className="model-form" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
+      <div className="form-grid">
+        <label>模型名称<input value={value.label || ""} onChange={(event) => set("label", event.target.value)} /></label>
+        <label>服务商标识<input value={value.provider || ""} onChange={(event) => set("provider", event.target.value)} /></label>
+        <label>API 家族<input value={value.api_family || ""} onChange={(event) => set("api_family", event.target.value)} /></label>
+        <label>模型类型<select value={value.model_type || "chat"} onChange={(event) => set("model_type", event.target.value)}><option value="chat">聊天模型</option><option value="embedding">Embedding</option></select></label>
+        <label className="wide">模型 ID<input value={value.model || ""} onChange={(event) => set("model", event.target.value)} /></label>
+        <label className="wide">模型版本候选<input value={value.model_version || ""} onChange={(event) => set("model_version", event.target.value)} placeholder="多个版本可用逗号、分号或换行分隔" /></label>
+        <label className="wide">API 地址<input value={value.api_base || ""} onChange={(event) => set("api_base", event.target.value)} /></label>
+        <label className="wide">API Key<input type="password" value={value.api_key || ""} onChange={(event) => set("api_key", event.target.value)} placeholder={isEdit ? "留空表示保持原 Key" : ""} /></label>
+        <label>优先级<input type="number" value={Number(value.priority ?? 100)} onChange={(event) => set("priority", Number(event.target.value) || 0)} /></label>
+        <label>每日限制<input type="number" value={Number(value.daily_limit ?? 0)} onChange={(event) => set("daily_limit", Number(event.target.value) || 0)} /></label>
+      </div>
+      <div className="capability-grid">
+        {checkbox("supports_pure", "纯模型")}
+        {checkbox("supports_search", "联网搜索")}
+        {checkbox("supports_reasoning", "深度思考")}
+        {checkbox("supports_citation", "引用返回")}
+        {checkbox("supports_site_filter", "站点筛选")}
+        {checkbox("supports_time_filter", "时间筛选")}
+        {checkbox("supports_user_location", "地区定位")}
+        {checkbox("supports_tool_calling", "工具调用")}
+        {checkbox("active", "启用")}
+      </div>
+      <div className="form-grid">
+        <label className="wide">联网模式说明<input value={value.web_search_mode || ""} onChange={(event) => set("web_search_mode", event.target.value)} /></label>
+        <label className="wide">联网参数路径<input value={value.web_search_param_path || ""} onChange={(event) => set("web_search_param_path", event.target.value)} /></label>
+        <label className="wide">深度思考参数路径<input value={value.reasoning_param_path || ""} onChange={(event) => set("reasoning_param_path", event.target.value)} /></label>
+        <label className="wide">思考档位/预算说明<input value={value.reasoning_levels || ""} onChange={(event) => set("reasoning_levels", event.target.value)} /></label>
+        <label className="wide">引用参数路径<input value={value.citation_param_path || ""} onChange={(event) => set("citation_param_path", event.target.value)} /></label>
+        <label className="wide">备注<textarea value={value.notes || ""} onChange={(event) => set("notes", event.target.value)} /></label>
+      </div>
+      <div className="inline-actions"><button type="submit">{submitLabel}</button>{onCancel ? <button className="ghost" type="button" onClick={onCancel}>取消</button> : null}</div>
+    </form>
+  );
+}
+
+function ModelCard({ model, onTest, onEdit }: { model: ModelConfig; onTest: () => void; onEdit: () => void }) {
   const defaults = model.sampling_defaults || {};
-  return <article className="model-card"><header><div><strong>{model.label}</strong><span>{model.provider} / {model.model}</span></div><span className={model.has_key ? "key-ok" : "key-missing"}><KeyRound size={14} />{model.has_key ? model.api_key_masked || "已配置" : "未配置"}</span></header><div className="tag-row">{model.supports_search ? <span>联网</span> : null}{model.supports_reasoning ? <span>思考</span> : null}{model.supports_citation ? <span>引用</span> : null}{model.active ? <span>启用</span> : <span>停用</span>}</div><dl><dt>temperature</dt><dd>{String(defaults.temperature ?? "模型默认")}</dd><dt>reasoning</dt><dd>{String(defaults.reasoning_effort ?? "模型默认")}</dd><dt>note</dt><dd>{String(defaults.defaults_note ?? "-")}</dd></dl><button className="ghost" onClick={onTest}>测试</button></article>;
+  return <article className="model-card"><header><div><strong>{model.label}</strong><span>{model.provider} / {model.model}</span></div><span className={model.has_key ? "key-ok" : "key-missing"}><KeyRound size={14} />{model.has_key ? model.api_key_masked || "已配置" : "未配置"}</span></header><div className="tag-row">{model.supports_search ? <span>联网</span> : null}{model.supports_reasoning ? <span>思考</span> : null}{model.supports_citation ? <span>引用</span> : null}{model.active ? <span>启用</span> : <span>停用</span>}</div><dl><dt>temperature</dt><dd>{String(defaults.temperature ?? "模型默认")}</dd><dt>reasoning</dt><dd>{String(defaults.reasoning_effort ?? "模型默认")}</dd><dt>api_base</dt><dd>{model.api_base || "-"}</dd><dt>note</dt><dd>{String(defaults.defaults_note ?? "-")}</dd></dl><div className="inline-actions"><button className="ghost" onClick={onEdit}>编辑设置</button><button className="ghost" onClick={onTest}>测试</button></div></article>;
 }
 
 function SamplingPage() {
