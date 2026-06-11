@@ -4,6 +4,8 @@
 
 更新时间：2026-06-11
 
+实施状态：首版 Vite + React + TypeScript 工作台已落地，Python 后端会优先服务 `frontend/dist`，旧 `static/` 作为回退保留。
+
 ## 1. 目标
 
 把当前 `static/index.html + static/app.js + static/styles.css` 的原生前端，重构为 Vite + React + TypeScript 的正式内部系统前端。
@@ -173,6 +175,13 @@ STATIC_DIR = ROOT / "frontend" / "dist"
 
 - 本地开发：`npm run dev` 代理到 `127.0.0.1:8765`。
 - 生产部署：`npm run build`，把 `frontend/dist` 作为静态目录。
+
+当前实现：
+
+- 源码目录：`frontend/src`。
+- 构建产物：`frontend/dist`。
+- 后端入口：`app.py` 中 `FRONTEND_DIST_DIR` 存在时优先服务 React 构建。
+- 旧前端：`static/` 暂时保留，用于没有构建产物时回退。
 
 ## 6. 页面信息架构
 

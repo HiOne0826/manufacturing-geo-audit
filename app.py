@@ -56,6 +56,7 @@ from src.tasks import mark_batch_failed, perform_batch, perform_rerun_failed
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+FRONTEND_DIST_DIR = ROOT / "frontend" / "dist"
 EXPORT_DIR = ROOT / "exports"
 SAMPLING_JOBS: dict[str, dict] = {}
 SAMPLING_JOBS_LOCK = threading.Lock()
@@ -243,6 +244,11 @@ def dispatch_rerun_failed(batch_id: str, payload: dict) -> str | None:
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path)
+        if FRONTEND_DIST_DIR.exists():
+            candidate = FRONTEND_DIST_DIR / parsed.path.lstrip("/")
+            if parsed.path == "/" or not candidate.exists() or candidate.is_dir():
+                return str(FRONTEND_DIST_DIR / "index.html")
+            return str(candidate)
         if parsed.path == "/":
             return str(STATIC_DIR / "index.html")
         if parsed.path.startswith("/static/"):

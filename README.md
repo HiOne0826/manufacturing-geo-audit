@@ -53,6 +53,31 @@ http://127.0.0.1:8765
 APP_PASSWORD=your-password APP_SESSION_SECRET=your-secret python3 app.py
 ```
 
+## 前端
+
+当前正式前端位于 `frontend/`，使用 Vite + React + TypeScript。
+
+安装依赖：
+
+```bash
+cd frontend
+npm install
+```
+
+开发模式：
+
+```bash
+npm run dev
+```
+
+构建正式静态文件：
+
+```bash
+npm run build
+```
+
+`frontend/dist` 存在时，`python3 app.py` 会优先服务 React 构建；旧 `static/` 保留为回退。
+
 ## 真实模型调用
 
 默认不允许真实模型调用。需要人工实测时：
