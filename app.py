@@ -40,7 +40,7 @@ from src.db import (
     update_model_config,
     update_project,
     update_question,
-    update_sampling_batch,
+    database_url,
 )
 from src.exporter import (
     analytics_to_csv,
@@ -49,8 +49,9 @@ from src.exporter import (
     runs_to_excel_html,
 )
 from src.runtime_env import load_dotenv_file
-from src.runner import estimate_batch_total, rerun_failed_runs, run_batch
+from src.runner import estimate_batch_total
 from src.db import utc_now
+from src.tasks import mark_batch_failed, perform_batch, perform_rerun_failed
 
 
 ROOT = Path(__file__).resolve().parent
@@ -80,6 +81,24 @@ def auth_enabled() -> bool:
 
 def agent_api_token() -> str:
     return os.environ.get("AGENT_API_TOKEN", "").strip()
+
+
+def task_queue_backend() -> str:
+    return os.environ.get("TASK_QUEUE_BACKEND", "inline").strip().lower() or "inline"
+
+
+def enqueue_rq_task(func, *args) -> str:
+    try:
+        from redis import Redis
+        from rq import Queue
+    except ImportError as exc:
+        raise RuntimeError("缺少 RQ 依赖，请先安装：python3 -m pip install -r requirements-worker.txt") from exc
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+    queue_name = os.environ.get("RQ_QUEUE_NAME", "geo-audit")
+    timeout = int(os.environ.get("RQ_JOB_TIMEOUT", "3600"))
+    queue = Queue(queue_name, connection=Redis.from_url(redis_url))
+    job = queue.enqueue(func, *args, job_timeout=timeout)
+    return job.id
 
 
 def sign_auth_payload(payload: str) -> str:
@@ -140,54 +159,23 @@ def sampling_batch_to_progress(batch: dict) -> dict:
 
 def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
     set_sampling_job(batch_id, status="running", started_at=utc_now())
-
     try:
-        with get_conn(DEFAULT_DB_PATH) as conn:
-            update_sampling_batch(conn, batch_id, {"status": "running", "started_at": utc_now(), "updated_at": utc_now()})
-            conn.commit()
-
-            def on_progress(progress: dict):
-                set_sampling_job(
-                    batch_id,
-                    status="running",
-                    total=progress["total"],
-                    completed=progress["completed"],
-                    failed=progress["failed"],
-                    success=progress["success"],
-                    current_provider=progress["provider"],
-                    current_model=progress["model"],
-                    current_question_id=progress["question_id"],
-                    current_repeat_index=progress["repeat_index"],
-                    updated_at=utc_now(),
-                )
-                update_sampling_batch(
-                    conn,
-                    batch_id,
-                    {
-                        "status": "running",
-                        "total_count": progress["total"],
-                        "completed_count": progress["completed"],
-                        "failed_count": progress["failed"],
-                        "success_count": progress["success"],
-                        "updated_at": utc_now(),
-                    },
-                )
-                conn.commit()
-
-            result = run_batch(conn, project_id, payload, batch_id=batch_id, progress_callback=on_progress)
-            update_sampling_batch(
-                conn,
+        def on_progress(progress: dict):
+            set_sampling_job(
                 batch_id,
-                {
-                    "status": "completed",
-                    "total_count": result["total"],
-                    "completed_count": result["total"],
-                    "failed_count": result["failed"],
-                    "success_count": result["success"],
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
+                status="running",
+                total=progress["total"],
+                completed=progress["completed"],
+                failed=progress["failed"],
+                success=progress["success"],
+                current_provider=progress["provider"],
+                current_model=progress["model"],
+                current_question_id=progress["question_id"],
+                current_repeat_index=progress["repeat_index"],
+                updated_at=utc_now(),
             )
+
+        result = perform_batch(batch_id, project_id, payload, progress_hook=on_progress, db_target=DEFAULT_DB_PATH)
         set_sampling_job(
             batch_id,
             status="completed",
@@ -200,20 +188,7 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
         )
     except Exception as exc:
         job = get_sampling_job(batch_id) or {}
-        with get_conn(DEFAULT_DB_PATH) as conn:
-            update_sampling_batch(
-                conn,
-                batch_id,
-                {
-                    "status": "failed",
-                    "error_message": str(exc),
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                    "completed_count": job.get("completed", 0),
-                    "failed_count": job.get("failed", 0),
-                    "success_count": job.get("success", 0),
-                },
-            )
+        mark_batch_failed(batch_id, str(exc), job, db_target=DEFAULT_DB_PATH)
         set_sampling_job(
             batch_id,
             status="failed",
@@ -229,39 +204,7 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
 def rerun_failed_in_background(batch_id: str, payload: dict):
     set_sampling_job(batch_id, status="running", started_at=utc_now())
     try:
-        with get_conn(DEFAULT_DB_PATH) as conn:
-            failed_runs = list_failed_runs_by_batch(conn, batch_id)
-            update_sampling_batch(
-                conn,
-                batch_id,
-                {
-                    "status": "running",
-                    "total_count": len(failed_runs),
-                    "completed_count": 0,
-                    "failed_count": 0,
-                    "success_count": 0,
-                    "error_message": "",
-                    "started_at": utc_now(),
-                    "finished_at": None,
-                    "updated_at": utc_now(),
-                },
-            )
-            conn.commit()
-
-            result = rerun_failed_runs(conn, batch_id, failed_runs, payload)
-            update_sampling_batch(
-                conn,
-                batch_id,
-                {
-                    "status": "completed",
-                    "total_count": result["total"],
-                    "completed_count": result["total"],
-                    "failed_count": result["failed"],
-                    "success_count": result["success"],
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
-            )
+        result = perform_rerun_failed(batch_id, payload, db_target=DEFAULT_DB_PATH)
         set_sampling_job(
             batch_id,
             status="completed",
@@ -273,18 +216,30 @@ def rerun_failed_in_background(batch_id: str, payload: dict):
             updated_at=utc_now(),
         )
     except Exception as exc:
-        with get_conn(DEFAULT_DB_PATH) as conn:
-            update_sampling_batch(
-                conn,
-                batch_id,
-                {
-                    "status": "failed",
-                    "error_message": str(exc),
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
-            )
+        mark_batch_failed(batch_id, str(exc), db_target=DEFAULT_DB_PATH)
         set_sampling_job(batch_id, status="failed", error=str(exc), finished_at=utc_now(), updated_at=utc_now())
+
+
+def dispatch_batch(batch_id: str, project_id: int, payload: dict) -> str | None:
+    if task_queue_backend() == "rq":
+        return enqueue_rq_task(perform_batch, batch_id, project_id, payload)
+    threading.Thread(
+        target=run_batch_in_background,
+        args=(batch_id, project_id, payload),
+        daemon=True,
+    ).start()
+    return None
+
+
+def dispatch_rerun_failed(batch_id: str, payload: dict) -> str | None:
+    if task_queue_backend() == "rq":
+        return enqueue_rq_task(perform_rerun_failed, batch_id, payload)
+    threading.Thread(
+        target=rerun_failed_in_background,
+        args=(batch_id, payload),
+        daemon=True,
+    ).start()
+    return None
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path)
@@ -320,7 +275,7 @@ class Handler(SimpleHTTPRequestHandler):
         return json.loads(raw or "{}")
 
     def json_response(self, data, status: int = 200):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -425,7 +380,13 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             with get_conn(DEFAULT_DB_PATH) as conn:
                 if parsed.path == "/api/health":
-                    self.json_response({"ok": True, "db": str(DEFAULT_DB_PATH)})
+                    self.json_response(
+                        {
+                            "ok": True,
+                            "db": "postgres" if database_url() else str(DEFAULT_DB_PATH),
+                            "task_queue_backend": task_queue_backend(),
+                        }
+                    )
                 elif parsed.path == "/api/auth/status":
                     self.json_response(
                         {
@@ -454,7 +415,7 @@ class Handler(SimpleHTTPRequestHandler):
                     batch_id = str(query.get("batch_id", [""])[0]).strip()
                     if not batch_id:
                         raise ValueError("缺少 batch_id")
-                    job = get_sampling_job(batch_id)
+                    job = None if task_queue_backend() == "rq" else get_sampling_job(batch_id)
                     if not job:
                         batch = get_sampling_batch(conn, batch_id)
                         if not batch:
@@ -640,12 +601,16 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
-                    threading.Thread(
-                        target=run_batch_in_background,
-                        args=(batch_id, project_id, payload),
-                        daemon=True,
-                    ).start()
-                    result = {"batch_id": batch_id, "total": total, "failed": 0, "success": 0, "status": "queued"}
+                    job_id = dispatch_batch(batch_id, project_id, payload)
+                    result = {
+                        "batch_id": batch_id,
+                        "total": total,
+                        "failed": 0,
+                        "success": 0,
+                        "status": "queued",
+                        "task_queue_backend": task_queue_backend(),
+                        "job_id": job_id,
+                    }
                     self.json_response(result)
                 elif parsed.path == "/api/agent/batches":
                     project_id = int(payload.get("project_id", 0))
@@ -686,8 +651,16 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
-                    threading.Thread(target=run_batch_in_background, args=(batch_id, project_id, run_payload), daemon=True).start()
-                    self.json_response({"batch_id": batch_id, "total": total, "status": "queued"})
+                    job_id = dispatch_batch(batch_id, project_id, run_payload)
+                    self.json_response(
+                        {
+                            "batch_id": batch_id,
+                            "total": total,
+                            "status": "queued",
+                            "task_queue_backend": task_queue_backend(),
+                            "job_id": job_id,
+                        }
+                    )
                 elif parsed.path.startswith("/api/agent/batches/") and parsed.path.endswith("/rerun_failed"):
                     parts = [unquote(item) for item in parsed.path.split("/") if item]
                     if len(parts) != 5:
@@ -695,8 +668,16 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     batch_id = parts[3]
                     failed_runs = list_failed_runs_by_batch(conn, batch_id)
-                    threading.Thread(target=rerun_failed_in_background, args=(batch_id, payload), daemon=True).start()
-                    self.json_response({"batch_id": batch_id, "total": len(failed_runs), "status": "queued"})
+                    job_id = dispatch_rerun_failed(batch_id, payload)
+                    self.json_response(
+                        {
+                            "batch_id": batch_id,
+                            "total": len(failed_runs),
+                            "status": "queued",
+                            "task_queue_backend": task_queue_backend(),
+                            "job_id": job_id,
+                        }
+                    )
                 elif parsed.path.startswith("/api/batches/") and parsed.path.endswith("/rerun_failed"):
                     parts = [unquote(item) for item in parsed.path.split("/") if item]
                     if len(parts) != 4:
@@ -718,12 +699,16 @@ class Handler(SimpleHTTPRequestHandler):
                         status="queued",
                         updated_at=utc_now(),
                     )
-                    threading.Thread(
-                        target=rerun_failed_in_background,
-                        args=(batch_id, payload),
-                        daemon=True,
-                    ).start()
-                    self.json_response({"batch_id": batch_id, "total": len(failed_runs), "status": "queued"})
+                    job_id = dispatch_rerun_failed(batch_id, payload)
+                    self.json_response(
+                        {
+                            "batch_id": batch_id,
+                            "total": len(failed_runs),
+                            "status": "queued",
+                            "task_queue_backend": task_queue_backend(),
+                            "job_id": job_id,
+                        }
+                    )
                 else:
                     self.json_response({"error": "接口不存在"}, 404)
         except Exception as exc:

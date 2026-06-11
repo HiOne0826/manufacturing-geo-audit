@@ -14,6 +14,7 @@ from .db import (
     get_project,
     insert_evaluation,
     insert_run,
+    is_postgres_conn,
     list_questions,
     utc_now,
 )
@@ -52,7 +53,9 @@ def retry_count(config: dict[str, Any] | None = None) -> int:
     return env_int("SAMPLING_RETRY_COUNT", 1, minimum=0, maximum=5)
 
 
-def connection_db_path(conn) -> Path:
+def connection_db_target(conn) -> Path | None:
+    if is_postgres_conn(conn):
+        return None
     row = conn.execute("PRAGMA database_list").fetchone()
     if not row or not row[2]:
         raise ValueError("当前数据库连接没有文件路径，不能用于并发采样")
@@ -158,7 +161,7 @@ def prepare_runtime_task(
 def execute_sampling_task(
     task: dict[str, Any],
     *,
-    db_path: Path,
+    db_target: Path | None,
     project: dict[str, Any],
     semaphore: threading.Semaphore,
     max_retries: int,
@@ -204,12 +207,12 @@ def execute_sampling_task(
             website_domain=project.get("website_domain", ""),
             citations=run.get("citations", []),
         )
-        with get_conn(db_path) as conn:
+        with get_conn(db_target) as conn:
             insert_run(conn, run)
             insert_evaluation(conn, evaluation)
         return {**base, "status": "success"}
     except Exception as exc:
-        with get_conn(db_path) as conn:
+        with get_conn(db_target) as conn:
             insert_run(
                 conn,
                 {
@@ -257,7 +260,7 @@ def build_tasks(
 def run_prepared_tasks(
     *,
     tasks: list[dict[str, Any]],
-    db_path: Path,
+    db_target: Path | None,
     project: dict[str, Any],
     config: dict[str, Any],
     batch_id: str,
@@ -279,7 +282,7 @@ def run_prepared_tasks(
             executor.submit(
                 execute_sampling_task,
                 task,
-                db_path=db_path,
+                db_target=db_target,
                 project=project,
                 semaphore=semaphores[task["base"]["provider"] or "unknown"],
                 max_retries=max_retries,
@@ -329,7 +332,7 @@ def run_batch(
     if not providers:
         raise ValueError("请至少选择一个模型")
 
-    db_path = connection_db_path(conn)
+    db_target = connection_db_target(conn)
     batch_id = batch_id or f"batch-{uuid.uuid4().hex[:10]}"
     model_configs: dict[int, dict[str, Any]] = {}
     for provider_cfg in providers:
@@ -343,7 +346,7 @@ def run_batch(
     conn.commit()
     return run_prepared_tasks(
         tasks=tasks,
-        db_path=db_path,
+        db_target=db_target,
         project=project,
         config=config,
         batch_id=batch_id,
@@ -400,7 +403,7 @@ def rerun_failed_runs(conn, batch_id: str, failed_runs: list[dict[str, Any]], co
     conn.commit()
     return run_prepared_tasks(
         tasks=tasks,
-        db_path=connection_db_path(conn),
+        db_target=connection_db_target(conn),
         project=project,
         config=rerun_config,
         batch_id=batch_id,
