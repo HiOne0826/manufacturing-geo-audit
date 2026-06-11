@@ -185,11 +185,13 @@ function QuestionTable({ questions, onDelete }: { questions: Question[]; onDelet
 function ModelsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: modelsApi.list });
   const [draft, setDraft] = useState<ModelFormState>(newModelDraft());
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [editing, setEditing] = useState<ModelConfig | null>(null);
   const create = useMutation({
     mutationFn: modelsApi.create,
     onSuccess: () => {
       setDraft(newModelDraft());
+      setShowCreateModal(false);
       queryClient.invalidateQueries({ queryKey: ["models"] });
     }
   });
@@ -203,24 +205,40 @@ function ModelsPage() {
   const test = useMutation({ mutationFn: modelsApi.test });
   return (
     <main className="page">
-      <PageTitle title="模型" description="查看服务商能力、Key 状态和采样默认参数。" />
-      <Panel title="新增模型">
-        <div className="preset-row">
-          {Object.keys(models.data?.presets || {}).map((provider) => (
-            <button key={provider} className="ghost" type="button" onClick={() => setDraft({ ...newModelDraft(), ...(models.data?.presets[provider] || {}), api_key: "" })}>{provider}</button>
-          ))}
-        </div>
-        <ModelForm value={draft} onChange={setDraft} submitLabel="保存模型" onSubmit={() => create.mutate(draft)} />
-      </Panel>
+      <PageTitle title="模型" description="查看服务商能力、Key 状态和采样默认参数。" action={<button onClick={() => setShowCreateModal(true)}>新增模型</button>} />
+      {showCreateModal ? (
+        <Modal title="新增模型" onClose={() => setShowCreateModal(false)}>
+          <div className="preset-row">
+            {Object.keys(models.data?.presets || {}).map((provider) => (
+              <button key={provider} className="ghost" type="button" onClick={() => setDraft({ ...newModelDraft(), ...(models.data?.presets[provider] || {}), api_key: "" })}>{provider}</button>
+            ))}
+          </div>
+          <ModelForm value={draft} onChange={setDraft} submitLabel="保存模型" onSubmit={() => create.mutate(draft)} onCancel={() => setShowCreateModal(false)} />
+        </Modal>
+      ) : null}
       {editing ? (
-        <Panel title={`编辑模型：${editing.label}`}>
+        <Modal title={`编辑模型：${editing.label}`} onClose={() => setEditing(null)}>
           <ModelForm value={{ ...editing, api_key: "" }} onChange={(value) => setEditing({ ...editing, ...value })} submitLabel="保存设置" isEdit onSubmit={() => update.mutate({ ...editing, api_key: editing.api_key || "__KEEP__" })} onCancel={() => setEditing(null)} />
-        </Panel>
+        </Modal>
       ) : null}
       <div className="model-grid">{models.data?.models.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div>
       {test.data ? <pre className="result-box">{JSON.stringify(test.data, null, 2)}</pre> : null}
       {test.error ? <div className="error-box">{test.error.message.includes("真实模型调用默认关闭") ? "真实模型测试当前被后端安全开关拦截。需要本地验收真实调用时，用 ALLOW_LIVE_MODEL_CALLS=1 重启 python3 app.py。" : test.error.message}</div> : null}
     </main>
+  );
+}
+
+function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal-panel">
+        <header className="modal-header">
+          <h2>{title}</h2>
+          <button className="ghost" type="button" onClick={onClose}>关闭</button>
+        </header>
+        <div className="modal-body">{children}</div>
+      </section>
+    </div>
   );
 }
 
