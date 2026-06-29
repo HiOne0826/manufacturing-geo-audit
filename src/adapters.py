@@ -151,7 +151,7 @@ PROVIDER_PRESETS = {
         "label": "豆包",
         "provider": "doubao",
         "api_family": "火山方舟 ARK Responses API",
-        "model": "doubao-seed-1-6",
+        "model": "doubao-seed-2-0-mini-260428",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
@@ -318,8 +318,9 @@ def post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dic
         headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
+    timeout = int(os.environ.get("SAMPLING_REQUEST_TIMEOUT", "90") or 90)
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")

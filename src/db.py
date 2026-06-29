@@ -133,7 +133,7 @@ DEFAULT_MODEL_CONFIGS = [
         "provider": "doubao",
         "label": "豆包",
         "api_family": "火山方舟 ARK Responses API",
-        "model": "doubao-seed-1-6",
+        "model": "doubao-seed-2-0-mini-260428",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",

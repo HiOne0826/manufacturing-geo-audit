@@ -13,9 +13,11 @@
 APP_PASSWORD=替换为强密码
 APP_SESSION_SECRET=替换为独立随机字符串
 AUTH_COOKIE_NAME=geo_audit_session
+ALLOW_LIVE_MODEL_CALLS=0
 ```
 
 未设置 `APP_PASSWORD` 时，本地开发保持无应用密码模式；公网部署必须设置。
+需要在服务器验收真实模型调用时，把 `ALLOW_LIVE_MODEL_CALLS` 改为 `1`，并重启 Web 与 worker。
 
 ## 认证接口
 
@@ -64,6 +66,7 @@ EnvironmentFile=-/opt/manufacturing-geo-audit/.env
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart manufacturing-geo-audit
+sudo systemctl restart manufacturing-geo-audit-worker
 sudo nginx -t
 sudo systemctl reload nginx
 ```
