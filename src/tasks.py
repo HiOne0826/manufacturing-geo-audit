@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import get_conn, list_failed_runs_by_batch, update_sampling_batch, utc_now
+from .db import get_conn, get_sampling_batch, list_failed_runs_by_batch, update_sampling_batch, utc_now
 from .runner import rerun_failed_runs, run_batch
 
 
@@ -63,6 +63,15 @@ def perform_rerun_failed(
 ) -> dict[str, Any]:
     with get_conn(db_target) as conn:
         failed_runs = list_failed_runs_by_batch(conn, batch_id)
+        if not failed_runs:
+            batch = get_sampling_batch(conn, batch_id)
+            return {
+                "batch_id": batch_id,
+                "total": int((batch or {}).get("total_count", 0) or 0),
+                "failed": int((batch or {}).get("failed_count", 0) or 0),
+                "success": int((batch or {}).get("success_count", 0) or 0),
+                "status": (batch or {}).get("status", "completed"),
+            }
         update_sampling_batch(
             conn,
             batch_id,

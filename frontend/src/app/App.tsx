@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { BarChart3, Boxes, Database, FileDown, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, Shield, SlidersHorizontal } from "lucide-react";
+import { BarChart3, Boxes, FileDown, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal } from "lucide-react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
 import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
-import type { ModelConfig, Project, Question } from "../api/types";
+import type { AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SourceRunStatus } from "../api/types";
 import { EmptyState, Metric, PageTitle, StatusBadge } from "../components/common";
 import { asCount, formatDateTime, pct } from "../utils/format";
 import { useSelectionStore } from "../store/selectionStore";
@@ -24,6 +24,14 @@ const navItems = [
   { to: "/analysis", label: "分析", icon: BarChart3 },
   { to: "/settings", label: "设置", icon: Settings }
 ];
+
+function runPlatform(row: Pick<ModelRun, "test_platform" | "provider">) {
+  return row.test_platform || row.provider || "unknown";
+}
+
+function isTerminalStatus(status?: string) {
+  return status === "completed" || status === "failed";
+}
 
 export function App() {
   const auth = useQuery({ queryKey: ["auth"], queryFn: authApi.status });
@@ -57,7 +65,6 @@ function AuthGate({ message, onMessage }: { message: string; onMessage: (value: 
 
 function Shell() {
   const projects = useQuery({ queryKey: ["projects"], queryFn: projectsApi.list });
-  const health = useQuery({ queryKey: ["health"], queryFn: systemApi.health });
   const { projectId, setProjectId } = useSelectionStore();
   useEffect(() => {
     if (!projectId && projects.data?.projects?.[0]) setProjectId(projects.data.projects[0].id);
@@ -78,8 +85,6 @@ function Shell() {
             </select>
           </div>
           <div className="system-pills">
-            <span><Database size={14} />{health.data?.task_queue_backend || "-"}</span>
-            <span><Shield size={14} />{health.data?.ok ? "健康" : "未知"}</span>
             <button className="ghost" onClick={() => logout.mutate()}>退出</button>
           </div>
         </header>
@@ -257,14 +262,18 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
 
 function newModelDraft(): ModelFormState {
   return {
-    provider: "mock",
-    label: "Mock",
-    model: "mock-model",
+    provider: "openrouter_gpt",
+    label: "ChatGPT",
+    model: "openai/gpt-5.2",
+    api_family: "OpenRouter Chat Completions",
+    api_base: "https://openrouter.ai/api/v1",
     api_key: "",
     model_type: "chat",
     priority: 100,
     daily_limit: 0,
     supports_pure: true,
+    supports_search: true,
+    supports_citation: true,
     supports_tool_calling: true,
     active: true
   };
@@ -322,6 +331,7 @@ function SamplingPage() {
   const { projectId } = useSelectionStore();
   const questions = useQuery({ queryKey: ["questions", projectId], queryFn: () => questionsApi.list(projectId), enabled: Boolean(projectId) });
   const models = useQuery({ queryKey: ["models"], queryFn: modelsApi.list });
+  const batches = useQuery({ queryKey: ["batches", projectId], queryFn: () => batchesApi.list(projectId || "all"), enabled: Boolean(projectId), refetchInterval: 2500 });
   const [selected, setSelected] = useState<Record<number, { mode: SamplingMode; reasoning_enabled: boolean }>>({});
   const [repeatCount, setRepeatCount] = useState(1);
   const [activeBatch, setActiveBatch] = useState<string>("");
@@ -343,17 +353,43 @@ function SamplingPage() {
     mutationFn: () => runsApi.start({ project_id: projectId, repeat_count: repeatCount, models: runModels }),
     onSuccess: (data) => { setActiveBatch(data.batch_id); queryClient.invalidateQueries({ queryKey: ["batches"] }); }
   });
+  const rerun = useMutation({ mutationFn: () => batchesApi.rerunFailed(activeBatch), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["progress", activeBatch] }) });
   const progress = useQuery({ queryKey: ["progress", activeBatch], queryFn: () => batchesApi.progress(activeBatch), enabled: Boolean(activeBatch), refetchInterval: (query) => query.state.data?.status === "completed" || query.state.data?.status === "failed" ? false : 1200 });
+  useEffect(() => {
+    if (activeBatch || !batches.data?.batches.length) return;
+    const running = batches.data.batches.find((batch) => !isTerminalStatus(batch.status));
+    if (running) setActiveBatch(running.batch_id);
+  }, [activeBatch, batches.data?.batches]);
   const activeModels = (models.data?.models || []).filter((m) => m.active);
   const searchTaskCount = runModels.filter((item) => item.search_enabled).length;
   const totalTasks = (questions.data?.questions.length || 0) * runModels.length * repeatCount;
+  const activeStatus = progress.data?.status;
+  const batchRunning = Boolean(activeBatch && !isTerminalStatus(activeStatus));
+  const failedSources = (progress.data?.source_statuses || []).some((item) => item.failed > 0);
   return (
     <main className="page sampling-page">
       <PageTitle title="采样" description="选择问题范围和模型矩阵，对比模型本体与联网搜索结果。" />
       <section className="sampling-grid">
         <Panel title="范围"><Metric label="当前问题数" value={questions.data?.questions.length || 0} /><label>重复次数<input type="number" min={1} max={10} value={repeatCount} onChange={(event) => setRepeatCount(Number(event.target.value) || 1)} /></label></Panel>
-        <Panel title="任务估算"><Metric label="已选模型" value={Object.keys(selected).length} /><Metric label="联网任务配置" value={searchTaskCount} /><Metric label="预计任务" value={totalTasks} /><button disabled={!projectId || !totalTasks || start.isPending} onClick={() => start.mutate()}><Play size={15} />启动采样</button></Panel>
-        <Panel title="运行状态">{activeBatch ? <><StatusBadge status={progress.data?.status || "queued"} /><ProgressBar batch={progress.data} /><Link to={`/batches/${activeBatch}`}>查看批次详情</Link></> : <EmptyState title="尚未启动采样" />}</Panel>
+        <Panel title="任务估算"><Metric label="已选模型" value={Object.keys(selected).length} /><Metric label="联网任务配置" value={searchTaskCount} /><Metric label="预计任务" value={totalTasks} /><button disabled={!projectId || !totalTasks || start.isPending || batchRunning} onClick={() => start.mutate()}><Play size={15} />{start.isPending ? "正在提交任务" : batchRunning ? "采样运行中" : "启动采样"}</button>{start.error ? <div className="error-box">{start.error.message}</div> : null}</Panel>
+        <Panel title="运行监测">
+          {activeBatch ? (
+            <div className="run-monitor" aria-live="polite">
+              <div className="monitor-head">
+                <div><span>当前批次</span><strong>{activeBatch}</strong></div>
+                <StatusBadge status={progress.data?.status || "queued"} />
+              </div>
+              <ProgressBar batch={progress.data} />
+              {progress.isError ? <div className="error-box">{progress.error.message}</div> : null}
+              <SourceStatusList rows={progress.data?.source_statuses || []} compact />
+              {rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}
+              <div className="inline-actions">
+                <Link className="button ghost" to={`/batches/${activeBatch}`}>{failedSources ? "查看失败原因" : "查看批次详情"}</Link>
+                {failedSources && isTerminalStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={rerun.isPending} onClick={() => rerun.mutate()}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}
+              </div>
+            </div>
+          ) : <EmptyState title="尚未启动采样" />}
+        </Panel>
       </section>
       <Panel title="模型矩阵">
         <div className="model-matrix">
@@ -380,7 +416,7 @@ function SamplingPage() {
                   </label>
                   <span className={model.has_key ? "key-ok" : "key-missing"}>{model.has_key ? "Key 已配置" : "缺少 Key"}</span>
                 </header>
-                <p>{model.provider} / {model.model}</p>
+                <p>测试平台：{model.test_platform || model.label}</p>
                 <div className="sampling-mode-group">
                   <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
                   <button className={mode === "search" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "search" } }))}>联网</button>
@@ -398,7 +434,7 @@ function SamplingPage() {
                 <dl>
                   <dt>默认温度</dt><dd>{String(model.sampling_defaults?.temperature ?? "模型默认")}</dd>
                   <dt>联网能力</dt><dd>{model.supports_search ? "支持" : "不支持"}</dd>
-                  <dt>说明</dt><dd>{String(model.sampling_defaults?.defaults_note ?? "按服务商默认参数运行")}</dd>
+                  <dt>说明</dt><dd>{model.supports_search ? "支持联网采样与本体对照" : "仅支持本体采样"}</dd>
                 </dl>
               </article>
             );
@@ -418,19 +454,128 @@ function BatchesPage() {
 function BatchDetailPage() {
   const { batchId = "" } = useParams();
   const batch = useQuery({ queryKey: ["batch", batchId], queryFn: () => batchesApi.get(batchId), refetchInterval: 2500 });
+  const progress = useQuery({ queryKey: ["progress", batchId], queryFn: () => batchesApi.progress(batchId), enabled: Boolean(batchId), refetchInterval: (query) => isTerminalStatus(query.state.data?.status) ? false : 1200 });
   const runs = useQuery({ queryKey: ["batch-runs", batchId], queryFn: () => batchesApi.runs(batchId), refetchInterval: 3000 });
-  const rerun = useMutation({ mutationFn: () => batchesApi.rerunFailed(batchId), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["batch", batchId] }) });
+  const rerun = useMutation({
+    mutationFn: () => batchesApi.rerunFailed(batchId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["batch", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["progress", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["batch-runs", batchId] });
+    }
+  });
   const rows = runs.data?.runs || [];
-  const byProvider = useMemo(() => Object.entries(rows.reduce<Record<string, { total: number; failed: number; latency: number }>>((acc, row) => { const key = row.provider || "unknown"; acc[key] ||= { total: 0, failed: 0, latency: 0 }; acc[key].total += 1; acc[key].failed += row.status === "failed" ? 1 : 0; acc[key].latency += Number(row.latency_ms || 0); return acc; }, {})), [rows]);
-  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、模型表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a><button onClick={() => rerun.mutate()}>重跑失败</button></div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batch.data.batch.status} /><ProgressBar batch={batch.data.batch} /></> : null}</Panel><section className="two-column"><Panel title="模型摘要"><div className="provider-summary">{byProvider.map(([provider, value]) => <div key={provider}><strong>{provider}</strong><span>{value.total} 次 / 失败 {value.failed}</span><em>{value.total ? Math.round(value.latency / value.total) : 0} ms</em></div>)}</div></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{row.provider}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
+  const batchStatus = progress.data?.status || batch.data?.batch.status;
+  const hasFailures = (progress.data?.source_statuses || []).some((item) => item.failed > 0) || rows.some((row) => row.status === "failed");
+  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batch.data.batch.status} /><ProgressBar batch={batch.data.batch} /></> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
 }
 
 function AnalysisPage() {
   const { projectId } = useSelectionStore();
-  const analytics = useQuery({ queryKey: ["analytics", projectId], queryFn: () => analyticsApi.get(projectId!), enabled: Boolean(projectId) });
-  const providers = Object.entries(analytics.data?.providers || {});
-  const chartRows = providers.map(([name, item]) => ({ name, 命中率: item.mention_rate, 官网引用率: item.owned_citation_rate }));
-  return <main className="page"><PageTitle title="分析" description="查看品牌命中、官网引用和竞品共现。" /><section className="metrics-grid"><Metric label="总运行" value={analytics.data?.total_runs || 0} /><Metric label="成功运行" value={analytics.data?.success_runs || 0} /><Metric label="品牌命中率" value={`${analytics.data?.brand_mention_rate || 0}%`} /><Metric label="官网引用率" value={`${analytics.data?.owned_citation_rate || 0}%`} /></section><Panel title="模型表现图"><div className="chart-box">{chartRows.length ? <ResponsiveContainer width="100%" height={260}><BarChart data={chartRows}><XAxis dataKey="name" tick={{ fontSize: 12 }} /><YAxis /><Tooltip /><Bar dataKey="命中率" fill="#2868d8" /><Bar dataKey="官网引用率" fill="#18a77b" /></BarChart></ResponsiveContainer> : <EmptyState title="暂无分析数据" />}</div></Panel><section className="two-column"><Panel title="模型表现表"><div className="data-table"><table><thead><tr><th>模型 / 模式</th><th>运行数</th><th>命中率</th><th>官网引用率</th></tr></thead><tbody>{providers.map(([name, item]) => <tr key={name}><td>{name}</td><td>{item.total}</td><td>{item.mention_rate}%</td><td>{item.owned_citation_rate}%</td></tr>)}</tbody></table></div></Panel><Panel title="竞品共现"><div className="data-table"><table><tbody>{analytics.data?.competitors.map((item) => <tr key={item.name}><td>{item.name}</td><td>{item.count}</td></tr>)}</tbody></table></div></Panel></section></main>;
+  const [batchId, setBatchId] = useState("");
+  const batches = useQuery({ queryKey: ["batches", projectId], queryFn: () => batchesApi.list(projectId || "all"), enabled: Boolean(projectId), refetchInterval: 3000 });
+  const summary = useQuery({
+    queryKey: ["analytics-summary", projectId, batchId],
+    queryFn: () => analyticsApi.summary(projectId!, batchId || undefined),
+    enabled: Boolean(projectId)
+  });
+  const data = summary.data;
+  const chartRows = data?.provider_breakdown.map((item) => ({ name: item.name, 命中率: item.mention_rate, Top3: item.top3_rate, 官网引用率: item.owned_citation_rate })) || [];
+  const action = (
+    <div className="inline-actions analysis-actions">
+      <select value={batchId} onChange={(event) => setBatchId(event.target.value)}>
+        <option value="">项目整体</option>
+        {(batches.data?.batches || []).map((batch) => <option key={batch.batch_id} value={batch.batch_id}>{batch.batch_id} / {batch.status}</option>)}
+      </select>
+      <button className="ghost" type="button" onClick={() => summary.refetch()}><RefreshCw size={15} />刷新</button>
+    </div>
+  );
+  if (!projectId) return <main className="page"><PageTitle title="分析" description="选择项目后查看 GEO 报告工作台。" /><EmptyState title="请先选择项目" /></main>;
+  return (
+    <main className="page analysis-page">
+      <PageTitle title="分析" description="从项目或单批次视角查看品牌可见性、模型差异、竞品风险和引用结构。" action={action} />
+      {summary.isError ? <div className="error-box">{summary.error.message}</div> : null}
+      {!data ? <EmptyState title="正在加载分析数据" /> : <AnalysisWorkspace summary={data} chartRows={chartRows} />}
+    </main>
+  );
+}
+
+function AnalysisWorkspace({ summary, chartRows }: { summary: AnalyticsSummary; chartRows: Array<Record<string, string | number>> }) {
+  const quality = summary.sample_quality;
+  const visibility = summary.visibility;
+  return (
+    <>
+      <section className="analysis-hero">
+        <div>
+          <span>{summary.meta.scope === "batch" ? "批次分析" : "项目整体"}</span>
+          <h2>{summary.meta.client_name} / {summary.meta.brand_name}</h2>
+          <p>样本 {quality.completed} / {quality.planned}，有效 {quality.valid}，失败 {quality.failed}，待完成 {quality.pending}</p>
+        </div>
+        <div className="quality-strip">
+          <RateBar label="有效样本率" value={quality.valid_rate} />
+          <RateBar label="失败率" value={quality.failure_rate} danger />
+        </div>
+      </section>
+      <section className="metrics-grid">
+        <Metric label="品牌命中率" value={`${visibility.mention_rate}%`} hint={`${visibility.mentioned} / ${visibility.valid_samples} 个有效样本`} />
+        <Metric label="Top3 概率" value={`${visibility.top3_rate}%`} hint={`Top1 ${visibility.top1_rate}% / Top5 ${visibility.top5_rate}%`} />
+        <Metric label="平均排名" value={visibility.average_rank ?? "-"} hint={`平均提及 ${visibility.avg_mentions_per_sample} 次 / 样本`} />
+        <Metric label="官网引用率" value={`${summary.source_analysis.owned_citation_rate}%`} hint={`第三方引用 ${summary.source_analysis.third_party_citation_rate}%`} />
+      </section>
+      <section className="two-column analysis-main-grid">
+        <Panel title="测试平台表现矩阵">
+          <div className="chart-box">{chartRows.length ? <ResponsiveContainer width="100%" height={280}><BarChart data={chartRows}><XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} height={72} angle={-18} textAnchor="end" /><YAxis /><Tooltip /><Bar dataKey="命中率" fill="#2868d8" /><Bar dataKey="Top3" fill="#18a77b" /><Bar dataKey="官网引用率" fill="#b65b12" /></BarChart></ResponsiveContainer> : <EmptyState title="暂无模型数据" />}</div>
+          <ProviderTable rows={summary.provider_breakdown} />
+        </Panel>
+        <Panel title="报告建议">
+          <div className="recommendation-list">{summary.recommendations.map((item, index) => <div key={item}><strong>{index + 1}</strong><span>{item}</span></div>)}</div>
+        </Panel>
+      </section>
+      <section className="two-column">
+        <Panel title="问题类型短板"><QuestionTypeTable rows={summary.question_type_breakdown} /></Panel>
+        <Panel title="竞品压制风险"><CompetitorRiskTable rows={summary.competitor_risks} /></Panel>
+      </section>
+      <section className="two-column">
+        <Panel title="引用来源结构"><SourcePanel summary={summary} /></Panel>
+        <Panel title="证据样本"><EvidencePanel summary={summary} /></Panel>
+      </section>
+    </>
+  );
+}
+
+function RateBar({ label, value, danger = false }: { label: string; value: number; danger?: boolean }) {
+  return <div className="rate-bar"><div><span>{label}</span><strong>{value}%</strong></div><em><i className={danger ? "is-danger" : ""} style={{ width: `${Math.min(Math.max(value, 0), 100)}%` }} /></em></div>;
+}
+
+function ProviderTable({ rows }: { rows: AnalyticsSummary["provider_breakdown"] }) {
+  if (!rows.length) return <EmptyState title="暂无模型表现" />;
+  return <div className="data-table dense"><table><thead><tr><th>测试平台 / 模式</th><th>有效 / 失败</th><th>命中率</th><th>Top3</th><th>官网引用</th><th>平均排名</th><th>平均耗时</th></tr></thead><tbody>{rows.map((row) => <tr key={row.name}><td className="wide-cell">{row.name}</td><td>{row.valid} / {row.failed}</td><td>{row.mention_rate}%</td><td>{row.top3_rate}%</td><td>{row.owned_citation_rate}%</td><td>{row.average_rank ?? "-"}</td><td>{Math.round(row.avg_latency_ms)} ms</td></tr>)}</tbody></table></div>;
+}
+
+function QuestionTypeTable({ rows }: { rows: AnalyticsSummary["question_type_breakdown"] }) {
+  if (!rows.length) return <EmptyState title="暂无问题类型数据" />;
+  return <div className="data-table dense"><table><thead><tr><th>问题类型</th><th>样本</th><th>命中率</th><th>Top3</th><th>竞品共现</th><th>高风险</th></tr></thead><tbody>{rows.map((row) => <tr key={row.name}><td>{row.name}</td><td>{row.valid} / {row.total}</td><td>{row.mention_rate}%</td><td>{row.top3_rate}%</td><td>{row.competitor_hit_rate}%</td><td>{row.high_risk}</td></tr>)}</tbody></table></div>;
+}
+
+function CompetitorRiskTable({ rows }: { rows: AnalyticsSummary["competitor_risks"] }) {
+  if (!rows.length) return <EmptyState title="暂无竞品共现" />;
+  return <div className="data-table dense"><table><thead><tr><th>竞品</th><th>出现次数</th><th>出现占比</th><th>目标缺席次数</th><th>压制率</th></tr></thead><tbody>{rows.map((row) => <tr key={row.name}><td>{row.name}</td><td>{row.count}</td><td>{row.share_rate}%</td><td>{row.target_absent_count}</td><td>{row.pressure_rate}%</td></tr>)}</tbody></table></div>;
+}
+
+function SourcePanel({ summary }: { summary: AnalyticsSummary }) {
+  const domains = summary.source_analysis.top_domains;
+  return <div className="source-panel"><div className="source-metrics"><Metric label="官网引用率" value={`${summary.source_analysis.owned_citation_rate}%`} /><Metric label="第三方引用率" value={`${summary.source_analysis.third_party_citation_rate}%`} /></div>{domains.length ? <div className="data-table dense"><table><thead><tr><th>域名</th><th>引用次数</th></tr></thead><tbody>{domains.map((item) => <tr key={item.domain}><td>{item.domain}</td><td>{item.count}</td></tr>)}</tbody></table></div> : <EmptyState title="暂无引用域名" />}</div>;
+}
+
+function EvidencePanel({ summary }: { summary: AnalyticsSummary }) {
+  const failed = summary.evidence.failed;
+  const missed = summary.evidence.brand_missed;
+  const highRisk = summary.evidence.high_risk;
+  return <div className="evidence-list">{failed.length ? <EvidenceGroup title="失败样本" rows={failed} /> : null}{highRisk.length ? <EvidenceGroup title="高风险样本" rows={highRisk} /> : null}{missed.length ? <EvidenceGroup title="品牌缺席样本" rows={missed} /> : null}{!failed.length && !highRisk.length && !missed.length ? <EmptyState title="暂无异常证据样本" /> : null}</div>;
+}
+
+function EvidenceGroup({ title, rows }: { title: string; rows: ModelRun[] }) {
+  return <div className="evidence-group"><h3>{title}</h3>{rows.slice(0, 4).map((row) => <article key={`${title}-${row.id}`}><strong>{runPlatform(row)}</strong><p>{row.error_message || row.response_text || row.question || "-"}</p></article>)}</div>;
 }
 
 function SettingsPage() {
@@ -479,14 +624,39 @@ function BatchTable({ batches }: { batches: Array<{ batch_id: string; status: st
   return <div className="data-table"><table><thead><tr><th>批次</th><th>状态</th><th>进度</th><th>成功 / 失败</th><th>创建时间</th></tr></thead><tbody>{batches.map((batch) => { const c = asCount(batch); return <tr key={batch.batch_id}><td><Link to={`/batches/${batch.batch_id}`}>{batch.batch_id}</Link></td><td><StatusBadge status={batch.status} /></td><td>{c.completed} / {c.total}</td><td>{c.success} / {c.failed}</td><td>{formatDateTime(batch.created_at)}</td></tr>; })}</tbody></table></div>;
 }
 
-function RunsTable({ runs }: { runs: Array<{ id: number; provider?: string; model?: string; status?: string; latency_ms?: number; question_type?: string; response_text?: string; requested_at?: string }> }) {
+function RunsTable({ runs }: { runs: ModelRun[] }) {
   if (!runs.length) return <EmptyState title="暂无运行明细" />;
-  return <div className="data-table dense"><table><thead><tr><th>模型</th><th>状态</th><th>耗时</th><th>问题类型</th><th>回答摘要</th><th>时间</th></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td>{run.provider} / {run.model}</td><td>{run.status}</td><td>{run.latency_ms || 0} ms</td><td>{run.question_type || "-"}</td><td className="wide-cell">{(run.response_text || "").slice(0, 140)}</td><td>{formatDateTime(run.requested_at)}</td></tr>)}</tbody></table></div>;
+  return <div className="data-table dense"><table><thead><tr><th>测试平台</th><th>状态</th><th>耗时</th><th>问题类型</th><th>回答摘要</th><th>时间</th></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td>{runPlatform(run)}</td><td>{run.status}</td><td>{run.latency_ms || 0} ms</td><td>{run.question_type || "-"}</td><td className="wide-cell">{(run.response_text || "").slice(0, 140)}</td><td>{formatDateTime(run.requested_at)}</td></tr>)}</tbody></table></div>;
 }
 
 function ProgressBar({ batch }: { batch?: { total_count?: number; completed_count?: number; total?: number; completed?: number } }) {
   const c = asCount(batch || {});
   return <div className="progress"><div style={{ width: `${pct(c.completed, c.total)}%` }} /><span>{c.completed} / {c.total}</span></div>;
+}
+
+function SourceStatusList({ rows, compact = false }: { rows: SourceRunStatus[]; compact?: boolean }) {
+  if (!rows.length) return <EmptyState title="等待平台状态" />;
+  return (
+    <div className={`source-status-list ${compact ? "is-compact" : ""}`}>
+      {rows.map((row) => (
+        <article key={`${row.test_platform}-${row.model}`} className={`source-status-card status-line-${row.status}`}>
+          <header>
+            <strong>{row.test_platform}</strong>
+            <StatusBadge status={row.status} />
+          </header>
+          <div className="source-status-grid">
+            <span>进度 <b>{row.completed} / {row.total}</b></span>
+            <span>成功 <b>{row.success}</b></span>
+            <span>失败 <b>{row.failed}</b></span>
+            <span>排队 <b>{row.queued}</b></span>
+            <span>运行 <b>{row.running}</b></span>
+            <span>均耗时 <b>{row.avg_latency_ms || 0} ms</b></span>
+          </div>
+          {row.last_error ? <p>{row.last_error}</p> : null}
+        </article>
+      ))}
+    </div>
+  );
 }
 
 function ModelHealth({ model }: { model: ModelConfig }) {

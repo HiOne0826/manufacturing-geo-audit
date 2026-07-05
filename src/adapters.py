@@ -11,7 +11,7 @@ import urllib.request
 from copy import deepcopy
 from typing import Any
 
-from src.runtime_env import provider_has_credentials, resolve_baidu_ak_sk, resolve_provider_api_key
+from src.runtime_env import provider_has_credentials, resolve_baidu_ak_sk, resolve_brave_search_api_key, resolve_provider_api_key
 
 
 class AdapterError(RuntimeError):
@@ -39,7 +39,7 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "temperature": 1,
         "reasoning_effort": "",
-        "defaults_note": "DeepSeek 官方 Chat Completions：temperature 默认 1，top_p 默认 1。",
+        "defaults_note": "DeepSeek 标准 API 无原生联网搜索；联网口径使用 Brave Search 外部检索增强。",
     },
     "qwen": {
         "temperature": 0.1,
@@ -66,6 +66,16 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
         "temperature": 0.1,
         "reasoning_effort": "",
         "defaults_note": "MiniMax：事实问答默认 temperature=0.1；思考默认关闭。",
+    },
+    "openrouter_gpt": {
+        "temperature": 1,
+        "reasoning_effort": "",
+        "defaults_note": "OpenRouter-GPT：通过 OpenRouter web plugin / native search 形成联网口径。",
+    },
+    "openrouter_gemini": {
+        "temperature": 1,
+        "reasoning_effort": "",
+        "defaults_note": "OpenRouter-Gemini：通过 OpenRouter web plugin / native search 形成联网口径。",
     },
 }
 
@@ -105,24 +115,24 @@ PROVIDER_PRESETS = {
         "label": "GPT",
         "provider": "openai",
         "api_family": "OpenAI Responses API",
-        "model": "gpt-4.1",
+        "model": "gpt-5.5",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://api.openai.com/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "内置 web_search 工具",
-        "web_search_param_path": "tools[].type=web_search",
+        "web_search_mode": "Responses API hosted web_search 工具",
+        "web_search_param_path": "tools[].type=web_search; tools[].search_context_size; tools[].user_location",
         "supports_reasoning": True,
         "reasoning_param_path": "reasoning.effort",
         "reasoning_levels": OPENAI_REASONING_LEVELS,
         "supports_citation": True,
-        "citation_param_path": "include[]=web_search_call.action.sources",
+        "citation_param_path": "output[].content[].annotations[type=url_citation]; include[]=web_search_call.action.sources",
         "supports_site_filter": False,
         "supports_time_filter": False,
-        "supports_user_location": False,
+        "supports_user_location": True,
         "supports_tool_calling": True,
-        "notes": "OpenAI Responses API；支持 web_search 与 reasoning.effort。",
+        "notes": "OpenAI Responses API；联网搜索使用 hosted web_search，引用从 url_citation annotations 与 web_search_call sources 提取。",
     },
     "gemini": {
         "label": "Gemini",
@@ -179,19 +189,65 @@ PROVIDER_PRESETS = {
         "model_type": "chat",
         "api_base": "https://api.deepseek.com/v1",
         "supports_pure": True,
-        "supports_search": False,
-        "web_search_mode": "标准公开 API 未见通用联网搜索开关",
-        "web_search_param_path": "",
+        "supports_search": True,
+        "web_search_mode": "Brave Search 外部检索增强",
+        "web_search_param_path": "BRAVE_SEARCH_API_KEY; /res/v1/web/search; q/count/country/search_lang/freshness/safesearch",
         "supports_reasoning": True,
         "reasoning_param_path": "thinking.type / reasoning_effort",
         "reasoning_levels": "disabled;enabled + low/medium/high",
-        "supports_citation": False,
-        "citation_param_path": "",
+        "supports_citation": True,
+        "citation_param_path": "Brave Search web.results[].url/title/description",
         "supports_site_filter": False,
         "supports_time_filter": False,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "DeepSeek OpenAI 兼容接口。",
+        "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+    },
+    "openrouter_gpt": {
+        "label": "OpenRouter-GPT",
+        "provider": "openrouter_gpt",
+        "api_family": "OpenRouter Chat Completions",
+        "model": "openai/gpt-5.2",
+        "model_version": "",
+        "model_type": "chat",
+        "api_base": "https://openrouter.ai/api/v1",
+        "supports_pure": True,
+        "supports_search": True,
+        "web_search_mode": "OpenRouter web plugin / :online",
+        "web_search_param_path": "plugins[].id=web; plugins[].max_results; plugins[].engine",
+        "supports_reasoning": True,
+        "reasoning_param_path": "reasoning.effort",
+        "reasoning_levels": OPENAI_REASONING_LEVELS,
+        "supports_citation": True,
+        "citation_param_path": "choices[].message.annotations[type=url_citation].url_citation",
+        "supports_site_filter": True,
+        "supports_time_filter": False,
+        "supports_user_location": False,
+        "supports_tool_calling": True,
+        "notes": "OpenRouter 中转 GPT 联网口径；联网使用 web plugin，OpenAI/Google 等模型默认优先 native search，否则回退搜索引擎。不是 OpenAI 官方直连接口。",
+    },
+    "openrouter_gemini": {
+        "label": "OpenRouter-Gemini",
+        "provider": "openrouter_gemini",
+        "api_family": "OpenRouter Chat Completions",
+        "model": "google/gemini-2.5-flash",
+        "model_version": "",
+        "model_type": "chat",
+        "api_base": "https://openrouter.ai/api/v1",
+        "supports_pure": True,
+        "supports_search": True,
+        "web_search_mode": "OpenRouter web plugin / :online",
+        "web_search_param_path": "plugins[].id=web; plugins[].max_results; plugins[].engine",
+        "supports_reasoning": True,
+        "reasoning_param_path": "reasoning.effort",
+        "reasoning_levels": "按 OpenRouter/Google 路由能力",
+        "supports_citation": True,
+        "citation_param_path": "choices[].message.annotations[type=url_citation].url_citation",
+        "supports_site_filter": True,
+        "supports_time_filter": False,
+        "supports_user_location": False,
+        "supports_tool_calling": True,
+        "notes": "OpenRouter 中转 Gemini 联网口径；联网使用 web plugin，Google 模型默认优先 native search。不是 Google Gemini 官方直连接口。",
     },
     "qwen": {
         "label": "通义千问",
@@ -329,6 +385,19 @@ def post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dic
         raise AdapterError(str(exc)) from exc
 
 
+def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
+    timeout = int(os.environ.get("SAMPLING_REQUEST_TIMEOUT", "90") or 90)
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise AdapterError(f"HTTP {exc.code}: {body[:1200]}") from exc
+    except Exception as exc:
+        raise AdapterError(str(exc)) from exc
+
+
 def normalize_base(base: str) -> str:
     return (base or "").rstrip("/")
 
@@ -400,6 +469,35 @@ def extract_generic_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     return citations
 
 
+def extract_brave_results(data: dict[str, Any], limit: int = 5) -> list[dict[str, str]]:
+    results = ((data.get("web") or {}).get("results") or [])[:limit]
+    items: list[dict[str, str]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        description = str(item.get("description") or item.get("snippet") or "").strip()
+        extra = item.get("extra_snippets") or []
+        snippets = [description] if description else []
+        snippets.extend(str(value).strip() for value in extra if str(value).strip())
+        if url or title or snippets:
+            items.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "description": "\n".join(snippets[:3]),
+                }
+            )
+    return items
+
+
+def brave_citations(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    return dedupe_citations(
+        [{"url": item.get("url", ""), "title": item.get("title", "")} for item in results if item.get("url")]
+    )
+
+
 def extract_qwen_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     citations = extract_generic_citations(data)
     search_info = data.get("search_info") or {}
@@ -451,6 +549,23 @@ def extract_gemini_citations(data: dict[str, Any]) -> list[dict[str, str]]:
         for chunk in grounding.get("groundingChunks") or []:
             web = chunk.get("web") or {}
             citations.append({"url": web.get("uri", ""), "title": web.get("title", "")})
+    return dedupe_citations(citations)
+
+
+def extract_openrouter_citations(data: dict[str, Any]) -> list[dict[str, str]]:
+    citations: list[dict[str, str]] = []
+    for choice in data.get("choices") or []:
+        message = choice.get("message") or {}
+        for annotation in message.get("annotations") or []:
+            if annotation.get("type") != "url_citation":
+                continue
+            payload = annotation.get("url_citation") or {}
+            citations.append(
+                {
+                    "url": payload.get("url", ""),
+                    "title": payload.get("title", ""),
+                }
+            )
     return dedupe_citations(citations)
 
 
@@ -557,6 +672,52 @@ def extract_required_temperature(error_text: str) -> float | None:
         return None
 
 
+def parse_openai_user_location(value: str) -> dict[str, str]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    location: dict[str, str] = {"type": "approximate"}
+    if not parts:
+        return location
+    location["city"] = parts[0]
+    if len(parts) >= 2:
+        if len(parts[1]) == 2 and parts[1].isalpha():
+            location["country"] = parts[1].upper()
+        else:
+            location["region"] = parts[1]
+    if len(parts) >= 3:
+        if "country" in location and "/" in parts[2]:
+            location["timezone"] = parts[2]
+        else:
+            location["country"] = parts[2].upper() if len(parts[2]) == 2 else parts[2]
+    if len(parts) >= 4:
+        location["timezone"] = parts[3]
+    return location
+
+
+def build_openai_web_search_tool(options: dict[str, Any]) -> dict[str, Any]:
+    tool: dict[str, Any] = {"type": "web_search"}
+    if options["search_strategy"] in {"low", "medium", "high"}:
+        tool["search_context_size"] = options["search_strategy"]
+    if options["search_user_location"]:
+        tool["user_location"] = parse_openai_user_location(options["search_user_location"])
+    return tool
+
+
+def build_openai_responses_payload(model: str, question: str, options: dict[str, Any]) -> dict[str, Any]:
+    reasoning_effort = options["reasoning_effort"]
+    if not reasoning_effort:
+        reasoning_effort = "none" if options["thinking_type"] == "disabled" else "medium"
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": question,
+        "instructions": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。",
+        "reasoning": {"effort": reasoning_effort},
+    }
+    if options["search_enabled"]:
+        payload["tools"] = [build_openai_web_search_tool(options)]
+        payload["include"] = ["web_search_call.action.sources"]
+    return payload
+
+
 def build_openai_chat_payload(model: str, question: str, temperature: float) -> dict[str, Any]:
     return {
         "model": model,
@@ -566,6 +727,75 @@ def build_openai_chat_payload(model: str, question: str, temperature: float) -> 
         ],
         "temperature": temperature,
     }
+
+
+def brave_country(value: str) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    for part in parts:
+        if len(part) == 2 and part.isalpha():
+            return part.upper()
+    return "CN"
+
+
+def brave_search_request(question: str, options: dict[str, Any]) -> dict[str, Any]:
+    api_key = resolve_brave_search_api_key()
+    if not api_key:
+        raise AdapterError("DeepSeek 联网口径需要 BRAVE_SEARCH_API_KEY。")
+    count = options.get("search_limit") or 5
+    try:
+        count = max(1, min(int(count), 10))
+    except (TypeError, ValueError):
+        count = 5
+    params = {
+        "q": question,
+        "count": str(count),
+        "country": brave_country(options.get("search_user_location", "")),
+        "search_lang": "zh-hans",
+        "ui_lang": "zh-CN",
+        "safesearch": "moderate",
+        "extra_snippets": "true",
+    }
+    if options.get("search_freshness"):
+        params["freshness"] = str(options["search_freshness"])
+    url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params)
+    data = get_json(
+        url,
+        {
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "X-Subscription-Token": api_key,
+        },
+    )
+    results = extract_brave_results(data, limit=count)
+    if not results:
+        raise AdapterError("Brave Search 未返回可用网页结果，无法执行 DeepSeek 联网口径。")
+    return {"raw_response": data, "results": results}
+
+
+def build_brave_augmented_question(question: str, results: list[dict[str, str]]) -> str:
+    source_blocks = []
+    for idx, item in enumerate(results, start=1):
+        source_blocks.append(
+            "\n".join(
+                [
+                    f"[{idx}] 标题: {item.get('title') or '-'}",
+                    f"URL: {item.get('url') or '-'}",
+                    f"摘要: {item.get('description') or '-'}",
+                ]
+            )
+        )
+    return (
+        "你是制造业品牌 GEO 审计助手。\n"
+        "以下是 Brave Search 返回的公开网页检索结果。请只基于这些资料回答用户问题。\n"
+        "如果资料不足，请明确说明“检索结果不足以判断”。\n\n"
+        "要求：\n"
+        "1. 客观回答，不要编造未出现在资料中的事实。\n"
+        "2. 涉及品牌、厂家、产品能力时尽量引用来源编号，例如 [1]。\n"
+        "3. 不要声称你自己进行了联网搜索；信息来源是下方 Brave Search 结果。\n\n"
+        f"用户问题：\n{question}\n\n"
+        "Brave Search 结果：\n"
+        + "\n\n".join(source_blocks)
+    )
 
 
 def build_doubao_chat_payload(
@@ -589,8 +819,6 @@ def build_deepseek_chat_payload(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
-    if options["search_enabled"]:
-        raise AdapterError("DeepSeek 标准公开 API 预设里未启用通用联网搜索，请先关闭联网搜索。")
     if options["thinking_type"] == "enabled":
         payload["thinking"] = {"type": "enabled"}
     elif options["thinking_type"] == "disabled":
@@ -702,6 +930,31 @@ def build_minimax_chat_payload(
     return build_openai_chat_payload(model, question, temperature)
 
 
+def build_openrouter_chat_payload(
+    model: str,
+    question: str,
+    temperature: float,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    payload = build_openai_chat_payload(model, question, temperature)
+    if options["search_enabled"]:
+        plugin: dict[str, Any] = {"id": "web"}
+        if options.get("search_limit"):
+            plugin["max_results"] = max(1, min(int(options["search_limit"]), 10))
+        else:
+            plugin["max_results"] = 5
+        if options.get("search_strategy") in {"native", "exa", "firecrawl", "parallel", "perplexity"}:
+            plugin["engine"] = options["search_strategy"]
+        if options.get("search_site_filter"):
+            plugin["include_domains"] = [
+                item.strip() for item in str(options["search_site_filter"]).split(",") if item.strip()
+            ]
+        payload["plugins"] = [plugin]
+    if options["reasoning_effort"]:
+        payload["reasoning"] = {"effort": options["reasoning_effort"]}
+    return payload
+
+
 def build_openai_compatible_payload(
     provider: str,
     model: str,
@@ -726,6 +979,8 @@ def build_openai_compatible_payload(
         return build_ernie_chat_payload(model, question, temperature, options)
     if provider == "minimax":
         return build_minimax_chat_payload(model, question, temperature, options)
+    if provider in {"openrouter_gpt", "openrouter_gemini"}:
+        return build_openrouter_chat_payload(model, question, temperature, options)
     raise AdapterError(f"未定义的 OpenAI 兼容请求构造器：{provider}")
 
 
@@ -738,7 +993,15 @@ def openai_compatible_request(
     provider: str,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = build_openai_compatible_payload(provider, model, question, temperature, options)
+    brave_payload: dict[str, Any] | None = None
+    external_citations: list[dict[str, str]] = []
+    request_question = question
+    if provider == "deepseek" and options["search_enabled"]:
+        brave_payload = brave_search_request(question, options)
+        brave_results = brave_payload["results"]
+        external_citations = brave_citations(brave_results)
+        request_question = build_brave_augmented_question(question, brave_results)
+    payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
     data = post_json(
         f"{normalize_base(base)}/chat/completions",
         {"Authorization": f"Bearer {api_key}"},
@@ -751,11 +1014,21 @@ def openai_compatible_request(
         citations = extract_hunyuan_citations(data)
     elif provider == "ernie":
         citations = extract_ernie_citations(data)
+    elif provider in {"openrouter_gpt", "openrouter_gemini"}:
+        citations = extract_openrouter_citations(data)
+    citations = dedupe_citations(external_citations + citations)
+    raw_response: dict[str, Any] = data
+    if brave_payload is not None:
+        raw_response = {
+            "deepseek_response": data,
+            "brave_search": brave_payload["raw_response"],
+            "brave_results": brave_payload["results"],
+        }
     return {
         "response_text": normalize_choice_text(data),
         "citations": citations,
         "usage": data.get("usage", {}),
-        "raw_response": data,
+        "raw_response": raw_response,
         "returned_model": data.get("model", model),
     }
 
@@ -767,18 +1040,7 @@ def openai_responses_request(
     question: str,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    reasoning_effort = options["reasoning_effort"]
-    if not reasoning_effort:
-        reasoning_effort = "none" if options["thinking_type"] == "disabled" else "medium"
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": question,
-        "instructions": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。",
-        "reasoning": {"effort": reasoning_effort},
-    }
-    if options["search_enabled"]:
-        payload["tools"] = [{"type": "web_search"}]
-        payload["include"] = ["web_search_call.action.sources"]
+    payload = build_openai_responses_payload(model, question, options)
     try:
         data = post_json(
             f"{normalize_base(base)}/responses",
@@ -1091,7 +1353,7 @@ def call_configured_model(
             result = kimi_search_request(runtime_base, api_key, runtime_model, question, temperature, options)
         else:
             result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, provider, options)
-    elif provider in {"deepseek", "qwen", "hunyuan", "ernie", "minimax"}:
+    elif provider in {"deepseek", "qwen", "hunyuan", "ernie", "minimax", "openrouter_gpt", "openrouter_gemini"}:
         result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, provider, options)
     elif provider == "gemini":
         result = gemini_request(runtime_base, api_key, runtime_model, question, temperature, options)

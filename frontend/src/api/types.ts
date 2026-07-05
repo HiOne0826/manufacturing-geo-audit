@@ -32,6 +32,7 @@ export type ModelConfig = {
   provider: string;
   label: string;
   model: string;
+  test_platform?: string;
   model_version?: string;
   api_family?: string;
   api_base?: string;
@@ -78,6 +79,22 @@ export type SamplingBatch = {
   updated_at?: string;
   task_queue_backend?: string;
   job_id?: string;
+  source_statuses?: SourceRunStatus[];
+};
+
+export type SourceRunStatus = {
+  test_platform: string;
+  provider?: string;
+  model?: string;
+  total: number;
+  completed: number;
+  success: number;
+  failed: number;
+  queued: number;
+  running: number;
+  status: string;
+  avg_latency_ms: number;
+  last_error?: string;
 };
 
 export type ModelRun = {
@@ -86,6 +103,7 @@ export type ModelRun = {
   batch_id?: string;
   provider?: string;
   model?: string;
+  test_platform?: string;
   model_version?: string;
   status?: string;
   search_enabled?: boolean;
@@ -111,4 +129,82 @@ export type Analytics = {
   owned_citation_rate: number;
   providers: Record<string, { total: number; mentioned: number; mention_rate: number; owned_citation_rate: number }>;
   competitors: Array<{ name: string; count: number }>;
+};
+
+export type AnalyticsSummary = {
+  meta: {
+    project_id: number;
+    client_name: string;
+    brand_name: string;
+    batch_id: string;
+    scope: "project" | "batch";
+    generated_at: string;
+  };
+  entities: {
+    target: { canonical_name: string; entity_type: string; aliases: string[] };
+    competitors: Array<{ canonical_name: string; aliases: string[]; entity_type: string }>;
+  };
+  sample_quality: {
+    planned: number;
+    completed: number;
+    valid: number;
+    failed: number;
+    pending: number;
+    valid_rate: number;
+    failure_rate: number;
+  };
+  visibility: {
+    target_brand: string;
+    valid_samples: number;
+    mentioned: number;
+    mention_rate: number;
+    top1_rate: number;
+    top3_rate: number;
+    top5_rate: number;
+    average_rank: number | null;
+    avg_mentions_per_sample: number;
+  };
+  provider_breakdown: Array<{
+    name: string;
+    total: number;
+    valid: number;
+    failed: number;
+    mention_rate: number;
+    top3_rate: number;
+    owned_citation_rate: number;
+    average_rank: number | null;
+    avg_latency_ms: number;
+    high_risk: number;
+  }>;
+  question_type_breakdown: Array<{
+    name: string;
+    total: number;
+    valid: number;
+    failed: number;
+    mention_rate: number;
+    top3_rate: number;
+    owned_citation_rate: number;
+    average_rank: number | null;
+    avg_latency_ms: number;
+    high_risk: number;
+    competitor_hit_rate: number;
+  }>;
+  competitor_risks: Array<{
+    name: string;
+    count: number;
+    share_rate: number;
+    target_absent_count: number;
+    pressure_rate: number;
+  }>;
+  source_analysis: {
+    owned_citation_rate: number;
+    third_party_citation_rate: number;
+    top_domains: Array<{ domain: string; count: number }>;
+  };
+  recommendations: string[];
+  evidence: {
+    failed: ModelRun[];
+    high_risk: ModelRun[];
+    brand_missed: ModelRun[];
+  };
 };

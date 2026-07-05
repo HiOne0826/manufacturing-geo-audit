@@ -4,6 +4,8 @@ import csv
 import io
 import html
 
+from src.platforms import test_platform_name
+
 
 def runs_to_csv(rows: list[dict]) -> str:
     output = io.StringIO()
@@ -109,22 +111,11 @@ def runs_to_excel_html(rows: list[dict]) -> str:
         "批次ID",
         "问题",
         "问题类型",
-        "服务商",
-        "模型",
+        "测试平台",
         "联网搜索",
-        "搜索策略",
-        "思考模式",
-        "推理强度",
-        "思考预算",
-        "重复次数",
         "生成时间",
         "状态",
         "品牌命中",
-        "推荐强度",
-        "竞品共现",
-        "官网引用",
-        "第三方引用",
-        "风险等级",
         "回答摘要",
         "错误信息",
     ]
@@ -135,22 +126,11 @@ def runs_to_excel_html(rows: list[dict]) -> str:
             row.get("batch_id", ""),
             row.get("question", ""),
             row.get("question_type", ""),
-            row.get("provider", ""),
-            row.get("model", ""),
+            row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model")),
             "是" if row.get("search_enabled") else "否",
-            row.get("search_mode", ""),
-            row.get("thinking_type", ""),
-            row.get("reasoning_effort", ""),
-            row.get("thinking_budget", ""),
-            row.get("repeat_index", ""),
             row.get("requested_at", ""),
             row.get("status", ""),
             "是" if row.get("target_brand_mentioned") else "否",
-            row.get("recommendation_strength", ""),
-            row.get("competitors_mentioned", ""),
-            "是" if row.get("owned_site_cited") else "否",
-            "是" if row.get("third_party_cited") else "否",
-            row.get("risk_level", ""),
             row.get("response_text", ""),
             row.get("error_message", ""),
         ])

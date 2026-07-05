@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json
@@ -48,6 +50,8 @@ from src.exporter import (
     runs_to_csv,
     runs_to_excel_html,
 )
+from src.analytics_summary import build_analytics_summary
+from src.platforms import test_platform_name
 from src.runtime_env import load_dotenv_file
 from src.runner import estimate_batch_total
 from src.db import utc_now
@@ -63,6 +67,7 @@ SAMPLING_JOBS: dict[str, dict] = {}
 SAMPLING_JOBS_LOCK = threading.Lock()
 AUTH_PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/status"}
 AUTH_SESSION_TTL_SECONDS = 60 * 60 * 12
+UI_PROVIDER_PRESETS = {key: value for key, value in PROVIDER_PRESETS.items() if key != "mock"}
 
 
 def auth_password() -> str:
@@ -157,6 +162,157 @@ def sampling_batch_to_progress(batch: dict) -> dict:
         "finished_at": batch.get("finished_at"),
         "updated_at": batch.get("updated_at"),
     }
+
+
+def planned_source_statuses(conn, batch: dict) -> dict[str, dict]:
+    config = batch.get("config") or {}
+    repeat_count = max(1, min(int(config.get("repeat_count", 1) or 1), 10))
+    questions = list_questions(conn, int(batch["project_id"]))
+    question_count = len(questions)
+    statuses: dict[str, dict] = {}
+    for item in config.get("models") or []:
+        model_config_id = int(item.get("model_config_id", 0) or 0)
+        model_config = get_model_config(conn, model_config_id)
+        if not model_config:
+            continue
+        provider = model_config.get("provider", "")
+        model = str(item.get("runtime_model") or model_config.get("model") or provider)
+        platform = test_platform_name(provider, model)
+        current = statuses.setdefault(
+            platform,
+            {
+                "test_platform": platform,
+                "provider": provider,
+                "model": model,
+                "total": 0,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+                "queued": 0,
+                "running": 0,
+                "status": "queued",
+                "avg_latency_ms": 0,
+                "last_error": "",
+                "_latency_sum": 0,
+                "_latency_count": 0,
+            },
+        )
+        current["total"] += question_count * repeat_count
+    return statuses
+
+
+def active_project_batch(conn, project_id: int) -> dict | None:
+    for batch in list_sampling_batches(conn, project_id):
+        if batch.get("status") in {"queued", "running"}:
+            return batch
+    return None
+
+
+def latest_logical_runs(rows: list[dict]) -> list[dict]:
+    latest = []
+    seen = set()
+    for row in rows:
+        key = (
+            row.get("question_id"),
+            row.get("model_config_id"),
+            bool(row.get("search_enabled")),
+            row.get("search_mode") or "",
+            row.get("thinking_type") or "",
+            row.get("reasoning_effort") or "",
+            row.get("thinking_budget"),
+            int(row.get("repeat_index") or 1),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        latest.append(row)
+    return latest
+
+
+def finalize_source_status(item: dict, batch_status: str, current_platform: str = "", infer_running: bool = False) -> dict:
+    completed = int(item.get("success", 0)) + int(item.get("failed", 0))
+    total = max(int(item.get("total", 0)), completed)
+    item["total"] = total
+    running = 0
+    if batch_status == "running" and completed < total:
+        if infer_running or (current_platform and item["test_platform"] == current_platform):
+            running = 1
+    queued = max(total - completed - running, 0)
+    if item.get("failed", 0):
+        status = "failed"
+    elif running:
+        status = "running"
+    elif total > 0 and completed >= total:
+        status = "completed"
+    else:
+        status = "queued"
+    latency_count = int(item.pop("_latency_count", 0) or 0)
+    latency_sum = int(item.pop("_latency_sum", 0) or 0)
+    return {
+        **item,
+        "completed": completed,
+        "queued": queued,
+        "running": running,
+        "status": status,
+        "avg_latency_ms": round(latency_sum / latency_count) if latency_count else 0,
+    }
+
+
+def source_statuses_for_batch(conn, batch: dict, job: dict | None = None) -> list[dict]:
+    statuses = planned_source_statuses(conn, batch)
+    rows = latest_logical_runs(list_runs_by_batch(conn, batch["batch_id"]))
+    for row in rows:
+        platform = row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model"))
+        current = statuses.setdefault(
+            platform,
+            {
+                "test_platform": platform,
+                "provider": row.get("provider", ""),
+                "model": row.get("model", ""),
+                "total": 0,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+                "queued": 0,
+                "running": 0,
+                "status": "queued",
+                "avg_latency_ms": 0,
+                "last_error": "",
+                "_latency_sum": 0,
+                "_latency_count": 0,
+            },
+        )
+        if not current.get("provider"):
+            current["provider"] = row.get("provider", "")
+        if not current.get("model"):
+            current["model"] = row.get("model", "")
+        if row.get("status") == "success":
+            current["success"] += 1
+        elif row.get("status") == "failed":
+            current["failed"] += 1
+            if not current.get("last_error"):
+                current["last_error"] = str(row.get("error_message") or "")[:300]
+        latency = int(row.get("latency_ms") or 0)
+        if latency:
+            current["_latency_sum"] += latency
+            current["_latency_count"] += 1
+    current_platform = ""
+    if job:
+        current_platform = test_platform_name(job.get("current_provider"), job.get("current_model"))
+    infer_running = not bool(job) and batch.get("status") == "running"
+    finalized = [
+        finalize_source_status(item, str(batch.get("status") or "queued"), current_platform, infer_running)
+        for item in statuses.values()
+    ]
+    return sorted(finalized, key=lambda item: item["test_platform"])
+
+
+def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> dict:
+    base = sampling_batch_to_progress(batch)
+    if job:
+        base.update(job)
+    base["source_statuses"] = source_statuses_for_batch(conn, batch, job)
+    return base
 
 
 def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
@@ -418,7 +574,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self.json_response(
                         {
                             "models": [enrich_model_config(item) for item in list_model_configs(conn)],
-                            "presets": PROVIDER_PRESETS,
+                            "presets": UI_PROVIDER_PRESETS,
                         }
                     )
                 elif parsed.path == "/api/questions":
@@ -433,14 +589,11 @@ class Handler(SimpleHTTPRequestHandler):
                     if not batch_id:
                         raise ValueError("缺少 batch_id")
                     job = None if task_queue_backend() == "rq" else get_sampling_job(batch_id)
-                    if not job:
-                        batch = get_sampling_batch(conn, batch_id)
-                        if not batch:
-                            self.json_response({"error": "批次不存在"}, 404)
-                            return
-                        self.json_response(sampling_batch_to_progress(batch))
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
                         return
-                    self.json_response(job)
+                    self.json_response(progress_response_for_batch(conn, batch, job))
                 elif parsed.path.startswith("/api/agent/batches/"):
                     parts = [unquote(item) for item in parsed.path.split("/") if item]
                     if len(parts) not in {4, 5}:
@@ -476,6 +629,10 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/analytics":
                     project_id = int(query.get("project_id", [0])[0])
                     self.json_response(analytics(conn, project_id))
+                elif parsed.path == "/api/analytics/summary":
+                    project_id = int(query.get("project_id", [0])[0])
+                    batch_id = str(query.get("batch_id", [""])[0]).strip() or None
+                    self.json_response(build_analytics_summary(conn, project_id, batch_id))
                 elif parsed.path == "/api/export/runs.csv":
                     project_id = int(query.get("project_id", [0])[0])
                     self.csv_response(runs_to_csv(list_runs(conn, project_id, limit=10000)), "geo-runs.csv")
@@ -572,6 +729,8 @@ class Handler(SimpleHTTPRequestHandler):
                     preset = PROVIDER_PRESETS.get(payload.get("provider", ""))
                     if not preset:
                         raise ValueError("未找到默认服务商模板")
+                    if preset.get("provider") == "mock":
+                        raise ValueError("正式页面不允许创建 Mock 模型")
                     model_id = create_model_config(conn, preset)
                     commit_json({"id": model_id})
                 elif parsed.path == "/api/questions/seed":
@@ -595,6 +754,14 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/runs/start":
                     project_id = int(payload.get("project_id", 0))
                     total = estimate_batch_total(conn, project_id, payload)
+                    existing_batch = active_project_batch(conn, project_id)
+                    if existing_batch:
+                        existing_job = get_sampling_job(existing_batch["batch_id"])
+                        result = progress_response_for_batch(conn, existing_batch, existing_job)
+                        result["task_queue_backend"] = task_queue_backend()
+                        result["existing"] = True
+                        self.json_response(result)
+                        return
                     batch_id = payload.get("batch_id") or f"batch-{uuid.uuid4().hex[:10]}"
                     create_sampling_batch(
                         conn,

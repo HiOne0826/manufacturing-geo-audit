@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,26 @@ from .db import (
     utc_now,
 )
 from .evaluator import evaluate_answer
+
+
+PROVIDER_CONCURRENCY_GROUPS = {
+    "openrouter_gpt": "openrouter",
+    "openrouter_gemini": "openrouter",
+}
+
+DEFAULT_PROVIDER_CONCURRENCY_LIMITS = {
+    "openai": 2,
+    "gemini": 2,
+    "openrouter": 4,
+    "deepseek": 2,
+    "doubao": 2,
+    "qwen": 2,
+    "hunyuan": 2,
+    "kimi": 2,
+    "ernie": 2,
+    "minimax": 2,
+    "mock": 16,
+}
 
 
 def env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
@@ -41,6 +62,55 @@ def sampling_max_workers(config: dict[str, Any] | None = None) -> int:
 
 def provider_max_workers() -> int:
     return env_int("SAMPLING_PROVIDER_MAX_WORKERS", 3, minimum=1, maximum=32)
+
+
+def provider_concurrency_group(provider: str) -> str:
+    normalized = str(provider or "unknown").strip().lower() or "unknown"
+    return PROVIDER_CONCURRENCY_GROUPS.get(normalized, normalized)
+
+
+def parse_provider_concurrency_limits(raw: Any) -> dict[str, int]:
+    if not raw:
+        return {}
+    parsed: dict[str, Any]
+    if isinstance(raw, dict):
+        parsed = raw
+    else:
+        text = str(raw).strip()
+        if not text:
+            return {}
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            parsed = {}
+            for item in text.split(","):
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                parsed[key.strip()] = value.strip()
+    limits: dict[str, int] = {}
+    for key, value in parsed.items():
+        group = provider_concurrency_group(str(key))
+        try:
+            limits[group] = max(1, min(int(value), 32))
+        except (TypeError, ValueError):
+            continue
+    return limits
+
+
+def provider_concurrency_limits(config: dict[str, Any] | None = None) -> dict[str, int]:
+    limits = dict(DEFAULT_PROVIDER_CONCURRENCY_LIMITS)
+    limits.update(parse_provider_concurrency_limits(os.environ.get("SAMPLING_PROVIDER_CONCURRENCY_LIMITS", "")))
+    limits.update(parse_provider_concurrency_limits((config or {}).get("provider_concurrency_limits")))
+    return limits
+
+
+def provider_concurrency_limit(provider: str, config: dict[str, Any] | None = None) -> int:
+    group = provider_concurrency_group(provider)
+    return provider_concurrency_limits(config).get(group, provider_max_workers())
 
 
 def retry_count(config: dict[str, Any] | None = None) -> int:
@@ -273,11 +343,12 @@ def run_prepared_tasks(
     total_expected = len(tasks)
     completed = 0
     failed = 0
-    provider_limit = provider_max_workers()
+    limits = provider_concurrency_limits(config)
     semaphores: dict[str, threading.Semaphore] = {}
     for task in tasks:
         provider = task["base"]["provider"] or "unknown"
-        semaphores.setdefault(provider, threading.Semaphore(provider_limit))
+        group = provider_concurrency_group(provider)
+        semaphores.setdefault(group, threading.Semaphore(limits.get(group, provider_max_workers())))
     max_workers = min(sampling_max_workers(config), max(1, total_expected))
     max_retries = retry_count(config)
 
@@ -288,7 +359,7 @@ def run_prepared_tasks(
                 task,
                 db_target=db_target,
                 project=project,
-                semaphore=semaphores[task["base"]["provider"] or "unknown"],
+                semaphore=semaphores[provider_concurrency_group(task["base"]["provider"] or "unknown")],
                 max_retries=max_retries,
             )
             for task in tasks

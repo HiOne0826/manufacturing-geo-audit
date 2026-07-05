@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.platforms import test_platform_name
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = Path(os.environ.get("GEO_AUDIT_DB_PATH", ROOT / "data" / "geo_audit.db"))
@@ -79,7 +81,7 @@ DEFAULT_MODEL_CONFIGS = [
         "provider": "openai",
         "label": "GPT",
         "api_family": "OpenAI Responses API",
-        "model": "gpt-4.1",
+        "model": "gpt-5.5",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://api.openai.com/v1",
@@ -88,19 +90,19 @@ DEFAULT_MODEL_CONFIGS = [
         "daily_limit": 0,
         "supports_pure": 1,
         "supports_search": 1,
-        "web_search_mode": "内置 web_search 工具",
-        "web_search_param_path": "tools[].type=web_search",
+        "web_search_mode": "Responses API hosted web_search 工具",
+        "web_search_param_path": "tools[].type=web_search; tools[].search_context_size; tools[].user_location",
         "supports_reasoning": 1,
         "reasoning_param_path": "reasoning.effort",
         "reasoning_levels": "none;minimal;low;medium;high;xhigh",
         "supports_citation": 1,
-        "citation_param_path": "include[]=web_search_call.action.sources",
+        "citation_param_path": "output[].content[].annotations[type=url_citation]; include[]=web_search_call.action.sources",
         "supports_site_filter": 0,
         "supports_time_filter": 0,
-        "supports_user_location": 0,
+        "supports_user_location": 1,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "OpenAI Responses API；支持 web_search 与 reasoning.effort。",
+        "notes": "OpenAI Responses API；联网搜索使用 hosted web_search，引用从 url_citation annotations 与 web_search_call sources 提取。",
     },
     {
         "provider": "gemini",
@@ -168,20 +170,74 @@ DEFAULT_MODEL_CONFIGS = [
         "priority": 100,
         "daily_limit": 0,
         "supports_pure": 1,
-        "supports_search": 0,
-        "web_search_mode": "标准公开 API 未见通用联网搜索开关",
-        "web_search_param_path": "",
+        "supports_search": 1,
+        "web_search_mode": "Brave Search 外部检索增强",
+        "web_search_param_path": "BRAVE_SEARCH_API_KEY; /res/v1/web/search; q/count/country/search_lang/freshness/safesearch",
         "supports_reasoning": 1,
         "reasoning_param_path": "thinking.type / reasoning_effort",
         "reasoning_levels": "disabled;enabled + low/medium/high",
-        "supports_citation": 0,
-        "citation_param_path": "",
+        "supports_citation": 1,
+        "citation_param_path": "Brave Search web.results[].url/title/description",
         "supports_site_filter": 0,
         "supports_time_filter": 0,
         "supports_user_location": 0,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "DeepSeek OpenAI 兼容接口。",
+        "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+    },
+    {
+        "provider": "openrouter_gpt",
+        "label": "OpenRouter-GPT",
+        "api_family": "OpenRouter Chat Completions",
+        "model": "openai/gpt-5.2",
+        "model_version": "",
+        "model_type": "chat",
+        "api_base": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "priority": 100,
+        "daily_limit": 0,
+        "supports_pure": 1,
+        "supports_search": 1,
+        "web_search_mode": "OpenRouter web plugin / :online",
+        "web_search_param_path": "plugins[].id=web; plugins[].max_results; plugins[].engine",
+        "supports_reasoning": 1,
+        "reasoning_param_path": "reasoning.effort",
+        "reasoning_levels": "none;minimal;low;medium;high;xhigh",
+        "supports_citation": 1,
+        "citation_param_path": "choices[].message.annotations[type=url_citation].url_citation",
+        "supports_site_filter": 1,
+        "supports_time_filter": 0,
+        "supports_user_location": 0,
+        "supports_tool_calling": 1,
+        "active": 1,
+        "notes": "OpenRouter 中转 GPT 联网口径；联网使用 web plugin。不是 OpenAI 官方直连接口。",
+    },
+    {
+        "provider": "openrouter_gemini",
+        "label": "OpenRouter-Gemini",
+        "api_family": "OpenRouter Chat Completions",
+        "model": "google/gemini-2.5-flash",
+        "model_version": "",
+        "model_type": "chat",
+        "api_base": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "priority": 100,
+        "daily_limit": 0,
+        "supports_pure": 1,
+        "supports_search": 1,
+        "web_search_mode": "OpenRouter web plugin / :online",
+        "web_search_param_path": "plugins[].id=web; plugins[].max_results; plugins[].engine",
+        "supports_reasoning": 1,
+        "reasoning_param_path": "reasoning.effort",
+        "reasoning_levels": "按 OpenRouter/Google 路由能力",
+        "supports_citation": 1,
+        "citation_param_path": "choices[].message.annotations[type=url_citation].url_citation",
+        "supports_site_filter": 1,
+        "supports_time_filter": 0,
+        "supports_user_location": 0,
+        "supports_tool_calling": 1,
+        "active": 1,
+        "notes": "OpenRouter 中转 Gemini 联网口径；联网使用 web plugin。不是 Google Gemini 官方直连接口。",
     },
     {
         "provider": "qwen",
@@ -571,12 +627,13 @@ def migrate_legacy_default_models(conn: sqlite3.Connection) -> None:
             api_base = CASE WHEN api_base = '' THEN 'https://api.openai.com/v1' ELSE api_base END,
             supports_search = 1,
             supports_reasoning = 1,
-            web_search_mode = CASE WHEN COALESCE(web_search_mode, '') = '' THEN '内置 web_search 工具' ELSE web_search_mode END,
-            web_search_param_path = CASE WHEN COALESCE(web_search_param_path, '') = '' THEN 'tools[].type=web_search' ELSE web_search_param_path END,
+            web_search_mode = CASE WHEN COALESCE(web_search_mode, '') IN ('', '内置 web_search 工具') THEN 'Responses API hosted web_search 工具' ELSE web_search_mode END,
+            web_search_param_path = CASE WHEN COALESCE(web_search_param_path, '') IN ('', 'tools[].type=web_search') THEN 'tools[].type=web_search; tools[].search_context_size; tools[].user_location' ELSE web_search_param_path END,
             reasoning_param_path = CASE WHEN COALESCE(reasoning_param_path, '') = '' THEN 'reasoning.effort' ELSE reasoning_param_path END,
             reasoning_levels = CASE WHEN COALESCE(reasoning_levels, '') = '' THEN 'none;minimal;low;medium;high;xhigh' ELSE reasoning_levels END,
             supports_citation = CASE WHEN COALESCE(supports_citation, 0) = 0 THEN 1 ELSE supports_citation END,
-            citation_param_path = CASE WHEN COALESCE(citation_param_path, '') = '' THEN 'include[]=web_search_call.action.sources' ELSE citation_param_path END,
+            citation_param_path = CASE WHEN COALESCE(citation_param_path, '') IN ('', 'include[]=web_search_call.action.sources') THEN 'output[].content[].annotations[type=url_citation]; include[]=web_search_call.action.sources' ELSE citation_param_path END,
+            supports_user_location = 1,
             model_type = CASE WHEN model_type = '' THEN 'chat' ELSE model_type END
         WHERE provider = 'openai' AND (label LIKE 'OpenAI%' OR label = 'GPT')
         """
@@ -638,10 +695,23 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
         WHERE provider = 'kimi' AND model = 'moonshot-v1-8k'
         """
     )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET model = 'gpt-5.5'
+        WHERE provider = 'openai' AND model IN ('gpt-4.1', 'gpt-5.2')
+        """
+    )
 
 
 def row_to_dict(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row else None
+
+
+def run_row_to_dict(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["test_platform"] = test_platform_name(item.get("provider"), item.get("model"))
+    return item
 
 
 def list_projects(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1207,7 +1277,7 @@ def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 100
         """,
         (batch_id, limit),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [run_row_to_dict(row) for row in rows]
 
 
 def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
@@ -1255,11 +1325,25 @@ def list_failed_runs_by_batch(conn: sqlite3.Connection, batch_id: str) -> list[d
         FROM model_runs r
         JOIN questions q ON q.id = r.question_id
         WHERE r.batch_id = ? AND r.status = 'failed'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM model_runs newer
+              WHERE newer.batch_id = r.batch_id
+                AND newer.question_id = r.question_id
+                AND newer.model_config_id = r.model_config_id
+                AND newer.search_enabled = r.search_enabled
+                AND COALESCE(newer.search_mode, '') = COALESCE(r.search_mode, '')
+                AND COALESCE(newer.thinking_type, '') = COALESCE(r.thinking_type, '')
+                AND COALESCE(newer.reasoning_effort, '') = COALESCE(r.reasoning_effort, '')
+                AND COALESCE(newer.thinking_budget, -1) = COALESCE(r.thinking_budget, -1)
+                AND newer.repeat_index = r.repeat_index
+                AND newer.id > r.id
+          )
         ORDER BY r.id ASC
         """,
         (batch_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [run_row_to_dict(row) for row in rows]
 
 
 def insert_evaluation(conn: sqlite3.Connection, evaluation: dict[str, Any]) -> None:
@@ -1337,7 +1421,7 @@ def analytics(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
     competitors: dict[str, int] = {}
     for row in runs:
         mode = "联网搜索" if row["search_enabled"] else "纯模型"
-        key = f"{row['provider']} / {row['model']} / {mode}"
+        key = f"{row.get('test_platform') or test_platform_name(row.get('provider'), row.get('model'))} / {mode}"
         item = providers.setdefault(key, {"total": 0, "mentioned": 0, "owned_cited": 0})
         item["total"] += 1
         item["mentioned"] += 1 if row.get("target_brand_mentioned") else 0

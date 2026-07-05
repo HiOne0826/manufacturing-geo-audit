@@ -17,10 +17,13 @@ PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "kimi": ("MOONSHOT_API_KEY", "KIMI_API_KEY"),
     "ernie": ("QIANFAN_ACCESS_TOKEN", "BAIDU_QIANFAN_API_KEY", "ERNIE_API_KEY"),
     "minimax": ("MINIMAX_API_KEY",),
+    "openrouter_gpt": ("OPENROUTER_API_KEY",),
+    "openrouter_gemini": ("OPENROUTER_API_KEY",),
 }
 
 BAIDU_AK_ENV_KEYS = ("BAIDU_QIANFAN_AK", "QIANFAN_AK", "BAIDU_AK", "ERNIE_AK")
 BAIDU_SK_ENV_KEYS = ("BAIDU_QIANFAN_SK", "QIANFAN_SK", "BAIDU_SK", "ERNIE_SK")
+BRAVE_SEARCH_ENV_KEYS = ("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY")
 
 
 def load_dotenv_file(path: Path) -> None:
@@ -59,6 +62,10 @@ def resolve_provider_api_key(provider: str, current_value: str = "") -> str:
 
 def resolve_baidu_ak_sk() -> tuple[str, str]:
     return first_env(*BAIDU_AK_ENV_KEYS), first_env(*BAIDU_SK_ENV_KEYS)
+
+
+def resolve_brave_search_api_key() -> str:
+    return first_env(*BRAVE_SEARCH_ENV_KEYS)
 
 
 def provider_has_credentials(provider: str, current_value: str = "") -> bool:

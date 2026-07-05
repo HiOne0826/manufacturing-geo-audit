@@ -13,9 +13,10 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
-from src.adapters import AdapterError, call_configured_model
+from src.adapters import AdapterError, call_configured_model, normalize_run_options, openai_compatible_request, openai_responses_request
 from src.db import create_model_config, create_project, get_conn, import_questions_rows, init_db, list_failed_runs_by_batch, list_runs
-from src.runner import rerun_failed_runs, run_batch
+from src.exporter import runs_to_excel_html
+from src.runner import provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -305,8 +306,236 @@ class HarnessHttpTests(unittest.TestCase):
         models = self.request_json("GET", "/api/models")["models"]
         kimi = next(item for item in models if item["provider"] == "kimi")
         deepseek = next(item for item in models if item["provider"] == "deepseek")
+        openrouter_gpt = next(item for item in models if item["provider"] == "openrouter_gpt")
+        openrouter_gemini = next(item for item in models if item["provider"] == "openrouter_gemini")
         self.assertEqual(kimi["sampling_defaults"]["temperature"], 0.6)
         self.assertEqual(deepseek["sampling_defaults"]["temperature"], 1)
+        self.assertTrue(deepseek["supports_search"])
+        self.assertIn("Brave Search", deepseek["web_search_mode"])
+        self.assertEqual(openrouter_gpt["label"], "OpenRouter-GPT")
+        self.assertEqual(openrouter_gemini["label"], "OpenRouter-Gemini")
+        self.assertTrue(openrouter_gpt["supports_search"])
+        self.assertTrue(openrouter_gemini["supports_search"])
+        self.assertIn("web plugin", openrouter_gpt["web_search_mode"])
+
+    def test_openai_model_settings_match_hosted_web_search(self):
+        self.create_mock_project()
+        models = self.request_json("GET", "/api/models")["models"]
+        gpt = next(item for item in models if item["provider"] == "openai")
+        self.assertEqual(gpt["api_family"], "OpenAI Responses API")
+        self.assertEqual(gpt["model"], "gpt-5.5")
+        self.assertTrue(gpt["supports_search"])
+        self.assertTrue(gpt["supports_user_location"])
+        self.assertIn("tools[].type=web_search", gpt["web_search_param_path"])
+        self.assertIn("tools[].search_context_size", gpt["web_search_param_path"])
+        self.assertIn("url_citation", gpt["citation_param_path"])
+
+    def test_openai_web_search_payload_uses_responses_tool(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "auto",
+                "search_strategy": "high",
+                "search_user_location": "Shanghai, CN, Asia/Shanghai",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "output_text": "ok",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "ok",
+                                "annotations": [
+                                    {"type": "url_citation", "url": "https://example.com", "title": "Example"}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = openai_responses_request("https://api.openai.com/v1", "test-key", "gpt-5.5", "问题", options)
+
+        payload = post_json.call_args.args[2]
+        self.assertEqual(post_json.call_args.args[0], "https://api.openai.com/v1/responses")
+        self.assertEqual(payload["tools"][0]["type"], "web_search")
+        self.assertEqual(payload["tools"][0]["search_context_size"], "high")
+        self.assertEqual(payload["tools"][0]["user_location"]["city"], "Shanghai")
+        self.assertEqual(payload["tools"][0]["user_location"]["country"], "CN")
+        self.assertEqual(payload["tools"][0]["user_location"]["timezone"], "Asia/Shanghai")
+        self.assertEqual(payload["include"], ["web_search_call.action.sources"])
+        self.assertEqual(result["citations"], [{"url": "https://example.com", "title": "Example"}])
+
+    def test_deepseek_search_uses_brave_external_context(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "auto",
+                "search_limit": 5,
+                "search_user_location": "Shanghai, CN, Asia/Shanghai",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.resolve_brave_search_api_key", return_value="brave-test-key"), \
+             mock.patch("src.adapters.get_json") as get_json, \
+             mock.patch("src.adapters.post_json") as post_json:
+            get_json.return_value = {
+                "web": {
+                    "results": [
+                        {
+                            "title": "英歌瑞自动化涂装设备",
+                            "url": "https://example.com/ingreen",
+                            "description": "英歌瑞提供自动化涂装和涂胶控制系统。",
+                        }
+                    ]
+                }
+            }
+            post_json.return_value = {
+                "model": "deepseek-chat",
+                "choices": [{"message": {"content": "基于资料，英歌瑞可作为参考品牌。[1]"}}],
+            }
+            result = openai_compatible_request(
+                "https://api.deepseek.com/v1",
+                "deepseek-test-key",
+                "deepseek-chat",
+                "国内自动化涂装设备有哪些品牌？",
+                1,
+                "deepseek",
+                options,
+            )
+
+        brave_url = get_json.call_args.args[0]
+        self.assertIn("https://api.search.brave.com/res/v1/web/search?", brave_url)
+        self.assertIn("country=CN", brave_url)
+        self.assertEqual(get_json.call_args.args[1]["X-Subscription-Token"], "brave-test-key")
+        payload = post_json.call_args.args[2]
+        user_content = payload["messages"][1]["content"]
+        self.assertIn("Brave Search 返回的公开网页检索结果", user_content)
+        self.assertIn("https://example.com/ingreen", user_content)
+        self.assertEqual(result["citations"], [{"url": "https://example.com/ingreen", "title": "英歌瑞自动化涂装设备"}])
+        self.assertIn("brave_results", result["raw_response"])
+
+    def test_openrouter_online_payload_uses_web_plugin_and_citations(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_limit": 3,
+                "search_strategy": "native",
+                "search_site_filter": "example.com,industry.example",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "openai/gpt-5.2",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "联网回答",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url_citation": {
+                                        "url": "https://example.com/source",
+                                        "title": "Source Title",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+            result = openai_compatible_request(
+                "https://openrouter.ai/api/v1",
+                "openrouter-test-key",
+                "openai/gpt-5.2",
+                "测试问题",
+                1,
+                "openrouter_gpt",
+                options,
+            )
+
+        self.assertEqual(post_json.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openrouter-test-key")
+        payload = post_json.call_args.args[2]
+        self.assertEqual(payload["plugins"], [{"id": "web", "max_results": 3, "engine": "native", "include_domains": ["example.com", "industry.example"]}])
+        self.assertEqual(result["citations"], [{"url": "https://example.com/source", "title": "Source Title"}])
+
+    def test_customer_excel_export_uses_test_platform_and_hides_internal_columns(self):
+        body = runs_to_excel_html(
+            [
+                {
+                    "run_id": "run-test",
+                    "batch_id": "batch-test",
+                    "question": "测试问题",
+                    "question_type": "品牌推荐",
+                    "provider": "doubao",
+                    "model": "doubao-seed-2-0-mini-260428",
+                    "search_enabled": True,
+                    "search_mode": "auto",
+                    "thinking_type": "disabled",
+                    "reasoning_effort": "",
+                    "thinking_budget": "",
+                    "repeat_index": 1,
+                    "requested_at": "2026-07-04T00:00:00+00:00",
+                    "status": "success",
+                    "target_brand_mentioned": True,
+                    "recommendation_strength": "未提及",
+                    "competitors_mentioned": "竞品A",
+                    "owned_site_cited": False,
+                    "third_party_cited": True,
+                    "risk_level": "低",
+                    "response_text": "回答内容",
+                    "error_message": "",
+                }
+            ]
+        )
+        self.assertIn("测试平台", body)
+        self.assertIn("豆包", body)
+        self.assertNotIn("doubao-seed-2-0-mini-260428", body)
+        for hidden_header in ["搜索策略", "思考模式", "推理强度", "思考预算", "重复次数", "推荐强度", "竞品共现", "官网引用", "第三方引用", "风险等级"]:
+            self.assertNotIn(hidden_header, body)
+
+        routed = runs_to_excel_html(
+            [
+                {
+                    "run_id": "run-openrouter",
+                    "batch_id": "batch-test",
+                    "question": "测试问题",
+                    "question_type": "品牌推荐",
+                    "provider": "openrouter_gpt",
+                    "model": "openai/gpt-5.2",
+                    "search_enabled": True,
+                    "requested_at": "2026-07-04T00:00:00+00:00",
+                    "status": "success",
+                    "target_brand_mentioned": False,
+                    "response_text": "回答内容",
+                    "error_message": "",
+                },
+                {
+                    "run_id": "run-gemini",
+                    "batch_id": "batch-test",
+                    "question": "测试问题",
+                    "question_type": "品牌推荐",
+                    "provider": "openrouter_gemini",
+                    "model": "google/gemini-2.5-flash",
+                    "search_enabled": True,
+                    "requested_at": "2026-07-04T00:00:00+00:00",
+                    "status": "success",
+                    "target_brand_mentioned": False,
+                    "response_text": "回答内容",
+                    "error_message": "",
+                },
+            ]
+        )
+        self.assertIn("ChatGPT", routed)
+        self.assertIn("Gemini", routed)
+        self.assertNotIn("OpenRouter-GPT", routed)
+        self.assertNotIn("OpenRouter-Gemini", routed)
 
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
@@ -329,6 +558,17 @@ class HarnessHttpTests(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(status.get("status"), "completed")
         self.assertEqual(status["success"] + status["failed"], status["total"])
+        self.assertIn("source_statuses", status)
+        self.assertEqual(len(status["source_statuses"]), 1)
+        source = status["source_statuses"][0]
+        self.assertEqual(source["test_platform"], "mock-model")
+        self.assertEqual(source["total"], 2)
+        self.assertEqual(source["completed"], 2)
+        self.assertEqual(source["success"], 2)
+        self.assertEqual(source["failed"], 0)
+        self.assertEqual(source["queued"], 0)
+        self.assertEqual(source["running"], 0)
+        self.assertEqual(source["status"], "completed")
         batches = self.request_json("GET", f"/api/batches?project_id={project_id}")["batches"]
         batch = next(item for item in batches if item["batch_id"] == batch_id)
         self.assertEqual(batch["status"], "completed")
@@ -337,16 +577,95 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(batch_detail["completed_count"], 2)
         batch_runs = self.request_json("GET", f"/api/batches/{batch_id}/runs")["runs"]
         self.assertEqual(len(batch_runs), 2)
+        self.assertTrue(all("test_platform" in row for row in batch_runs))
         self.assertIn("<table", self.request_text(f"/api/export/batches/{batch_id}/runs.xls"))
         self.assertIn("<table", self.request_text(f"/api/export/batches/{batch_id}/summary.xls"))
         app.SAMPLING_JOBS.clear()
         persisted_status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
         self.assertEqual(persisted_status["status"], "completed")
         self.assertEqual(persisted_status["completed"], 2)
+        self.assertEqual(persisted_status["source_statuses"][0]["status"], "completed")
         runs = self.request_json("GET", f"/api/runs?project_id={project_id}")["runs"]
         self.assertEqual(len(runs), 2)
         self.assertIn("run_id", self.request_text(f"/api/export/runs.csv?project_id={project_id}"))
         self.assertIn("<table", self.request_text(f"/api/export/runs.xls?project_id={project_id}"))
+
+    def test_progress_reports_two_sources_from_batch_config_and_runs(self):
+        project_id, first_model_id = self.create_mock_project(question_count=2)
+        second_model = self.request_json(
+            "POST",
+            "/api/models",
+            {
+                "provider": "mock",
+                "label": "Mock Two",
+                "model": "mock-model-2",
+                "supports_pure": True,
+                "supports_search": True,
+                "active": True,
+            },
+        )
+        started = self.request_json(
+            "POST",
+            "/api/runs/start",
+            {
+                "project_id": project_id,
+                "models": [
+                    {"model_config_id": first_model_id, "search_enabled": True},
+                    {"model_config_id": int(second_model["id"]), "search_enabled": False},
+                ],
+                "repeat_count": 1,
+            },
+        )
+        batch_id = started["batch_id"]
+        status = {}
+        for _ in range(50):
+            status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+            if status.get("status") == "completed":
+                break
+            time.sleep(0.1)
+        self.assertEqual(status["status"], "completed")
+        sources = {item["test_platform"]: item for item in status["source_statuses"]}
+        self.assertEqual(set(sources), {"mock-model", "mock-model-2"})
+        self.assertEqual(sources["mock-model"]["total"], 2)
+        self.assertEqual(sources["mock-model-2"]["total"], 2)
+        self.assertEqual(sources["mock-model"]["completed"], 2)
+        self.assertEqual(sources["mock-model-2"]["completed"], 2)
+        self.assertEqual(sources["mock-model"]["status"], "completed")
+        self.assertEqual(sources["mock-model-2"]["status"], "completed")
+
+    def test_analytics_summary_reports_visibility_and_quality(self):
+        project_id, model_id = self.create_mock_project(question_count=2)
+        started = self.request_json(
+            "POST",
+            "/api/runs/start",
+            {
+                "project_id": project_id,
+                "models": [{"model_config_id": model_id, "search_enabled": True}],
+                "repeat_count": 1,
+            },
+        )
+        batch_id = started["batch_id"]
+        for _ in range(50):
+            status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+            if status.get("status") == "completed":
+                break
+            time.sleep(0.1)
+
+        summary = self.request_json("GET", f"/api/analytics/summary?project_id={project_id}")
+        self.assertEqual(summary["meta"]["scope"], "project")
+        self.assertEqual(summary["sample_quality"]["planned"], 2)
+        self.assertEqual(summary["sample_quality"]["valid"], 2)
+        self.assertEqual(summary["sample_quality"]["failed"], 0)
+        self.assertEqual(summary["visibility"]["mention_rate"], 100)
+        self.assertEqual(summary["visibility"]["top3_rate"], 100)
+        self.assertEqual(summary["source_analysis"]["owned_citation_rate"], 0)
+        self.assertTrue(summary["provider_breakdown"])
+        self.assertTrue(summary["recommendations"])
+
+        batch_summary = self.request_json("GET", f"/api/analytics/summary?project_id={project_id}&batch_id={batch_id}")
+        self.assertEqual(batch_summary["meta"]["scope"], "batch")
+        self.assertEqual(batch_summary["meta"]["batch_id"], batch_id)
+        self.assertEqual(batch_summary["sample_quality"]["planned"], 2)
 
     def test_rq_backend_enqueues_without_inline_thread(self):
         project_id, model_id = self.create_mock_project(question_count=1)
@@ -368,6 +687,8 @@ class HarnessHttpTests(unittest.TestCase):
             enqueue.assert_called_once()
             persisted_status = self.request_json("GET", f"/api/runs/progress?batch_id={started['batch_id']}")
             self.assertEqual(persisted_status["status"], "queued")
+            self.assertEqual(persisted_status["source_statuses"][0]["status"], "queued")
+            self.assertEqual(persisted_status["source_statuses"][0]["total"], 1)
         finally:
             if old_backend is None:
                 os.environ.pop("TASK_QUEUE_BACKEND", None)
@@ -376,6 +697,30 @@ class HarnessHttpTests(unittest.TestCase):
 
 
 class HarnessDirectTests(unittest.TestCase):
+    def test_provider_concurrency_limits_use_shared_source_groups(self):
+        old_limits = os.environ.get("SAMPLING_PROVIDER_CONCURRENCY_LIMITS")
+        try:
+            os.environ.pop("SAMPLING_PROVIDER_CONCURRENCY_LIMITS", None)
+            self.assertEqual(provider_concurrency_group("openrouter_gpt"), "openrouter")
+            self.assertEqual(provider_concurrency_group("openrouter_gemini"), "openrouter")
+            self.assertEqual(provider_concurrency_limit("openrouter_gpt"), 4)
+            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 4)
+            self.assertEqual(provider_concurrency_limit("deepseek"), 2)
+            self.assertEqual(provider_concurrency_limit("doubao"), 2)
+            self.assertEqual(provider_concurrency_limit("qwen"), 2)
+            self.assertEqual(provider_concurrency_limit("hunyuan"), 2)
+            self.assertEqual(provider_concurrency_limit("mock"), 16)
+
+            os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = "openrouter=1,deepseek=2"
+            self.assertEqual(provider_concurrency_limit("openrouter_gpt"), 1)
+            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 1)
+            self.assertEqual(provider_concurrency_limit("deepseek"), 2)
+        finally:
+            if old_limits is None:
+                os.environ.pop("SAMPLING_PROVIDER_CONCURRENCY_LIMITS", None)
+            else:
+                os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = old_limits
+
     def test_default_blocks_live_model_calls(self):
         old_value = os.environ.pop("ALLOW_LIVE_MODEL_CALLS", None)
         try:

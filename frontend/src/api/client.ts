@@ -19,8 +19,9 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   const response = await fetch(apiPath(path), { ...options, headers, credentials: "same-origin" });
   const contentType = response.headers.get("Content-Type") || "";
   const data = contentType.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok || (typeof data === "object" && data && "error" in data)) {
-    const message = typeof data === "object" && data && "error" in data ? String(data.error) : "请求失败";
+  const apiError = typeof data === "object" && data && "error" in data && Boolean(data.error);
+  if (!response.ok || apiError) {
+    const message = apiError ? String((data as { error: unknown }).error) : "请求失败";
     throw new ApiError(message, response.status);
   }
   return data as T;

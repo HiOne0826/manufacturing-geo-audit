@@ -1,5 +1,5 @@
 import { api } from "./client";
-import type { Analytics, ModelConfig, ModelRun, Project, Question, SamplingBatch } from "./types";
+import type { Analytics, AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SamplingBatch } from "./types";
 
 export const authApi = {
   status: () => api<{ ok: boolean; auth_enabled: boolean; authenticated: boolean }>("/api/auth/status"),
@@ -49,5 +49,6 @@ export const runsApi = {
 };
 
 export const analyticsApi = {
-  get: (projectId: number) => api<Analytics>(`/api/analytics?project_id=${projectId}`)
+  get: (projectId: number) => api<Analytics>(`/api/analytics?project_id=${projectId}`),
+  summary: (projectId: number, batchId?: string) => api<AnalyticsSummary>(`/api/analytics/summary?project_id=${projectId}${batchId ? `&batch_id=${encodeURIComponent(batchId)}` : ""}`)
 };
