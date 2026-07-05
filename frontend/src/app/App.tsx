@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { BarChart3, Boxes, FileDown, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal } from "lucide-react";
+import { BarChart3, Boxes, FileDown, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
 import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
@@ -175,29 +175,67 @@ const projectLabels = { client_name: "客户名称", brand_name: "品牌名称",
 function QuestionsPage() {
   const { projectId } = useSelectionStore();
   const questions = useQuery({ queryKey: ["questions", projectId], queryFn: () => questionsApi.list(projectId), enabled: Boolean(projectId) });
-  const [csvText, setCsvText] = useState("汽车白车身多材料连接，国内有哪些FDS热熔螺接设备品牌值得推荐？\n新能源汽车电池PACK装配，国内有哪些FDS热熔螺接设备品牌值得推荐？");
-  const importText = useMutation({ mutationFn: () => questionsApi.importText(projectId!, csvText), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["questions", projectId] }) });
-  const seed = useMutation({ mutationFn: () => questionsApi.seed(projectId!), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["questions", projectId] }) });
+  const [csvText, setCsvText] = useState("");
+  const parsedLineCount = csvText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
+  const importText = useMutation({
+    mutationFn: () => questionsApi.importText(projectId!, csvText),
+    onSuccess: () => {
+      setCsvText("");
+      queryClient.invalidateQueries({ queryKey: ["questions", projectId] });
+    }
+  });
   const remove = useMutation({ mutationFn: questionsApi.remove, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["questions", projectId] }) });
   return (
     <main className="page">
-      <PageTitle title="问题库" description="按项目导入和维护采样问题。" action={<button disabled={!projectId} onClick={() => seed.mutate()}>生成模板问题</button>} />
-      <section className="two-column">
-        <Panel title="快速导入">
-          <textarea className="tall" value={csvText} onChange={(event) => setCsvText(event.target.value)} />
-          <button disabled={!projectId || importText.isPending} onClick={() => importText.mutate()}>识别并导入</button>
+      <PageTitle title="问题库" description="导入、查看和维护当前项目的采样问题。" />
+      <section className="question-workbench">
+        <Panel title="导入问题">
+          <div className="question-import">
+            <div className="import-summary">
+              <Metric label="当前问题" value={questions.data?.questions.length || 0} />
+              <Metric label="待导入" value={parsedLineCount} hint="按行识别" />
+            </div>
+            <label>
+              粘贴问题
+              <textarea
+                className="question-textarea"
+                placeholder={"每行一个问题，或粘贴带表头的 CSV。示例：\nSCA 涂胶系统有哪些国产替代品牌？\n汽车制造涂胶系统选择 SCA 还是国产厂商？"}
+                value={csvText}
+                onChange={(event) => setCsvText(event.target.value)}
+              />
+            </label>
+            <div className="import-actions">
+              <button disabled={!projectId || !parsedLineCount || importText.isPending} onClick={() => importText.mutate()}><Upload size={15} />{importText.isPending ? "正在导入" : "导入问题"}</button>
+              <button className="ghost" type="button" disabled={!csvText || importText.isPending} onClick={() => setCsvText("")}>清空</button>
+            </div>
+            {importText.error ? <div className="error-box">{importText.error.message}</div> : null}
+          </div>
         </Panel>
         <Panel title={`问题列表 ${questions.data?.questions.length || 0}`}>
-          <QuestionTable questions={questions.data?.questions || []} onDelete={(id) => remove.mutate(id)} />
+          <QuestionTable questions={questions.data?.questions || []} onDelete={(id) => remove.mutate(id)} deletingId={remove.variables} />
         </Panel>
       </section>
     </main>
   );
 }
 
-function QuestionTable({ questions, onDelete }: { questions: Question[]; onDelete: (id: number) => void }) {
+function QuestionTable({ questions, onDelete, deletingId }: { questions: Question[]; onDelete: (id: number) => void; deletingId?: number }) {
   if (!questions.length) return <EmptyState title="当前项目还没有问题" />;
-  return <div className="data-table dense"><table><thead><tr><th>问题</th><th>类型</th><th>阶段</th><th>优先级</th><th></th></tr></thead><tbody>{questions.map((q) => <tr key={q.id}><td className="wide-cell">{q.question}</td><td>{q.question_type}</td><td>{q.purchase_stage || "-"}</td><td>{q.priority || "-"}</td><td><button className="ghost" onClick={() => onDelete(q.id)}>删除</button></td></tr>)}</tbody></table></div>;
+  return (
+    <div className="question-list">
+      {questions.map((q) => (
+        <article className="question-row" key={q.id}>
+          <div>
+            <strong>{q.question}</strong>
+            <span>{q.question_type || "未分类"} · {q.purchase_stage || "未标注阶段"} · {q.priority || "普通优先级"}</span>
+          </div>
+          <button className="icon-button danger" type="button" disabled={deletingId === q.id} aria-label="删除问题" title="删除问题" onClick={() => onDelete(q.id)}>
+            <Trash2 size={15} />
+          </button>
+        </article>
+      ))}
+    </div>
+  );
 }
 
 function ModelsPage() {
