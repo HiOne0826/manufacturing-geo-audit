@@ -1,6 +1,6 @@
 # 制造业 GEO 审计系统当前状态
 
-更新时间：2026-06-11
+更新时间：2026-07-05
 
 ## 定位
 
@@ -19,6 +19,7 @@ Python http.server
   -> SQLite WAL
   -> ThreadPoolExecutor
   -> model_runs / answer_evaluations / sampling_batches
+  -> source_statuses 平台级进度聚合
 ```
 
 正式任务模式：
@@ -44,6 +45,7 @@ Nginx Basic Auth
 - `/api/models` 不返回明文 `api_key`，只返回 `has_key` 和掩码。
 - 测试默认不允许调用真实模型。
 - 真实模型调用必须显式设置 `ALLOW_LIVE_MODEL_CALLS=1`。
+- 正式页面不允许创建 Mock 模型；真实模型测试入口受 `ALLOW_LIVE_MODEL_CALLS` 拦截。
 
 ## 数据库
 
@@ -110,6 +112,7 @@ RQ_QUEUE_NAME=geo-audit
 ```bash
 SAMPLING_MAX_WORKERS=8
 SAMPLING_PROVIDER_MAX_WORKERS=3
+SAMPLING_PROVIDER_CONCURRENCY_LIMITS=openrouter:4,deepseek:2,doubao:2,qwen:2,hunyuan:2,gemini:2,openai:2
 SAMPLING_REQUEST_TIMEOUT=120
 SAMPLING_RETRY_COUNT=1
 ```
@@ -118,20 +121,61 @@ SAMPLING_RETRY_COUNT=1
 
 - 每个采样任务独立数据库连接。
 - 每个 provider 有独立并发限制。
+- 同一个项目存在 queued/running 批次时，重复启动会复用现有批次，避免用户误点产生重复采样。
 - 单任务失败不会中断整个 batch。
 - 失败任务会落库为 `status=failed`。
-- 支持按 batch 重跑失败项。
+- 支持按 batch 重跑当前最新仍失败的任务；重跑成功后平台状态按最新等价 run 汇总。
+
+## 客户交付口径
+
+- 抽样页和批次详情页按“测试平台”展示状态，不暴露内部 provider/model_config_id。
+- `openai` / `openrouter_gpt` 展示为 ChatGPT。
+- `gemini` / `openrouter_gemini` 展示为 Gemini。
+- `deepseek` 展示为 DeepSeek。
+- `doubao` 展示为豆包。
+- `qwen` 展示为千问。
+- `hunyuan` 展示为元宝。
+- CSV 保留完整机器字段；Excel 面向客户精简为运行 ID、批次 ID、问题、问题类型、联网搜索、生成时间、状态、品牌命中、回答摘要、错误信息、测试平台。
+- DeepSeek 联网口径通过 Brave Search 外部检索增强，结果保留搜索来源 / 引用。
+
+## 运行状态监测
+
+`/api/runs/progress` 返回批次总体进度和 `source_statuses`：
+
+- `test_platform`
+- `provider`
+- `model`
+- `total`
+- `completed`
+- `success`
+- `failed`
+- `queued`
+- `running`
+- `status`
+- `avg_latency_ms`
+- `last_error`
+
+状态规则：
+
+1. 有失败优先显示 `failed`。
+2. 有运行中任务显示 `running`。
+3. 完成数达到计划数显示 `completed`。
+4. 其余显示 `queued`。
+
+inline 模式优先结合内存 job 和数据库结果；RQ 或无内存 job 时，从 `sampling_batches.config_json` 与 `model_runs` 推导平台状态。
 
 ## 模型接入
 
 当前模型库支持的主要 provider：
 
 - OpenAI
+- OpenRouter-GPT
+- OpenRouter-Gemini
 - Gemini
 - 豆包
 - DeepSeek
 - 通义千问
-- 腾讯混元
+- 腾讯混元 / 元宝
 - Kimi
 - 文心一言
 - MiniMax
@@ -202,7 +246,7 @@ python3 -m unittest discover -s tests
 最近结果：
 
 ```text
-Ran 12 tests
+Ran 25 tests
 OK
 ```
 
@@ -219,6 +263,27 @@ OK
 - 失败重跑。
 - RQ 入队 Mock。
 - 模型默认采样参数。
+- 平台展示名聚合。
+- Excel 客户版字段精简。
+- `/api/runs/progress` 平台状态聚合。
+- RQ 无内存 job 时的平台状态推导。
+
+### 2026-07-05 客户交付前回归
+
+命令：
+
+```bash
+python3 -m unittest discover -s tests
+cd frontend && npm run build
+python3 scripts/load_test_local.py --questions 2 --models 2 --workers 2
+```
+
+结果：
+
+- 单元 / 集成测试：25 tests OK。
+- 前端构建：通过，提示 Vite chunk 大于 500 kB。
+- 本地 mock 负载：4/4 success，CSV / XLS 均生成。
+- 内置浏览器截图验证：采样页、批次详情页、390px 移动宽度均可用，无页面级横向滚动。
 
 任务系统检测：
 

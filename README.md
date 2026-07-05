@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-截至 2026-06-11，本项目已经从轻量本地工作台升级为可公网小范围使用的内部系统：
+截至 2026-07-05，本项目已经从轻量本地工作台升级为可公网小范围使用的内部系统：
 
 - 使用人数预期不超过 3 人。
 - 公网入口建议使用 Nginx Basic Auth。
@@ -14,6 +14,9 @@
 - API Key 不在任何接口明文返回。
 - 默认测试不调用真实模型，真实调用必须显式设置 `ALLOW_LIVE_MODEL_CALLS=1`。
 - 支持批次持久化、并发采样、失败隔离、失败重跑、CSV/XLS 导出。
+- 采样页和批次详情页支持按测试平台展示运行监测，用户提交任务后可看到各来源进度。
+- 客户版 Excel 导出已精简运行控制列；CSV 保留完整机器字段。
+- 平台展示口径统一为 ChatGPT、Gemini、DeepSeek、豆包、千问、元宝等客户可理解名称。
 - 支持 SQLite 本地模式，也支持 PostgreSQL + Redis/RQ 正式任务模式。
 - 提供内部 Agent API，可被 MCP 或其他 Agent 包装调用。
 
@@ -27,6 +30,7 @@
 - 抽样任务：按项目、问题、模型批量采样。
 - 并发执行：`ThreadPoolExecutor` 支持多模型多问题并发。
 - 批次状态：`sampling_batches` 持久化任务状态。
+- 平台进度：`/api/runs/progress` 返回 `source_statuses`，聚合每个测试平台的排队、运行、成功、失败和均耗时。
 - 结果归档：`model_runs` 保存回答、引用、耗时、状态、错误。
 - 规则评估：保存品牌命中、竞品共现、官网引用、风险等级。
 - 失败重跑：按 batch 只重跑失败项。
@@ -92,6 +96,8 @@ API Key 可放入 `.env`。常用环境变量：
 DOUBAO_API_KEY=...
 DASHSCOPE_API_KEY=...
 QWEN_API_KEY=...
+OPENROUTER_API_KEY=...
+BRAVE_SEARCH_API_KEY=...
 MOONSHOT_API_KEY=...
 KIMI_API_KEY=...
 DEEPSEEK_API_KEY=...
@@ -165,6 +171,25 @@ python3 scripts/check_task_system.py
 测试说明见：[docs/test-harness.md](docs/test-harness.md)。
 
 ## 最近验证
+
+### 客户交付前回归
+
+2026-07-05 完成本轮客户交付前修正后，已执行：
+
+```bash
+python3 -m unittest discover -s tests
+cd frontend && npm run build
+python3 scripts/load_test_local.py --questions 2 --models 2 --workers 2
+```
+
+结果：
+
+- 单元 / 集成测试：25 tests OK。
+- 前端构建：通过，仍有 Vite chunk size 提示。
+- 本地 mock 负载：4/4 success，CSV / XLS 均生成。
+- 内置浏览器截图验证：采样页、批次详情页、390px 移动宽度均可用，无页面级横向滚动。
+
+### 真实模型并发抽样
 
 最近真实模型并发抽样使用本地已有 3 个问题和 6 个已有 key 模型：
 
