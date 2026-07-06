@@ -725,19 +725,25 @@ def build_openai_web_search_tool(options: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_openai_responses_payload(model: str, question: str, options: dict[str, Any]) -> dict[str, Any]:
-    reasoning_effort = options["reasoning_effort"]
-    if not reasoning_effort:
-        reasoning_effort = "none" if options["thinking_type"] == "disabled" else "medium"
     payload: dict[str, Any] = {
         "model": model,
         "input": question,
         "instructions": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。",
-        "reasoning": {"effort": reasoning_effort},
     }
+    if openai_model_supports_reasoning(model):
+        reasoning_effort = options["reasoning_effort"]
+        if not reasoning_effort:
+            reasoning_effort = "none" if options["thinking_type"] == "disabled" else "medium"
+        payload["reasoning"] = {"effort": reasoning_effort}
     if options["search_enabled"]:
         payload["tools"] = [build_openai_web_search_tool(options)]
         payload["include"] = ["web_search_call.action.sources"]
     return payload
+
+
+def openai_model_supports_reasoning(model: str) -> bool:
+    normalized = str(model or "").lower()
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def build_openai_chat_payload(model: str, question: str, temperature: float) -> dict[str, Any]:

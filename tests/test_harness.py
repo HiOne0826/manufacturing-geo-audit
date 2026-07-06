@@ -370,6 +370,15 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(payload["include"], ["web_search_call.action.sources"])
         self.assertEqual(result["citations"], [{"url": "https://example.com", "title": "Example"}])
 
+    def test_openai_responses_payload_omits_reasoning_for_non_reasoning_model(self):
+        options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {"output_text": "ok", "output": []}
+            openai_responses_request("https://api.openai.com/v1", "test-key", "gpt-4.1-mini", "问题", options)
+
+        payload = post_json.call_args.args[2]
+        self.assertNotIn("reasoning", payload)
+
     def test_deepseek_search_uses_brave_external_context(self):
         options = normalize_run_options(
             {
