@@ -465,6 +465,53 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(payload["plugins"], [{"id": "web", "max_results": 3, "engine": "native", "include_domains": ["example.com", "industry.example"]}])
         self.assertEqual(result["citations"], [{"url": "https://example.com/source", "title": "Source Title"}])
 
+    def test_openrouter_gpt_wrapper_uses_direct_openai_fallback_when_key_exists(self):
+        with mock.patch.dict(
+            os.environ,
+            {"ALLOW_LIVE_MODEL_CALLS": "1", "OPENAI_API_KEY": "openai-direct-key", "OPENROUTER_GPT_FALLBACK_MODEL": "gpt-4.1-mini"},
+        ), mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {"output_text": "ok", "output": []}
+            result = call_configured_model(
+                {
+                    "provider": "openrouter_gpt",
+                    "api_base": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-5.2",
+                },
+                "测试问题",
+                True,
+                1,
+                {"search_mode": "auto", "thinking_type": "disabled"},
+            )
+
+        self.assertEqual(post_json.call_args.args[0], "https://api.openai.com/v1/responses")
+        self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openai-direct-key")
+        self.assertEqual(post_json.call_args.args[2]["model"], "gpt-4.1-mini")
+        self.assertEqual(result["provider"], "openrouter_gpt")
+        self.assertEqual(result["model"], "gpt-4.1-mini")
+
+    def test_openrouter_gemini_wrapper_uses_direct_gemini_fallback_when_key_exists(self):
+        with mock.patch.dict(
+            os.environ,
+            {"ALLOW_LIVE_MODEL_CALLS": "1", "GEMINI_API_KEY": "gemini-direct-key", "OPENROUTER_GEMINI_FALLBACK_MODEL": "gemini-2.5-flash"},
+        ), mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "modelVersion": "gemini-2.5-flash"}
+            result = call_configured_model(
+                {
+                    "provider": "openrouter_gemini",
+                    "api_base": "https://openrouter.ai/api/v1",
+                    "model": "google/gemini-2.5-flash",
+                },
+                "测试问题",
+                True,
+                1,
+                {"search_mode": "auto", "thinking_type": "disabled"},
+            )
+
+        self.assertEqual(post_json.call_args.args[0], "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent")
+        self.assertEqual(post_json.call_args.args[1]["x-goog-api-key"], "gemini-direct-key")
+        self.assertEqual(result["provider"], "openrouter_gemini")
+        self.assertEqual(result["model"], "gemini-2.5-flash")
+
     def test_customer_excel_export_uses_test_platform_and_hides_internal_columns(self):
         body = runs_to_excel_html(
             [

@@ -656,6 +656,28 @@ def resolve_provider_runtime_config(provider: str, api_key: str, api_base: str, 
     return api_base, model_name
 
 
+def resolve_openrouter_direct_fallback(provider: str) -> tuple[str, str, str, str] | None:
+    if provider == "openrouter_gpt":
+        direct_key = resolve_provider_api_key("openai")
+        if direct_key:
+            return (
+                "openai",
+                direct_key,
+                os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+                os.getenv("OPENROUTER_GPT_FALLBACK_MODEL", os.getenv("OPENAI_CHATGPT_MODEL", "gpt-4.1-mini")),
+            )
+    if provider == "openrouter_gemini":
+        direct_key = resolve_provider_api_key("gemini")
+        if direct_key:
+            return (
+                "gemini",
+                direct_key,
+                os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
+                os.getenv("OPENROUTER_GEMINI_FALLBACK_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
+            )
+    return None
+
+
 def normalize_kimi_temperature(model: str, temperature: float) -> float:
     if str(model).startswith("kimi-k2.5"):
         return 0.6
@@ -1329,36 +1351,41 @@ def call_configured_model(
         }
     if os.environ.get("ALLOW_LIVE_MODEL_CALLS") != "1":
         raise AdapterError("真实模型调用默认关闭。需要调用真实模型时请设置 ALLOW_LIVE_MODEL_CALLS=1。")
-    api_key = resolve_provider_api_key(provider, model_config.get("api_key", ""))
-    api_base = model_config.get("api_base", "")
-    model_name = model_config.get("model", "")
+    runtime_provider = provider
+    fallback = resolve_openrouter_direct_fallback(provider)
+    if fallback:
+        runtime_provider, api_key, api_base, model_name = fallback
+    else:
+        api_key = resolve_provider_api_key(provider, model_config.get("api_key", ""))
+        api_base = model_config.get("api_base", "")
+        model_name = model_config.get("model", "")
     options = normalize_run_options({**(run_options or {}), "search_enabled": search_enabled})
-    if provider == "ernie" and not api_key:
+    if runtime_provider == "ernie" and not api_key:
         ak, sk = resolve_baidu_ak_sk()
         if ak and sk:
             api_key = fetch_baidu_access_token(ak, sk)
     if not api_key:
         raise AdapterError("缺少 API Key")
-    runtime_base, runtime_model = resolve_provider_runtime_config(provider, api_key, api_base, model_name)
+    runtime_base, runtime_model = resolve_provider_runtime_config(runtime_provider, api_key, api_base, model_name)
     start = time.time()
-    if provider == "openai":
+    if runtime_provider == "openai":
         result = openai_responses_request(runtime_base, api_key, runtime_model, question, options)
-    elif provider == "doubao":
+    elif runtime_provider == "doubao":
         if options["search_enabled"]:
             result = doubao_search_request(runtime_base, api_key, runtime_model, question, options)
         else:
-            result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, provider, options)
-    elif provider == "kimi":
+            result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
+    elif runtime_provider == "kimi":
         if options["search_enabled"]:
             result = kimi_search_request(runtime_base, api_key, runtime_model, question, temperature, options)
         else:
-            result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, provider, options)
-    elif provider in {"deepseek", "qwen", "hunyuan", "ernie", "minimax", "openrouter_gpt", "openrouter_gemini"}:
-        result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, provider, options)
-    elif provider == "gemini":
+            result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
+    elif runtime_provider in {"deepseek", "qwen", "hunyuan", "ernie", "minimax", "openrouter_gpt", "openrouter_gemini"}:
+        result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
+    elif runtime_provider == "gemini":
         result = gemini_request(runtime_base, api_key, runtime_model, question, temperature, options)
     else:
-        raise AdapterError(f"暂不支持的模型服务商：{provider}")
+        raise AdapterError(f"暂不支持的模型服务商：{runtime_provider}")
     return {
         "provider": provider,
         "model": result.get("returned_model", runtime_model),

@@ -17,8 +17,8 @@ PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "kimi": ("MOONSHOT_API_KEY", "KIMI_API_KEY"),
     "ernie": ("QIANFAN_ACCESS_TOKEN", "BAIDU_QIANFAN_API_KEY", "ERNIE_API_KEY"),
     "minimax": ("MINIMAX_API_KEY",),
-    "openrouter_gpt": ("OPENROUTER_API_KEY",),
-    "openrouter_gemini": ("OPENROUTER_API_KEY",),
+    "openrouter_gpt": ("OPENROUTER_API_KEY", "OPENAI_API_KEY"),
+    "openrouter_gemini": ("OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
 }
 
 BAIDU_AK_ENV_KEYS = ("BAIDU_QIANFAN_AK", "QIANFAN_AK", "BAIDU_AK", "ERNIE_AK")
