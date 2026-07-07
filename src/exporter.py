@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import html
+import json
 
 from src.platforms import test_platform_name
 
@@ -12,6 +13,28 @@ EXPORT_PLATFORM_NAMES = {
     "openrouter_gemini": "OpenRouter-Gemini",
 }
 
+RUN_EXPORT_COLUMNS = [
+    ("问题ID", "source_question_id"),
+    ("问题内容", "question"),
+    ("回答文本", "response_text"),
+    ("引用来源", "citation_sources"),
+    ("问题类型", "question_type"),
+    ("产品类型", "product_category"),
+    ("产品线", "product_line"),
+    ("采购阶段", "purchase_stage"),
+    ("场景", "scenario"),
+    ("优先级", "question_priority"),
+    ("建议测试平台", "suggested_platforms"),
+    ("运行ID", "run_id"),
+    ("批次ID", "batch_id"),
+    ("测试平台", "test_platform"),
+    ("联网搜索", "search_enabled_label"),
+    ("生成时间", "requested_at"),
+    ("状态", "status"),
+    ("耗时", "latency_ms_label"),
+    ("错误信息", "error_message"),
+]
+
 
 def export_test_platform_name(row: dict) -> str:
     provider = str(row.get("provider") or "").strip().lower()
@@ -20,37 +43,46 @@ def export_test_platform_name(row: dict) -> str:
     return row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model"))
 
 
+def run_export_value(row: dict, key: str) -> str:
+    if key == "test_platform":
+        return export_test_platform_name(row)
+    if key == "search_enabled_label":
+        return "是" if row.get("search_enabled") else "否"
+    if key == "latency_ms_label":
+        return f'{row.get("latency_ms", 0) or 0} ms'
+    if key == "citation_sources":
+        return citation_urls(row.get("citations_json"))
+    return row.get(key, "")
+
+
+def citation_urls(value: object) -> str:
+    if not value:
+        return ""
+    try:
+        items = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(items, list):
+        return ""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("link") or item.get("uri") or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return "; ".join(urls)
+
+
 def runs_to_csv(rows: list[dict]) -> str:
     output = io.StringIO()
-    fieldnames = [
-        "run_id",
-        "batch_id",
-        "question",
-        "question_type",
-        "provider",
-        "model",
-        "search_enabled",
-        "search_mode",
-        "thinking_type",
-        "reasoning_effort",
-        "thinking_budget",
-        "repeat_index",
-        "requested_at",
-        "status",
-        "target_brand_mentioned",
-        "target_brand_rank",
-        "recommendation_strength",
-        "competitors_mentioned",
-        "owned_site_cited",
-        "third_party_cited",
-        "risk_level",
-        "response_text",
-        "error_message",
-    ]
+    fieldnames = [label for label, _ in RUN_EXPORT_COLUMNS]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     for row in rows:
-        writer.writerow({name: row.get(name, "") for name in fieldnames})
+        writer.writerow({label: run_export_value(row, key) for label, key in RUN_EXPORT_COLUMNS})
     return output.getvalue()
 
 
@@ -119,34 +151,8 @@ def rows_to_excel_html(title: str, headers: list[str], rows: list[list[object]])
 
 
 def runs_to_excel_html(rows: list[dict]) -> str:
-    headers = [
-        "运行ID",
-        "批次ID",
-        "问题",
-        "问题类型",
-        "测试平台",
-        "联网搜索",
-        "生成时间",
-        "状态",
-        "品牌命中",
-        "回答摘要",
-        "错误信息",
-    ]
-    body = []
-    for row in rows:
-        body.append([
-            row.get("run_id", ""),
-            row.get("batch_id", ""),
-            row.get("question", ""),
-            row.get("question_type", ""),
-            export_test_platform_name(row),
-            "是" if row.get("search_enabled") else "否",
-            row.get("requested_at", ""),
-            row.get("status", ""),
-            "是" if row.get("target_brand_mentioned") else "否",
-            row.get("response_text", ""),
-            row.get("error_message", ""),
-        ])
+    headers = [label for label, _ in RUN_EXPORT_COLUMNS]
+    body = [[run_export_value(row, key) for _, key in RUN_EXPORT_COLUMNS] for row in rows]
     return rows_to_excel_html("运行明细", headers, body)
 
 

@@ -16,9 +16,9 @@ type ModelFormState = Partial<ModelConfig> & { api_key?: string };
 
 const navItems = [
   { to: "/", label: "总览", icon: Gauge },
+  { to: "/models", label: "模型", icon: SlidersHorizontal },
   { to: "/projects", label: "项目", icon: Boxes },
   { to: "/questions", label: "问题库", icon: ListChecks },
-  { to: "/models", label: "模型", icon: SlidersHorizontal },
   { to: "/sampling", label: "采样", icon: Play },
   { to: "/batches", label: "批次", icon: Layers3 },
   { to: "/analysis", label: "分析", icon: BarChart3 },
@@ -27,6 +27,18 @@ const navItems = [
 
 function runPlatform(row: Pick<ModelRun, "test_platform" | "provider">) {
   return row.test_platform || row.provider || "unknown";
+}
+
+function citationUrls(value?: string) {
+  if (!value) return "";
+  try {
+    const parsed = JSON.parse(value);
+    const items = Array.isArray(parsed) ? parsed : [];
+    const urls = items.map((item) => String(item?.url || item?.link || item?.uri || "").trim()).filter(Boolean);
+    return Array.from(new Set(urls)).join("; ");
+  } catch {
+    return "";
+  }
 }
 
 function isTerminalStatus(status?: string) {
@@ -807,7 +819,60 @@ function BatchTable({ batches }: { batches: Array<{ batch_id: string; status: st
 
 function RunsTable({ runs }: { runs: ModelRun[] }) {
   if (!runs.length) return <EmptyState title="暂无运行明细" />;
-  return <div className="data-table dense"><table><thead><tr><th>测试平台</th><th>状态</th><th>耗时</th><th>问题类型</th><th>回答摘要</th><th>时间</th></tr></thead><tbody>{runs.map((run) => <tr key={run.id}><td>{runPlatform(run)}</td><td>{run.status}</td><td>{run.latency_ms || 0} ms</td><td>{run.question_type || "-"}</td><td className="wide-cell">{(run.response_text || "").slice(0, 140)}</td><td>{formatDateTime(run.requested_at)}</td></tr>)}</tbody></table></div>;
+  return (
+    <div className="data-table dense run-detail-table">
+      <table>
+        <thead>
+          <tr>
+            <th>问题ID</th>
+            <th>问题内容</th>
+            <th>回答文本</th>
+            <th>引用来源</th>
+            <th>问题类型</th>
+            <th>产品类型</th>
+            <th>产品线</th>
+            <th>采购阶段</th>
+            <th>场景</th>
+            <th>优先级</th>
+            <th>建议测试平台</th>
+            <th>运行ID</th>
+            <th>批次ID</th>
+            <th>测试平台</th>
+            <th>联网搜索</th>
+            <th>生成时间</th>
+            <th>状态</th>
+            <th>耗时</th>
+            <th>错误信息</th>
+          </tr>
+        </thead>
+        <tbody>
+          {runs.map((run) => (
+            <tr key={run.id}>
+              <td>{run.source_question_id || "-"}</td>
+              <td className="question-content-cell">{run.question || "-"}</td>
+              <td className="answer-text-cell">{run.response_text || "-"}</td>
+              <td className="citation-source-cell">{citationUrls(run.citations_json) || "-"}</td>
+              <td>{run.question_type || "-"}</td>
+              <td>{run.product_category || "-"}</td>
+              <td>{run.product_line || "-"}</td>
+              <td>{run.purchase_stage || "-"}</td>
+              <td>{run.scenario || "-"}</td>
+              <td>{run.question_priority || "-"}</td>
+              <td>{run.suggested_platforms || "-"}</td>
+              <td>{run.run_id || "-"}</td>
+              <td>{run.batch_id || "-"}</td>
+              <td>{runPlatform(run)}</td>
+              <td>{run.search_enabled ? "是" : "否"}</td>
+              <td>{formatDateTime(run.requested_at)}</td>
+              <td>{run.status || "-"}</td>
+              <td>{run.latency_ms || 0} ms</td>
+              <td className="error-message-cell">{run.error_message || "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function ProgressBar({ batch }: { batch?: { total_count?: number; completed_count?: number; total?: number; completed?: number } }) {

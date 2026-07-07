@@ -103,6 +103,7 @@ export type ModelRun = {
   id: number;
   run_id?: string;
   batch_id?: string;
+  source_question_id?: string;
   provider?: string;
   model?: string;
   test_platform?: string;
@@ -117,6 +118,12 @@ export type ModelRun = {
   requested_at?: string;
   question?: string;
   question_type?: string;
+  product_category?: string;
+  product_line?: string;
+  purchase_stage?: string;
+  scenario?: string;
+  question_priority?: string;
+  suggested_platforms?: string;
   target_brand_mentioned?: boolean;
   recommendation_strength?: string;
   citations_json?: string;

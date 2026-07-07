@@ -1287,7 +1287,10 @@ def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = Non
 def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT r.*, q.question, q.question_type, e.target_brand_mentioned,
+        SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
+               q.product_category, q.product_line, q.purchase_stage, q.scenario,
+               q.priority AS question_priority, q.suggested_platforms,
+               e.target_brand_mentioned,
                e.target_brand_rank, e.recommendation_strength, e.competitors_mentioned,
                e.owned_site_cited, e.third_party_cited, e.risk_level
         FROM model_runs r
@@ -1418,7 +1421,10 @@ def insert_evaluation(conn: sqlite3.Connection, evaluation: dict[str, Any]) -> N
 def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT r.*, q.question, q.question_type, e.target_brand_mentioned,
+        SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
+               q.product_category, q.product_line, q.purchase_stage, q.scenario,
+               q.priority AS question_priority, q.suggested_platforms,
+               e.target_brand_mentioned,
                e.target_brand_rank, e.recommendation_strength, e.competitors_mentioned,
                e.owned_site_cited, e.third_party_cited, e.risk_level
         FROM model_runs r

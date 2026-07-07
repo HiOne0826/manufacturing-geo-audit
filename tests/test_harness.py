@@ -16,7 +16,7 @@ from pathlib import Path
 import app
 from src.adapters import AdapterError, call_configured_model, normalize_run_options, openai_compatible_request, openai_responses_request
 from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs
-from src.exporter import runs_to_excel_html
+from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
 
@@ -594,8 +594,15 @@ class HarnessHttpTests(unittest.TestCase):
                 {
                     "run_id": "run-test",
                     "batch_id": "batch-test",
+                    "source_question_id": "Q001",
                     "question": "测试问题",
                     "question_type": "品牌推荐",
+                    "product_category": "产品类型A",
+                    "product_line": "FDS",
+                    "purchase_stage": "认知阶段",
+                    "scenario": "汽车焊装/轻量化连接",
+                    "question_priority": "高",
+                    "suggested_platforms": "ChatGPT; DeepSeek",
                     "provider": "doubao",
                     "model": "doubao-seed-2-0-mini-260428",
                     "search_enabled": True,
@@ -613,15 +620,55 @@ class HarnessHttpTests(unittest.TestCase):
                     "third_party_cited": True,
                     "risk_level": "低",
                     "response_text": "回答内容",
+                    "citations_json": json.dumps([
+                        {"url": "https://example.com/a", "title": "A"},
+                        {"uri": "https://example.com/b", "title": "B"},
+                    ]),
                     "error_message": "",
                 }
             ]
         )
+        expected_order = ["问题ID", "问题内容", "回答文本", "引用来源", "问题类型", "产品类型", "产品线", "采购阶段", "场景", "优先级", "建议测试平台", "运行ID", "批次ID", "测试平台", "联网搜索", "生成时间", "状态", "耗时", "错误信息"]
+        self.assertLess(body.index("问题ID"), body.index("回答文本"))
+        self.assertLess(body.index("回答文本"), body.index("引用来源"))
+        self.assertLess(body.index("引用来源"), body.index("问题类型"))
+        self.assertLess(body.index("建议测试平台"), body.index("运行ID"))
+        for header in expected_order:
+            self.assertIn(header, body)
+        for value in ["Q001", "产品类型A", "FDS", "认知阶段", "汽车焊装/轻量化连接", "高", "ChatGPT; DeepSeek", "回答内容", "https://example.com/a; https://example.com/b"]:
+            self.assertIn(value, body)
         self.assertIn("测试平台", body)
         self.assertIn("豆包", body)
         self.assertNotIn("doubao-seed-2-0-mini-260428", body)
         for hidden_header in ["搜索策略", "思考模式", "推理强度", "思考预算", "重复次数", "推荐强度", "竞品共现", "官网引用", "第三方引用", "风险等级"]:
             self.assertNotIn(hidden_header, body)
+        csv_body = runs_to_csv([
+            {
+                "run_id": "run-test",
+                "batch_id": "batch-test",
+                "source_question_id": "Q001",
+                "question": "测试问题",
+                "response_text": "回答内容",
+                "citations_json": json.dumps([{"url": "https://example.com/a"}, {"url": "https://example.com/b"}]),
+                "question_type": "品牌推荐",
+                "product_category": "产品类型A",
+                "product_line": "FDS",
+                "purchase_stage": "认知阶段",
+                "scenario": "汽车焊装/轻量化连接",
+                "question_priority": "高",
+                "suggested_platforms": "ChatGPT; DeepSeek",
+                "provider": "doubao",
+                "model": "doubao-seed-2-0-mini-260428",
+                "search_enabled": True,
+                "requested_at": "2026-07-04T00:00:00+00:00",
+                "status": "success",
+                "latency_ms": 123,
+                "error_message": "",
+            }
+        ])
+        self.assertTrue(csv_body.splitlines()[0].startswith("问题ID,问题内容,回答文本,引用来源,问题类型,产品类型,产品线,采购阶段,场景,优先级,建议测试平台,运行ID"))
+        self.assertIn("回答内容", csv_body)
+        self.assertIn("https://example.com/a; https://example.com/b", csv_body)
 
         routed = runs_to_excel_html(
             [

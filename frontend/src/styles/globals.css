@@ -293,12 +293,42 @@ code, pre {
 .question-table td {
   vertical-align: top;
 }
+.run-detail-table table {
+  min-width: 1680px;
+}
+.run-detail-table th {
+  background: #17466d;
+  color: #fff;
+  white-space: nowrap;
+}
+.run-detail-table td {
+  vertical-align: top;
+}
 .question-content-cell {
   min-width: 320px;
   max-width: 520px;
   white-space: normal;
   overflow-wrap: anywhere;
   font-weight: 600;
+}
+.answer-text-cell {
+  min-width: 360px;
+  max-width: 640px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.citation-source-cell {
+  min-width: 300px;
+  max-width: 420px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.error-message-cell {
+  min-width: 220px;
+  max-width: 360px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .icon-button {
   width: 34px;
