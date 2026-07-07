@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import csv
+import io
 import json
 import os
+import re
 import threading
 import time
 import uuid
+import zipfile
 from base64 import b64decode
 from datetime import datetime
 from http import HTTPStatus
@@ -14,6 +18,7 @@ from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from xml.etree import ElementTree
 
 from src.adapters import PROVIDER_PRESETS, enrich_model_config, test_model_config
 from src.db import (
@@ -28,6 +33,7 @@ from src.db import (
     get_model_config,
     get_sampling_batch,
     get_conn,
+    import_question_content_rows,
     import_questions_csv,
     import_questions_rows,
     init_db,
@@ -742,8 +748,12 @@ class Handler(SimpleHTTPRequestHandler):
                 elif parsed.path == "/api/questions/import_rows":
                     rows = payload.get("rows", [])
                     if not rows and payload.get("file_base64"):
-                        rows = self.decode_csv_rows(payload["file_base64"])
+                        rows = self.decode_table_rows(payload["file_base64"], payload.get("file_name", ""))
                     count = import_questions_rows(conn, int(payload.get("project_id", 0)), rows)
+                    commit_json({"count": count})
+                elif parsed.path == "/api/questions/import_file":
+                    rows = self.decode_table_rows(payload.get("file_base64", ""), payload.get("file_name", ""))
+                    count = import_question_content_rows(conn, int(payload.get("project_id", 0)), rows)
                     commit_json({"count": count})
                 elif parsed.path == "/api/questions/update":
                     update_question(conn, payload)
@@ -905,9 +915,110 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as exc:
             self.json_response({"error": str(exc)}, 500)
 
-    def decode_csv_rows(self, file_base64: str):
-        raw = b64decode(file_base64.encode("utf-8")).decode("utf-8-sig")
-        return list(__import__("csv").DictReader(raw.splitlines()))
+    def decode_table_rows(self, file_base64: str, file_name: str = ""):
+        if not file_base64:
+            return []
+        raw = b64decode(file_base64.encode("utf-8"))
+        lower_name = file_name.lower()
+        if lower_name.endswith(".xlsx") or raw.startswith(b"PK\x03\x04"):
+            return parse_xlsx_rows(raw)
+        text = raw.decode("utf-8-sig")
+        first_line = next((line for line in text.splitlines() if line.strip()), "")
+        delimiter = "\t" if first_line.count("\t") > first_line.count(",") else ","
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",\t;")
+            delimiter = dialect.delimiter
+        except csv.Error:
+            pass
+        return list(csv.DictReader(text.splitlines(), delimiter=delimiter))
+
+
+def parse_xlsx_rows(raw: bytes) -> list[dict[str, str]]:
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        shared_strings = read_xlsx_shared_strings(archive)
+        sheet_path = first_xlsx_sheet_path(archive)
+        root = ElementTree.fromstring(archive.read(sheet_path))
+    table: list[list[str]] = []
+    for row in root.iter():
+        if local_name(row.tag) != "row":
+            continue
+        values: list[str] = []
+        for cell in row:
+            if local_name(cell.tag) != "c":
+                continue
+            cell_ref = cell.attrib.get("r", "")
+            column_index = xlsx_column_index(cell_ref)
+            while len(values) <= column_index:
+                values.append("")
+            values[column_index] = xlsx_cell_value(cell, shared_strings)
+        if any(value.strip() for value in values):
+            table.append(values)
+    if not table:
+        return []
+    header = [value.strip() for value in table[0]]
+    rows: list[dict[str, str]] = []
+    for values in table[1:]:
+        rows.append({header[index]: values[index].strip() for index in range(min(len(header), len(values))) if header[index]})
+    return rows
+
+
+def read_xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+    strings: list[str] = []
+    for item in root:
+        if local_name(item.tag) != "si":
+            continue
+        parts = [node.text or "" for node in item.iter() if local_name(node.tag) == "t"]
+        strings.append("".join(parts))
+    return strings
+
+
+def first_xlsx_sheet_path(archive: zipfile.ZipFile) -> str:
+    names = archive.namelist()
+    if "xl/workbook.xml" in names and "xl/_rels/workbook.xml.rels" in names:
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        first_sheet = next((node for node in workbook.iter() if local_name(node.tag) == "sheet"), None)
+        relation_id = first_sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") if first_sheet is not None else ""
+        rels = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        for relation in rels:
+            if relation.attrib.get("Id") == relation_id:
+                target = relation.attrib.get("Target", "")
+                normalized_target = target.lstrip("/")
+                return normalized_target if normalized_target.startswith("xl/") else f"xl/{normalized_target}"
+    sheet_names = sorted(name for name in names if re.match(r"xl/worksheets/sheet\d+\.xml$", name))
+    if not sheet_names:
+        raise ValueError("未找到 XLSX 工作表")
+    return sheet_names[0]
+
+
+def xlsx_cell_value(cell: ElementTree.Element, shared_strings: list[str]) -> str:
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.iter() if local_name(node.tag) == "t")
+    value_node = next((node for node in cell if local_name(node.tag) == "v"), None)
+    if value_node is None or value_node.text is None:
+        return ""
+    value = value_node.text
+    if cell_type == "s":
+        index = int(value)
+        return shared_strings[index] if 0 <= index < len(shared_strings) else ""
+    return value
+
+
+def xlsx_column_index(cell_ref: str) -> int:
+    letters = re.match(r"([A-Z]+)", cell_ref.upper())
+    if not letters:
+        return 0
+    value = 0
+    for char in letters.group(1):
+        value = value * 26 + ord(char) - ord("A") + 1
+    return value - 1
+
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def main():

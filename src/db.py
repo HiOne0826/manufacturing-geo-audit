@@ -15,6 +15,20 @@ from src.platforms import test_platform_name
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = Path(os.environ.get("GEO_AUDIT_DB_PATH", ROOT / "data" / "geo_audit.db"))
 POSTGRES_SCHEMA_PATH = ROOT / "deploy" / "postgres" / "schema.sql"
+QUESTION_CONTENT_KEYS = ("question", "问题", "问题内容", "问题文本", "question_content")
+
+
+def normalize_question_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {str(key).replace("\ufeff", "").strip(): value for key, value in row.items() if key is not None}
+
+
+def extract_question_content(row: dict[str, Any]) -> str:
+    normalized = normalize_question_row(row)
+    for key in QUESTION_CONTENT_KEYS:
+        value = normalized.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
 
 
 class PostgresConnection:
@@ -856,13 +870,8 @@ def seed_questions(conn: sqlite3.Connection, project_id: int) -> int:
 def _insert_question_row(
     conn: sqlite3.Connection, project: dict[str, Any], row: dict[str, Any], fallback_id: str
 ) -> None:
-    question = (
-        row.get("question")
-        or row.get("问题")
-        or row.get("问题内容")
-        or row.get("question_content")
-        or ""
-    ).strip()
+    row = normalize_question_row(row)
+    question = extract_question_content(row)
     if not question:
         return
     def pick(*keys, default=""):
@@ -884,7 +893,7 @@ def _insert_question_row(
             int(row.get("project_id") or project["id"]),
             pick("question_id", "问题ID", default=fallback_id),
             pick("industry", "行业", default="制造业"),
-            pick("product_category", "产品品类", default=project.get("product_category", "")),
+            pick("product_category", "产品品类", "产品类型", default=project.get("product_category", "")),
             pick("question_type", "问题类型", "问题来源", default="custom"),
             question,
             pick("question_source", "问题来源", default=""),
@@ -955,6 +964,19 @@ def import_questions_rows(conn: sqlite3.Connection, project_id: int, rows: list[
         raise ValueError("项目不存在")
     count = 0
     for idx, row in enumerate(rows, start=1):
+        _insert_question_row(conn, project, row, f"FILE{idx:03d}")
+        count += 1
+    return count
+
+
+def import_question_content_rows(conn: sqlite3.Connection, project_id: int, rows: list[dict[str, Any]]) -> int:
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    count = 0
+    for idx, row in enumerate(rows, start=1):
+        if not extract_question_content(row):
+            continue
         _insert_question_row(conn, project, row, f"FILE{idx:03d}")
         count += 1
     return count

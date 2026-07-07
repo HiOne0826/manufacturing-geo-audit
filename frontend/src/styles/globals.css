@@ -198,7 +198,7 @@ code, pre {
 }
 .question-workbench {
   display: grid;
-  grid-template-columns: minmax(360px, .9fr) minmax(420px, 1.1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   align-items: start;
 }
@@ -237,11 +237,15 @@ code, pre {
   min-height: 280px;
   line-height: 1.55;
 }
+.file-import input {
+  padding: 7px 10px;
+}
 .import-actions {
   display: flex;
   align-items: center;
   justify-content: flex-start;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .question-list {
   display: grid;
@@ -274,6 +278,27 @@ code, pre {
 .question-row span {
   color: var(--muted);
   font-size: 12px;
+}
+.question-table {
+  max-height: calc(100vh - 260px);
+}
+.question-table table {
+  min-width: 1120px;
+}
+.question-table th {
+  background: #17466d;
+  color: #fff;
+  white-space: nowrap;
+}
+.question-table td {
+  vertical-align: top;
+}
+.question-content-cell {
+  min-width: 320px;
+  max-width: 520px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-weight: 600;
 }
 .icon-button {
   width: 34px;
@@ -372,6 +397,14 @@ td span { display: block; color: var(--muted); margin-top: 3px; }
   border-radius: 8px;
   background: #fdecec;
   color: var(--danger);
+  font-size: 13px;
+}
+.success-box {
+  padding: 12px;
+  border: 1px solid #a8dcc8;
+  border-radius: 8px;
+  background: #eaf8f2;
+  color: var(--success);
   font-size: 13px;
 }
 .key-ok, .key-missing {

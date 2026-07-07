@@ -657,6 +657,8 @@ def resolve_provider_runtime_config(provider: str, api_key: str, api_base: str, 
 
 
 def resolve_openrouter_direct_fallback(provider: str) -> tuple[str, str, str, str] | None:
+    if os.getenv("OPENROUTER_DIRECT_FALLBACK") != "1":
+        return None
     if provider == "openrouter_gpt":
         direct_key = resolve_provider_api_key("openai")
         if direct_key:

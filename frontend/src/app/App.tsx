@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { BarChart3, Boxes, FileDown, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
+import { BarChart3, Boxes, FileDown, FileSpreadsheet, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
 import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
@@ -73,7 +73,7 @@ function Shell() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <BrandBlock subtitle="制造业 GEO 审计系统" />
+        <BrandBlock subtitle="B2B GEO 测试平台" />
         <nav>{navItems.map((item) => <NavLink key={item.to} to={item.to} end={item.to === "/"}><item.icon size={17} />{item.label}</NavLink>)}</nav>
       </aside>
       <section className="workspace">
@@ -176,15 +176,29 @@ function QuestionsPage() {
   const { projectId } = useSelectionStore();
   const questions = useQuery({ queryKey: ["questions", projectId], queryFn: () => questionsApi.list(projectId), enabled: Boolean(projectId) });
   const [csvText, setCsvText] = useState("");
-  const parsedLineCount = csvText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
-  const importText = useMutation({
-    mutationFn: () => questionsApi.importText(projectId!, csvText),
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const parsedQuestions = useMemo(() => extractQuestionContents(csvText), [csvText]);
+  const parsedQuestionRows = useMemo(() => extractQuestionRows(csvText), [csvText]);
+  const pendingImportLabel = selectedFile ? "文件" : parsedQuestions.length;
+  const importPaste = useMutation({
+    mutationFn: () => parsedQuestionRows.length ? questionsApi.importRows(projectId!, parsedQuestionRows) : questionsApi.importText(projectId!, parsedQuestions.join("\n")),
     onSuccess: () => {
       setCsvText("");
       queryClient.invalidateQueries({ queryKey: ["questions", projectId] });
     }
   });
+  const importFile = useMutation({
+    mutationFn: async () => {
+      if (!selectedFile) return { count: 0 };
+      return questionsApi.importFile(projectId!, selectedFile.name, await fileToBase64(selectedFile));
+    },
+    onSuccess: () => {
+      setSelectedFile(null);
+      queryClient.invalidateQueries({ queryKey: ["questions", projectId] });
+    }
+  });
   const remove = useMutation({ mutationFn: questionsApi.remove, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["questions", projectId] }) });
+  const importing = importPaste.isPending || importFile.isPending;
   return (
     <main className="page">
       <PageTitle title="问题库" description="导入、查看和维护当前项目的采样问题。" />
@@ -193,47 +207,176 @@ function QuestionsPage() {
           <div className="question-import">
             <div className="import-summary">
               <Metric label="当前问题" value={questions.data?.questions.length || 0} />
-              <Metric label="待导入" value={parsedLineCount} hint="按行识别" />
+              <Metric label="待导入" value={pendingImportLabel} hint={selectedFile ? selectedFile.name : "采样只使用问题内容"} />
             </div>
             <label>
-              粘贴问题
+              粘贴问题或表格
               <textarea
                 className="question-textarea"
-                placeholder={"每行一个问题，或粘贴带表头的 CSV。示例：\nSCA 涂胶系统有哪些国产替代品牌？\n汽车制造涂胶系统选择 SCA 还是国产厂商？"}
+                placeholder={"每行一个问题，或粘贴带表头的 CSV/TSV。带表头时会保留问题类型、产品线、采购阶段、场景、优先级等字段；采样只使用问题内容。\n\n问题ID,问题内容,回答文本,问题类型,产品线,采购阶段,场景,优先级,建议测试平台\nQ001,汽车白车身多材料连接有哪些推荐品牌？,,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,ChatGPT"}
                 value={csvText}
                 onChange={(event) => setCsvText(event.target.value)}
               />
             </label>
+            <label className="file-import">
+              <span>表格文件</span>
+              <input
+                type="file"
+                accept=".xlsx,.csv,.tsv,.txt,text/csv,text/tab-separated-values,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
+              />
+            </label>
             <div className="import-actions">
-              <button disabled={!projectId || !parsedLineCount || importText.isPending} onClick={() => importText.mutate()}><Upload size={15} />{importText.isPending ? "正在导入" : "导入问题"}</button>
-              <button className="ghost" type="button" disabled={!csvText || importText.isPending} onClick={() => setCsvText("")}>清空</button>
+              <button disabled={!projectId || !parsedQuestions.length || importing} onClick={() => importPaste.mutate()}><Upload size={15} />{importPaste.isPending ? "正在导入" : "导入粘贴内容"}</button>
+              <button className="ghost" type="button" disabled={!projectId || !selectedFile || importing} onClick={() => importFile.mutate()}><FileSpreadsheet size={15} />{importFile.isPending ? "正在导入" : "导入文件"}</button>
+              <button className="ghost" type="button" disabled={(!csvText && !selectedFile) || importing} onClick={() => { setCsvText(""); setSelectedFile(null); }}>清空</button>
             </div>
-            {importText.error ? <div className="error-box">{importText.error.message}</div> : null}
+            {importPaste.data ? <div className="success-box">已导入 {importPaste.data.count} 个问题</div> : null}
+            {importFile.data ? <div className="success-box">已导入 {importFile.data.count} 个问题</div> : null}
+            {importPaste.error ? <div className="error-box">{importPaste.error.message}</div> : null}
+            {importFile.error ? <div className="error-box">{importFile.error.message}</div> : null}
           </div>
         </Panel>
-        <Panel title={`问题列表 ${questions.data?.questions.length || 0}`}>
-          <QuestionTable questions={questions.data?.questions || []} onDelete={(id) => remove.mutate(id)} deletingId={remove.variables} />
-        </Panel>
       </section>
+      <Panel title={`问题列表 ${questions.data?.questions.length || 0}`}>
+        <QuestionTable questions={questions.data?.questions || []} onDelete={(id) => remove.mutate(id)} deletingId={remove.variables} />
+      </Panel>
     </main>
   );
+}
+
+const questionContentHeaders = new Set(["question", "问题", "问题内容", "问题文本", "question_content"]);
+
+function extractQuestionContents(text: string) {
+  const structuredRows = extractQuestionRows(text);
+  if (structuredRows.length) return structuredRows.map((row) => questionValue(row)).filter(Boolean);
+  const fallbackLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const firstLine = fallbackLines[0] || "";
+  const delimiter = firstLine.includes("\t") ? "\t" : firstLine.includes(",") ? "," : "";
+  if (!delimiter) return fallbackLines;
+  const rows = parseDelimitedRows(text, delimiter);
+  if (rows.length < 2) return fallbackLines;
+  const questionIndex = rows[0].findIndex((cell) => questionContentHeaders.has(normalizeHeader(cell)));
+  if (questionIndex < 0) return fallbackLines;
+  return rows.slice(1).map((row) => (row[questionIndex] || "").trim()).filter(Boolean);
+}
+
+function extractQuestionRows(text: string): Record<string, string>[] {
+  const fallbackLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const firstLine = fallbackLines[0] || "";
+  const delimiter = firstLine.includes("\t") ? "\t" : firstLine.includes(",") ? "," : "";
+  if (!delimiter) return [];
+  const table = parseDelimitedRows(text, delimiter);
+  if (table.length < 2) return [];
+  const headers = table[0].map((cell) => cell.replace(/^\ufeff/, "").trim());
+  const questionIndex = headers.findIndex((cell) => questionContentHeaders.has(normalizeHeader(cell)));
+  if (questionIndex < 0) return [];
+  return table.slice(1).map((cells) => {
+    const row: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      if (header) row[header] = (cells[index] || "").trim();
+    });
+    return row;
+  }).filter((row) => questionValue(row));
+}
+
+function questionValue(row: Record<string, string>) {
+  for (const [key, value] of Object.entries(row)) {
+    if (questionContentHeaders.has(normalizeHeader(key)) && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function normalizeHeader(value: string) {
+  return value.replace(/^\ufeff/, "").trim().toLowerCase();
+}
+
+function parseDelimitedRows(text: string, delimiter: string) {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === "\"") {
+      if (quoted && next === "\"") {
+        cell += "\"";
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (char === delimiter && !quoted) {
+      row.push(cell);
+      cell = "";
+      continue;
+    }
+    if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && next === "\n") index += 1;
+      row.push(cell);
+      if (row.some((value) => value.trim())) rows.push(row);
+      row = [];
+      cell = "";
+      continue;
+    }
+    cell += char;
+  }
+  row.push(cell);
+  if (row.some((value) => value.trim())) rows.push(row);
+  return rows;
+}
+
+function fileToBase64(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.readAsDataURL(file);
+  });
 }
 
 function QuestionTable({ questions, onDelete, deletingId }: { questions: Question[]; onDelete: (id: number) => void; deletingId?: number }) {
   if (!questions.length) return <EmptyState title="当前项目还没有问题" />;
   return (
-    <div className="question-list">
-      {questions.map((q) => (
-        <article className="question-row" key={q.id}>
-          <div>
-            <strong>{q.question}</strong>
-            <span>{q.question_type || "未分类"} · {q.purchase_stage || "未标注阶段"} · {q.priority || "普通优先级"}</span>
-          </div>
-          <button className="icon-button danger" type="button" disabled={deletingId === q.id} aria-label="删除问题" title="删除问题" onClick={() => onDelete(q.id)}>
-            <Trash2 size={15} />
-          </button>
-        </article>
-      ))}
+    <div className="data-table question-table">
+      <table>
+        <thead>
+          <tr>
+            <th>问题ID</th>
+            <th>问题内容</th>
+            <th>回答文本</th>
+            <th>问题类型</th>
+            <th>产品线</th>
+            <th>采购阶段</th>
+            <th>场景</th>
+            <th>优先级</th>
+            <th>建议测试平台</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {questions.map((q) => (
+            <tr key={q.id}>
+              <td>{q.question_id || "-"}</td>
+              <td className="question-content-cell">{q.question}</td>
+              <td>-</td>
+              <td>{q.question_type || "-"}</td>
+              <td>{q.product_line || q.product_category || "-"}</td>
+              <td>{q.purchase_stage || "-"}</td>
+              <td>{q.scenario || "-"}</td>
+              <td>{q.priority || "-"}</td>
+              <td>{q.suggested_platforms || "-"}</td>
+              <td>
+                <button className="icon-button danger" type="button" disabled={deletingId === q.id} aria-label="删除问题" title="删除问题" onClick={() => onDelete(q.id)}>
+                  <Trash2 size={15} />
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

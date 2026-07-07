@@ -7,6 +7,19 @@ import html
 from src.platforms import test_platform_name
 
 
+EXPORT_PLATFORM_NAMES = {
+    "openrouter_gpt": "OpenRouter-GPT",
+    "openrouter_gemini": "OpenRouter-Gemini",
+}
+
+
+def export_test_platform_name(row: dict) -> str:
+    provider = str(row.get("provider") or "").strip().lower()
+    if provider in EXPORT_PLATFORM_NAMES:
+        return EXPORT_PLATFORM_NAMES[provider]
+    return row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model"))
+
+
 def runs_to_csv(rows: list[dict]) -> str:
     output = io.StringIO()
     fieldnames = [
@@ -126,7 +139,7 @@ def runs_to_excel_html(rows: list[dict]) -> str:
             row.get("batch_id", ""),
             row.get("question", ""),
             row.get("question_type", ""),
-            row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model")),
+            export_test_platform_name(row),
             "是" if row.get("search_enabled") else "否",
             row.get("requested_at", ""),
             row.get("status", ""),

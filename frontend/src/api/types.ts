@@ -14,8 +14,10 @@ export type Project = {
 export type Question = {
   id: number;
   project_id: number;
+  question_id?: string;
   question: string;
   question_type: string;
+  product_category?: string;
   product_line?: string;
   purchase_stage?: string;
   scenario?: string;

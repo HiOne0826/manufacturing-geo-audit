@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import app
 from src.adapters import AdapterError, call_configured_model, normalize_run_options, openai_compatible_request, openai_responses_request
-from src.db import create_model_config, create_project, get_conn, import_questions_rows, init_db, list_failed_runs_by_batch, list_runs
+from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs
 from src.exporter import runs_to_excel_html
 from src.runner import provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
@@ -318,6 +319,34 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertTrue(openrouter_gemini["supports_search"])
         self.assertIn("web plugin", openrouter_gpt["web_search_mode"])
 
+    def test_question_file_import_only_uses_question_content_column(self):
+        project_id, _ = self.create_mock_project(question_count=0)
+        csv_text = "\n".join(
+            [
+                "问题ID,问题内容 ,回答文本,问题类型,产品线,采购阶段,场景,优先级,建议测试平台",
+                "Q001,汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？,这段回答不应导入,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,ChatGPT",
+                "Q002,新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？,这段回答也不应导入,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,DeepSeek",
+            ]
+        )
+        imported = self.request_json(
+            "POST",
+            "/api/questions/import_file",
+            {
+                "project_id": project_id,
+                "file_name": "questions.csv",
+                "file_base64": base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii"),
+            },
+        )
+        self.assertEqual(imported["count"], 2)
+        questions = self.request_json("GET", f"/api/questions?project_id={project_id}")["questions"]
+        raw = json.dumps(questions, ensure_ascii=False)
+        self.assertIn("汽车白车身多材料连接", raw)
+        self.assertIn("新能源电池 PACK 装配", raw)
+        self.assertNotIn("这段回答不应导入", raw)
+        self.assertTrue(all(item["question_type"] == "品牌推荐" for item in questions))
+        self.assertTrue(all(item["product_line"] == "FDS" for item in questions))
+        self.assertIn("ChatGPT", raw)
+
     def test_openai_model_settings_match_hosted_web_search(self):
         self.create_mock_project()
         models = self.request_json("GET", "/api/models")["models"]
@@ -477,7 +506,12 @@ class HarnessHttpTests(unittest.TestCase):
     def test_openrouter_gpt_wrapper_uses_direct_openai_fallback_when_key_exists(self):
         with mock.patch.dict(
             os.environ,
-            {"ALLOW_LIVE_MODEL_CALLS": "1", "OPENAI_API_KEY": "openai-direct-key", "OPENROUTER_GPT_FALLBACK_MODEL": "gpt-4.1-mini"},
+            {
+                "ALLOW_LIVE_MODEL_CALLS": "1",
+                "OPENROUTER_DIRECT_FALLBACK": "1",
+                "OPENAI_API_KEY": "openai-direct-key",
+                "OPENROUTER_GPT_FALLBACK_MODEL": "gpt-4.1-mini",
+            },
         ), mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {"output_text": "ok", "output": []}
             result = call_configured_model(
@@ -498,10 +532,43 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(result["provider"], "openrouter_gpt")
         self.assertEqual(result["model"], "gpt-4.1-mini")
 
+    def test_openrouter_wrapper_prefers_openrouter_key_by_default(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ALLOW_LIVE_MODEL_CALLS": "1",
+                "OPENROUTER_API_KEY": "openrouter-key",
+                "OPENAI_API_KEY": "openai-direct-key",
+            },
+            clear=False,
+        ), mock.patch("src.adapters.post_json") as post_json:
+            os.environ.pop("OPENROUTER_DIRECT_FALLBACK", None)
+            post_json.return_value = {"model": "openai/gpt-5.2", "choices": [{"message": {"content": "ok"}}]}
+            result = call_configured_model(
+                {
+                    "provider": "openrouter_gpt",
+                    "api_base": "https://openrouter.ai/api/v1",
+                    "model": "openai/gpt-5.2",
+                },
+                "测试问题",
+                True,
+                1,
+                {"search_mode": "auto", "thinking_type": "disabled"},
+            )
+
+        self.assertEqual(post_json.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openrouter-key")
+        self.assertEqual(result["provider"], "openrouter_gpt")
+
     def test_openrouter_gemini_wrapper_uses_direct_gemini_fallback_when_key_exists(self):
         with mock.patch.dict(
             os.environ,
-            {"ALLOW_LIVE_MODEL_CALLS": "1", "GEMINI_API_KEY": "gemini-direct-key", "OPENROUTER_GEMINI_FALLBACK_MODEL": "gemini-2.5-flash"},
+            {
+                "ALLOW_LIVE_MODEL_CALLS": "1",
+                "OPENROUTER_DIRECT_FALLBACK": "1",
+                "GEMINI_API_KEY": "gemini-direct-key",
+                "OPENROUTER_GEMINI_FALLBACK_MODEL": "gemini-2.5-flash",
+            },
         ), mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "modelVersion": "gemini-2.5-flash"}
             result = call_configured_model(
@@ -588,10 +655,10 @@ class HarnessHttpTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertIn("ChatGPT", routed)
-        self.assertIn("Gemini", routed)
-        self.assertNotIn("OpenRouter-GPT", routed)
-        self.assertNotIn("OpenRouter-Gemini", routed)
+        self.assertIn("OpenRouter-GPT", routed)
+        self.assertIn("OpenRouter-Gemini", routed)
+        self.assertNotIn("openai/gpt-5.2", routed)
+        self.assertNotIn("google/gemini-2.5-flash", routed)
 
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
@@ -753,6 +820,48 @@ class HarnessHttpTests(unittest.TestCase):
 
 
 class HarnessDirectTests(unittest.TestCase):
+    def test_import_question_content_rows_ignores_other_table_columns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "questions.db"
+            init_db(db_path)
+            with get_conn(db_path) as conn:
+                project_id = create_project(
+                    conn,
+                    {
+                        "client_name": "测试客户",
+                        "brand_name": "测试品牌",
+                        "product_category": "测试品类",
+                        "competitors": "竞品A;竞品B",
+                    },
+                )
+                rows = [
+                    {
+                        "问题ID": "Q001",
+                        "问题内容 ": "汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？",
+                        "回答文本": "这段回答不应导入",
+                        "问题类型": "品牌推荐",
+                        "产品线": "FDS",
+                        "建议测试平台": "ChatGPT",
+                    },
+                    {
+                        "问题ID": "Q002",
+                        "问题内容 ": "新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？",
+                        "回答文本": "这段回答也不应导入",
+                        "问题类型": "品牌推荐",
+                        "产品线": "FDS",
+                        "建议测试平台": "DeepSeek",
+                    },
+                ]
+                self.assertEqual(import_question_content_rows(conn, project_id, rows), 2)
+                questions = list_questions(conn, project_id)
+        raw = json.dumps(questions, ensure_ascii=False)
+        self.assertIn("汽车白车身多材料连接", raw)
+        self.assertIn("新能源电池 PACK 装配", raw)
+        self.assertNotIn("这段回答不应导入", raw)
+        self.assertTrue(all(item["question_type"] == "品牌推荐" for item in questions))
+        self.assertTrue(all(item["product_line"] == "FDS" for item in questions))
+        self.assertIn("DeepSeek", raw)
+
     def test_provider_concurrency_limits_use_shared_source_groups(self):
         old_limits = os.environ.get("SAMPLING_PROVIDER_CONCURRENCY_LIMITS")
         try:
