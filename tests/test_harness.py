@@ -489,6 +489,50 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertIn("Network is unreachable", str(ctx.exception))
         post_json.assert_not_called()
 
+    def test_qwen_search_uses_brave_external_context_for_urls(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "force",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test-key"}), \
+             mock.patch("src.adapters.get_json") as get_json, \
+             mock.patch("src.adapters.post_json") as post_json:
+            get_json.return_value = {
+                "web": {
+                    "results": [
+                        {
+                            "title": "OpenRouter Web Search",
+                            "url": "https://openrouter.ai/docs/guides/features/plugins/web-search",
+                            "description": "OpenRouter web search plugin documentation.",
+                        }
+                    ]
+                }
+            }
+            post_json.return_value = {
+                "model": "qwen-plus",
+                "choices": [{"message": {"content": "根据资料，OpenRouter Web Search 支持多个 engine。[1]"}}],
+            }
+            result = openai_compatible_request(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen-test-key",
+                "qwen-plus",
+                "OpenRouter Web Search 支持哪些 engine？",
+                0.1,
+                "qwen",
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        self.assertIn("Brave Search 返回的公开网页检索结果", payload["messages"][1]["content"])
+        self.assertEqual(
+            result["citations"],
+            [{"url": "https://openrouter.ai/docs/guides/features/plugins/web-search", "title": "OpenRouter Web Search"}],
+        )
+        self.assertIn("brave_results", result["raw_response"])
+
     def test_openrouter_online_payload_uses_web_plugin_and_citations(self):
         options = normalize_run_options(
             {
@@ -1013,8 +1057,9 @@ class HarnessDirectTests(unittest.TestCase):
             self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 4)
             self.assertEqual(provider_concurrency_limit("deepseek"), 1)
             self.assertEqual(provider_concurrency_limit("doubao"), 2)
-            self.assertEqual(provider_concurrency_limit("qwen"), 2)
+            self.assertEqual(provider_concurrency_limit("qwen"), 1)
             self.assertEqual(provider_concurrency_limit("hunyuan"), 2)
+            self.assertEqual(provider_concurrency_limit("ernie"), 1)
             self.assertEqual(provider_concurrency_limit("mock"), 16)
 
             os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = "openrouter=1,deepseek=2"

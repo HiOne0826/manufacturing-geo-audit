@@ -33,10 +33,10 @@ DEFAULT_PROVIDER_CONCURRENCY_LIMITS = {
     "openrouter": 4,
     "deepseek": 1,
     "doubao": 2,
-    "qwen": 2,
+    "qwen": 1,
     "hunyuan": 2,
     "kimi": 2,
-    "ernie": 2,
+    "ernie": 1,
     "minimax": 2,
     "mock": 16,
 }

@@ -19,6 +19,7 @@ class AdapterError(RuntimeError):
 
 
 OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
+BRAVE_AUGMENTED_PROVIDERS = {"deepseek", "qwen", "ernie"}
 
 PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "openai": {
@@ -801,7 +802,7 @@ def brave_search_request(question: str, options: dict[str, Any]) -> dict[str, An
     )
     results = extract_brave_results(data, limit=count)
     if not results:
-        raise AdapterError("Brave Search 未返回可用网页结果，无法执行 DeepSeek 联网口径。")
+        raise AdapterError("Brave Search 未返回可用网页结果，无法执行联网搜索口径。")
     return {"raw_response": data, "results": results}
 
 
@@ -1030,14 +1031,15 @@ def openai_compatible_request(
     brave_payload: dict[str, Any] | None = None
     external_citations: list[dict[str, str]] = []
     request_question = question
-    if provider == "deepseek" and options["search_enabled"]:
+    if provider in BRAVE_AUGMENTED_PROVIDERS and options["search_enabled"]:
         try:
             brave_payload = brave_search_request(question, options)
             brave_results = brave_payload["results"]
             external_citations = brave_citations(brave_results)
             request_question = build_brave_augmented_question(question, brave_results)
         except AdapterError as exc:
-            raise AdapterError(f"DeepSeek 联网口径依赖 Brave Search 失败：{exc}") from exc
+            label = {"deepseek": "DeepSeek", "qwen": "通义千问", "ernie": "文心一言"}.get(provider, provider)
+            raise AdapterError(f"{label} 联网口径依赖 Brave Search 失败：{exc}") from exc
     payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
     data = post_json(
         f"{normalize_base(base)}/chat/completions",
@@ -1057,7 +1059,7 @@ def openai_compatible_request(
     raw_response: dict[str, Any] = data
     if brave_payload is not None:
         raw_response = {
-            "deepseek_response": data,
+            f"{provider}_response": data,
             "brave_search": brave_payload["raw_response"],
             "brave_results": brave_payload["results"],
         }
