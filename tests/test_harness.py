@@ -532,6 +532,7 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(post_json.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openrouter-test-key")
         payload = post_json.call_args.args[2]
+        self.assertEqual(payload["max_tokens"], 4096)
         self.assertEqual(payload["plugins"], [{"id": "web", "max_results": 3, "engine": "native", "include_domains": ["example.com", "industry.example"]}])
         self.assertEqual(result["citations"], [{"url": "https://example.com/source", "title": "Source Title"}])
 
@@ -1010,7 +1011,7 @@ class HarnessDirectTests(unittest.TestCase):
             self.assertEqual(provider_concurrency_group("openrouter_gemini"), "openrouter")
             self.assertEqual(provider_concurrency_limit("openrouter_gpt"), 4)
             self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 4)
-            self.assertEqual(provider_concurrency_limit("deepseek"), 2)
+            self.assertEqual(provider_concurrency_limit("deepseek"), 1)
             self.assertEqual(provider_concurrency_limit("doubao"), 2)
             self.assertEqual(provider_concurrency_limit("qwen"), 2)
             self.assertEqual(provider_concurrency_limit("hunyuan"), 2)

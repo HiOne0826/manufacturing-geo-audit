@@ -31,7 +31,7 @@ DEFAULT_PROVIDER_CONCURRENCY_LIMITS = {
     "openai": 2,
     "gemini": 2,
     "openrouter": 4,
-    "deepseek": 2,
+    "deepseek": 1,
     "doubao": 2,
     "qwen": 2,
     "hunyuan": 2,

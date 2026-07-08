@@ -970,6 +970,7 @@ def build_openrouter_chat_payload(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
+    payload["max_tokens"] = 4096
     if options["search_enabled"]:
         plugin: dict[str, Any] = {"id": "web"}
         if options.get("search_limit"):
