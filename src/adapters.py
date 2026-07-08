@@ -50,7 +50,8 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "hunyuan": {
         "temperature": 0,
         "reasoning_effort": "",
-        "defaults_note": "腾讯混元：确定性审计默认 temperature=0；官方限制 temperature <= 2。",
+        "search_mode": "force",
+        "defaults_note": "腾讯元宝：确定性审计默认 temperature=0；联网搜索默认强制启用搜索增强并返回 search_info/citation。",
     },
     "kimi": {
         "temperature": 0.6,
@@ -70,12 +71,14 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "openrouter_gpt": {
         "temperature": 1,
         "reasoning_effort": "",
-        "defaults_note": "OpenRouter-GPT：通过 OpenRouter web plugin / native search 形成联网口径。",
+        "search_strategy": "exa",
+        "defaults_note": "OpenRouter-GPT：联网搜索默认使用 OpenRouter web plugin 的 Exa 引擎，提升引用链接稳定性。",
     },
     "openrouter_gemini": {
         "temperature": 1,
         "reasoning_effort": "",
-        "defaults_note": "OpenRouter-Gemini：通过 OpenRouter web plugin / native search 形成联网口径。",
+        "search_strategy": "exa",
+        "defaults_note": "OpenRouter-Gemini：联网搜索默认使用 OpenRouter web plugin 的 Exa 引擎，提升引用链接稳定性。",
     },
 }
 
@@ -224,7 +227,7 @@ PROVIDER_PRESETS = {
         "supports_time_filter": False,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "OpenRouter 中转 GPT 联网口径；联网使用 web plugin，OpenAI/Google 等模型默认优先 native search，否则回退搜索引擎。不是 OpenAI 官方直连接口。",
+        "notes": "OpenRouter 中转 GPT 联网口径；联网使用 web plugin，默认搜索引擎为 Exa。不是 OpenAI 官方直连接口。",
     },
     "openrouter_gemini": {
         "label": "OpenRouter-Gemini",
@@ -247,7 +250,7 @@ PROVIDER_PRESETS = {
         "supports_time_filter": False,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "OpenRouter 中转 Gemini 联网口径；联网使用 web plugin，Google 模型默认优先 native search。不是 Google Gemini 官方直连接口。",
+        "notes": "OpenRouter 中转 Gemini 联网口径；联网使用 web plugin，默认搜索引擎为 Exa。不是 Google Gemini 官方直连接口。",
     },
     "qwen": {
         "label": "通义千问",
@@ -273,7 +276,7 @@ PROVIDER_PRESETS = {
         "notes": "联网搜索按阿里云百炼文档走 enable_search=true，可配 search_options；引用优先从 search_info.search_results 提取。",
     },
     "hunyuan": {
-        "label": "腾讯混元",
+        "label": "腾讯元宝",
         "provider": "hunyuan",
         "api_family": "腾讯混元 / TokenHub",
         "model": "hunyuan-turbos-latest",
@@ -283,7 +286,7 @@ PROVIDER_PRESETS = {
         "supports_pure": True,
         "supports_search": True,
         "web_search_mode": "搜索增强 / 强制搜索增强",
-        "web_search_param_path": "enable_enhancement / force_search_enhancement",
+        "web_search_param_path": "enable_enhancement=true; force_search_enhancement=true; search_info=true; citation=true",
         "supports_reasoning": True,
         "reasoning_param_path": "按模型能力控制，当前预置仅记录能力",
         "reasoning_levels": "按模型能力",
@@ -293,7 +296,7 @@ PROVIDER_PRESETS = {
         "supports_time_filter": True,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "腾讯混元 OpenAI 兼容接口；联网搜索主要用 enable_enhancement / force_search_enhancement / search_info / citation。",
+        "notes": "腾讯元宝数据源基于腾讯混元 OpenAI 兼容接口；联网默认强制启用搜索增强，并要求返回 search_info 与 citation。",
     },
     "kimi": {
         "label": "Kimi",
@@ -305,8 +308,8 @@ PROVIDER_PRESETS = {
         "api_base": "https://api.moonshot.cn/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "官方 Web Search 工具",
-        "web_search_param_path": "tools[].type=web_search",
+        "web_search_mode": "官方 builtin_function.$web_search 工具",
+        "web_search_param_path": "tools[].type=builtin_function; tools[].function.name=$web_search; thinking.type=disabled",
         "supports_reasoning": True,
         "reasoning_param_path": "thinking.type",
         "reasoning_levels": "disabled;enabled",
@@ -1027,10 +1030,13 @@ def openai_compatible_request(
     external_citations: list[dict[str, str]] = []
     request_question = question
     if provider == "deepseek" and options["search_enabled"]:
-        brave_payload = brave_search_request(question, options)
-        brave_results = brave_payload["results"]
-        external_citations = brave_citations(brave_results)
-        request_question = build_brave_augmented_question(question, brave_results)
+        try:
+            brave_payload = brave_search_request(question, options)
+            brave_results = brave_payload["results"]
+            external_citations = brave_citations(brave_results)
+            request_question = build_brave_augmented_question(question, brave_results)
+        except AdapterError as exc:
+            raise AdapterError(f"DeepSeek 联网口径依赖 Brave Search 失败：{exc}") from exc
     payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
     data = post_json(
         f"{normalize_base(base)}/chat/completions",

@@ -7,7 +7,7 @@ TEST_PLATFORM_NAMES = {
     "gemini": "Gemini",
     "doubao": "豆包",
     "qwen": "千问",
-    "hunyuan": "元宝",
+    "hunyuan": "腾讯元宝",
     "openrouter_gpt": "ChatGPT",
     "openrouter_gemini": "Gemini",
 }

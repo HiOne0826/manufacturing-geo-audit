@@ -720,6 +720,38 @@ function renderSamplingModels() {
                 <p class="sampling-inline-help">对应阿里云百炼 <code>enable_search=true</code> 和 <code>search_options</code>。如果模型未开通联网能力，接口会直接返回错误。</p>
               </div>
             `
+          : ["openrouter_gpt", "openrouter_gemini"].includes(row.provider)
+            ? `
+              <div class="sampling-runtime-block sampling-search-detail">
+                <div class="sampling-runtime-title">OpenRouter 联网搜索配置</div>
+                <div class="sampling-runtime-grid">
+                  <label class="sampling-subfield">
+                    <span>搜索引擎</span>
+                    <select data-sampling-field="search_strategy" data-model-config-id="${row.id}">
+                      <option value=""${!draft.search_strategy ? " selected" : ""}>默认</option>
+                      <option value="exa"${draft.search_strategy === "exa" ? " selected" : ""}>exa</option>
+                      <option value="native"${draft.search_strategy === "native" ? " selected" : ""}>native</option>
+                      <option value="parallel"${draft.search_strategy === "parallel" ? " selected" : ""}>parallel</option>
+                      <option value="perplexity"${draft.search_strategy === "perplexity" ? " selected" : ""}>perplexity</option>
+                      <option value="firecrawl"${draft.search_strategy === "firecrawl" ? " selected" : ""}>firecrawl</option>
+                    </select>
+                  </label>
+                  <label class="sampling-subfield">
+                    <span>结果条数</span>
+                    <input
+                      data-sampling-field="search_limit"
+                      data-model-config-id="${row.id}"
+                      type="number"
+                      min="1"
+                      max="10"
+                      value="${escapeHtml(draft.search_limit || "")}"
+                      placeholder="默认 5"
+                    />
+                  </label>
+                </div>
+                <p class="sampling-inline-help">默认使用 <code>exa</code>，比 native 自动搜索更稳定地产生引用链接。</p>
+              </div>
+            `
           : `
               <div class="sampling-runtime-block sampling-search-detail">
                 <div class="sampling-runtime-title">联网搜索详细配置</div>
@@ -1648,7 +1680,7 @@ document.getElementById("startRunBtn").addEventListener("click", async () => {
         search_enabled: Boolean(search?.checked),
         thinking_enabled: Boolean(reasoning?.checked),
         thinking_type: reasoning?.checked ? "enabled" : "disabled",
-        search_mode: search?.checked ? "auto" : "off",
+        search_mode: search?.checked ? String(defaults.search_mode || "auto").trim() : "off",
         temperature: temperature === "" ? null : Number(temperature),
         reasoning_effort: String(draft.reasoning_effort || defaults.reasoning_effort || "").trim(),
         thinking_budget: thinkingBudgetRaw === "" ? null : Number(thinkingBudgetRaw),

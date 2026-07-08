@@ -14,10 +14,10 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
-from src.adapters import AdapterError, call_configured_model, normalize_run_options, openai_compatible_request, openai_responses_request
+from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_run_options, openai_compatible_request, openai_responses_request
 from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs
 from src.exporter import runs_to_csv, runs_to_excel_html
-from src.runner import provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
+from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -307,14 +307,21 @@ class HarnessHttpTests(unittest.TestCase):
         models = self.request_json("GET", "/api/models")["models"]
         kimi = next(item for item in models if item["provider"] == "kimi")
         deepseek = next(item for item in models if item["provider"] == "deepseek")
+        hunyuan = next(item for item in models if item["provider"] == "hunyuan")
         openrouter_gpt = next(item for item in models if item["provider"] == "openrouter_gpt")
         openrouter_gemini = next(item for item in models if item["provider"] == "openrouter_gemini")
         self.assertEqual(kimi["sampling_defaults"]["temperature"], 0.6)
+        self.assertIn("$web_search", kimi["web_search_param_path"])
+        self.assertEqual(hunyuan["label"], "腾讯元宝")
+        self.assertEqual(hunyuan["sampling_defaults"]["search_mode"], "force")
+        self.assertIn("force_search_enhancement=true", hunyuan["web_search_param_path"])
         self.assertEqual(deepseek["sampling_defaults"]["temperature"], 1)
         self.assertTrue(deepseek["supports_search"])
         self.assertIn("Brave Search", deepseek["web_search_mode"])
         self.assertEqual(openrouter_gpt["label"], "OpenRouter-GPT")
         self.assertEqual(openrouter_gemini["label"], "OpenRouter-Gemini")
+        self.assertEqual(openrouter_gpt["sampling_defaults"]["search_strategy"], "exa")
+        self.assertEqual(openrouter_gemini["sampling_defaults"]["search_strategy"], "exa")
         self.assertTrue(openrouter_gpt["supports_search"])
         self.assertTrue(openrouter_gemini["supports_search"])
         self.assertIn("web plugin", openrouter_gpt["web_search_mode"])
@@ -457,6 +464,31 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(result["citations"], [{"url": "https://example.com/ingreen", "title": "英歌瑞自动化涂装设备"}])
         self.assertIn("brave_results", result["raw_response"])
 
+    def test_deepseek_search_reports_brave_failure_without_fallback(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "auto",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.brave_search_request", side_effect=AdapterError("<urlopen error [Errno 101] Network is unreachable>")), \
+             mock.patch("src.adapters.post_json") as post_json:
+            with self.assertRaises(AdapterError) as ctx:
+                openai_compatible_request(
+                    "https://api.deepseek.com/v1",
+                    "deepseek-test-key",
+                    "deepseek-chat",
+                    "问题",
+                    1,
+                    "deepseek",
+                    options,
+                )
+
+        self.assertIn("DeepSeek 联网口径依赖 Brave Search 失败", str(ctx.exception))
+        self.assertIn("Network is unreachable", str(ctx.exception))
+        post_json.assert_not_called()
+
     def test_openrouter_online_payload_uses_web_plugin_and_citations(self):
         options = normalize_run_options(
             {
@@ -502,6 +534,67 @@ class HarnessHttpTests(unittest.TestCase):
         payload = post_json.call_args.args[2]
         self.assertEqual(payload["plugins"], [{"id": "web", "max_results": 3, "engine": "native", "include_domains": ["example.com", "industry.example"]}])
         self.assertEqual(result["citations"], [{"url": "https://example.com/source", "title": "Source Title"}])
+
+    def test_hunyuan_search_payload_forces_search_and_url_metadata(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "force",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "hunyuan-turbos-latest",
+                "choices": [{"message": {"content": "联网回答"}}],
+                "search_info": {
+                    "search_results": [
+                        {"url": "https://example.com/hunyuan", "title": "混元来源"},
+                    ]
+                },
+            }
+            result = openai_compatible_request(
+                "https://api.hunyuan.cloud.tencent.com/v1",
+                "hunyuan-test-key",
+                "hunyuan-turbos-latest",
+                "测试问题",
+                0,
+                "hunyuan",
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        self.assertTrue(payload["enable_enhancement"])
+        self.assertTrue(payload["force_search_enhancement"])
+        self.assertTrue(payload["search_info"])
+        self.assertTrue(payload["citation"])
+        self.assertEqual(result["citations"], [{"url": "https://example.com/hunyuan", "title": "混元来源"}])
+
+    def test_kimi_search_payload_uses_builtin_web_search_tool(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "kimi-k2.5",
+                "choices": [{"message": {"content": "联网回答"}}],
+            }
+            kimi_search_request(
+                "https://api.moonshot.cn/v1",
+                "kimi-test-key",
+                "kimi-k2.5",
+                "测试问题",
+                0.6,
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        self.assertEqual(payload["tools"][0]["type"], "builtin_function")
+        self.assertEqual(payload["tools"][0]["function"]["name"], "$web_search")
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
 
     def test_openrouter_gpt_wrapper_uses_direct_openai_fallback_when_key_exists(self):
         with mock.patch.dict(
@@ -932,6 +1025,49 @@ class HarnessDirectTests(unittest.TestCase):
                 os.environ.pop("SAMPLING_PROVIDER_CONCURRENCY_LIMITS", None)
             else:
                 os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = old_limits
+
+    def test_openrouter_runtime_tasks_default_to_exa_search_strategy(self):
+        question = {"id": 1, "question": "今天 OpenRouter Web Search 支持哪些 engine？"}
+        config = {"search_mode": "auto", "thinking_type": "disabled"}
+        for provider, model in [
+            ("openrouter_gpt", "openai/gpt-5.2"),
+            ("openrouter_gemini", "google/gemini-2.5-flash"),
+        ]:
+            task = prepare_runtime_task(
+                batch_id="batch-test",
+                project_id=1,
+                question=question,
+                provider_cfg={"model_config_id": 1, "search_enabled": True},
+                model_config={
+                    "id": 1,
+                    "provider": provider,
+                    "model": model,
+                    "model_version": "",
+                },
+                config=config,
+                repeat_index=1,
+            )
+
+            self.assertEqual(task["run_options"]["search_strategy"], "exa")
+
+    def test_hunyuan_runtime_tasks_default_to_force_search_mode(self):
+        task = prepare_runtime_task(
+            batch_id="batch-test",
+            project_id=1,
+            question={"id": 1, "question": "今天有什么制造业新闻？"},
+            provider_cfg={"model_config_id": 1, "search_enabled": True},
+            model_config={
+                "id": 1,
+                "provider": "hunyuan",
+                "model": "hunyuan-turbos-latest",
+                "model_version": "",
+            },
+            config={"search_mode": "auto", "thinking_type": "disabled"},
+            repeat_index=1,
+        )
+
+        self.assertEqual(task["base"]["search_mode"], "force")
+        self.assertEqual(task["run_options"]["search_mode"], "force")
 
     def test_default_blocks_live_model_calls(self):
         old_value = os.environ.pop("ALLOW_LIVE_MODEL_CALLS", None)

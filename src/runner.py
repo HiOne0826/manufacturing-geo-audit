@@ -167,7 +167,12 @@ def prepare_runtime_task(
         runtime_model_config["model_version"] = runtime_model_version
     provider = runtime_model_config.get("provider", "")
     model = runtime_model_config.get("model", "")
-    model_search_mode = str(provider_cfg.get("search_mode", config.get("search_mode", "auto"))).strip() or "auto"
+    sampling_defaults = provider_sampling_defaults(provider, model)
+    default_search_mode = str(sampling_defaults.get("search_mode", "")).strip()
+    raw_search_mode = provider_cfg.get("search_mode")
+    if raw_search_mode in (None, "", "null"):
+        raw_search_mode = default_search_mode or config.get("search_mode", "auto")
+    model_search_mode = str(raw_search_mode).strip() or default_search_mode or "auto"
     search_enabled = bool(provider_cfg.get("search_enabled", False)) and model_search_mode != "off"
     model_thinking_enabled = bool(provider_cfg.get("thinking_enabled", False))
     model_thinking_type = str(
@@ -176,7 +181,6 @@ def prepare_runtime_task(
     model_reasoning_effort = (
         str(provider_cfg.get("reasoning_effort", config.get("reasoning_effort", ""))).strip() if model_thinking_enabled else ""
     )
-    sampling_defaults = provider_sampling_defaults(provider, model)
     raw_temperature = provider_cfg.get("temperature", config.get("temperature"))
     if raw_temperature in (None, "", "null"):
         raw_temperature = sampling_defaults.get("temperature", 0)
@@ -202,6 +206,7 @@ def prepare_runtime_task(
         "thinking_budget": model_thinking_budget,
         "requested_at": utc_now(),
     }
+    default_search_strategy = str(sampling_defaults.get("search_strategy", "")).strip()
     run_options = {
         "search_mode": model_search_mode,
         "thinking_type": model_thinking_type,
@@ -215,7 +220,7 @@ def prepare_runtime_task(
         "search_user_location": provider_cfg.get("search_user_location", ""),
         "search_site_filter": provider_cfg.get("search_site_filter", ""),
         "search_time_filter": provider_cfg.get("search_time_filter", ""),
-        "search_strategy": provider_cfg.get("search_strategy", ""),
+        "search_strategy": provider_cfg.get("search_strategy", default_search_strategy) or default_search_strategy,
         "search_freshness": provider_cfg.get("search_freshness", ""),
         "search_prompt_intervene": provider_cfg.get("search_prompt_intervene", ""),
         "search_enable_source": provider_cfg.get("search_enable_source", False),
