@@ -643,7 +643,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if not batch:
                         self.json_response({"error": "批次不存在"}, 404)
                         return
-                    self.json_response({"batch": sampling_batch_to_progress(batch)})
+                    self.json_response({"batch": progress_response_for_batch(conn, batch)})
                 elif parsed.path == "/api/batches":
                     project_raw = query.get("project_id", [None])[0]
                     project_id = int(project_raw) if project_raw and project_raw != "all" else None
@@ -661,7 +661,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if not batch:
                         self.json_response({"error": "批次不存在"}, 404)
                         return
-                    self.json_response({"batch": batch})
+                    self.json_response({"batch": progress_response_for_batch(conn, batch)})
                 elif parsed.path == "/api/analytics":
                     project_id = int(query.get("project_id", [0])[0])
                     self.json_response(analytics(conn, project_id))

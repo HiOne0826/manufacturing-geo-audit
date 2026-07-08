@@ -991,6 +991,10 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(imported["count"], 1)
 
         status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        detail = self.request_json("GET", f"/api/batches/{batch_id}")["batch"]
+        self.assertEqual(detail["status"], "queued")
+        self.assertEqual(detail["total"], 3)
+        self.assertEqual(detail["completed"], 2)
         self.assertEqual(status["status"], "queued")
         self.assertEqual(status["total"], 3)
         self.assertEqual(status["completed"], 2)
