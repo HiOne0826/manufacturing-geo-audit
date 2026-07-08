@@ -45,6 +45,7 @@ from src.db import (
     list_runs,
     list_sampling_batches,
     seed_questions,
+    update_sampling_batch,
     update_model_config,
     update_project,
     update_question,
@@ -61,7 +62,7 @@ from src.platforms import test_platform_name
 from src.runtime_env import load_dotenv_file
 from src.runner import estimate_batch_total
 from src.db import utc_now
-from src.tasks import mark_batch_failed, perform_batch, perform_rerun_failed
+from src.tasks import mark_batch_failed, perform_batch, perform_rerun_failed, perform_resume_batch, request_batch_pause
 
 
 ROOT = Path(__file__).resolve().parent
@@ -209,7 +210,7 @@ def planned_source_statuses(conn, batch: dict) -> dict[str, dict]:
 
 def active_project_batch(conn, project_id: int) -> dict | None:
     for batch in list_sampling_batches(conn, project_id):
-        if batch.get("status") in {"queued", "running"}:
+        if batch.get("status") in {"queued", "running", "pause_requested"}:
             return batch
     return None
 
@@ -270,6 +271,8 @@ def finalize_source_status(item: dict, batch_status: str, current_platform: str 
         status = "failed"
     elif running:
         status = "running"
+    elif batch_status == "paused" and completed < total:
+        status = "paused"
     elif total > 0 and completed >= total:
         status = "completed"
     else:
@@ -345,8 +348,14 @@ def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> d
         base.update(latest_progress)
         if latest_progress["failed"]:
             base["status"] = "failed"
+        elif str(batch.get("status") or "") in {"paused", "pause_requested"}:
+            base["status"] = batch["status"]
         elif latest_progress["completed"] < latest_progress["total"]:
             base["status"] = "queued"
+    base["total_count"] = base.get("total", base.get("total_count", 0))
+    base["completed_count"] = base.get("completed", base.get("completed_count", 0))
+    base["success_count"] = base.get("success", base.get("success_count", 0))
+    base["failed_count"] = base.get("failed", base.get("failed_count", 0))
     base["source_statuses"] = source_statuses_for_batch(conn, batch, job)
     return base
 
@@ -357,7 +366,7 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
         def on_progress(progress: dict):
             set_sampling_job(
                 batch_id,
-                status="running",
+                status=progress.get("status", "running"),
                 total=progress["total"],
                 completed=progress["completed"],
                 failed=progress["failed"],
@@ -370,14 +379,15 @@ def run_batch_in_background(batch_id: str, project_id: int, payload: dict):
             )
 
         result = perform_batch(batch_id, project_id, payload, progress_hook=on_progress, db_target=DEFAULT_DB_PATH)
+        final_status = result.get("status", "completed")
         set_sampling_job(
             batch_id,
-            status="completed",
+            status=final_status,
             total=result["total"],
-            completed=result["total"],
+            completed=result["success"] + result["failed"],
             failed=result["failed"],
             success=result["success"],
-            finished_at=utc_now(),
+            finished_at=utc_now() if final_status != "paused" else None,
             updated_at=utc_now(),
         )
     except Exception as exc:
@@ -414,6 +424,42 @@ def rerun_failed_in_background(batch_id: str, payload: dict):
         set_sampling_job(batch_id, status="failed", error=str(exc), finished_at=utc_now(), updated_at=utc_now())
 
 
+def resume_batch_in_background(batch_id: str, payload: dict):
+    set_sampling_job(batch_id, status="running", started_at=utc_now())
+    try:
+        def on_progress(progress: dict):
+            set_sampling_job(
+                batch_id,
+                status=progress.get("status", "running"),
+                total=progress["total"],
+                completed=progress["completed"],
+                failed=progress["failed"],
+                success=progress["success"],
+                current_provider=progress.get("provider"),
+                current_model=progress.get("model"),
+                current_question_id=progress.get("question_id"),
+                current_repeat_index=progress.get("repeat_index"),
+                updated_at=utc_now(),
+            )
+
+        result = perform_resume_batch(batch_id, payload, progress_hook=on_progress, db_target=DEFAULT_DB_PATH)
+        final_status = result.get("status", "completed")
+        job = get_sampling_job(batch_id) or {}
+        set_sampling_job(
+            batch_id,
+            status=final_status,
+            total=job.get("total", result.get("total", 0)),
+            completed=job.get("completed", result.get("success", 0) + result.get("failed", 0)),
+            failed=job.get("failed", result.get("failed", 0)),
+            success=job.get("success", result.get("success", 0)),
+            finished_at=utc_now() if final_status != "paused" else None,
+            updated_at=utc_now(),
+        )
+    except Exception as exc:
+        mark_batch_failed(batch_id, str(exc), db_target=DEFAULT_DB_PATH)
+        set_sampling_job(batch_id, status="failed", error=str(exc), finished_at=utc_now(), updated_at=utc_now())
+
+
 def dispatch_batch(batch_id: str, project_id: int, payload: dict) -> str | None:
     if task_queue_backend() == "rq":
         return enqueue_rq_task(perform_batch, batch_id, project_id, payload)
@@ -430,6 +476,17 @@ def dispatch_rerun_failed(batch_id: str, payload: dict) -> str | None:
         return enqueue_rq_task(perform_rerun_failed, batch_id, payload)
     threading.Thread(
         target=rerun_failed_in_background,
+        args=(batch_id, payload),
+        daemon=True,
+    ).start()
+    return None
+
+
+def dispatch_resume_batch(batch_id: str, payload: dict) -> str | None:
+    if task_queue_backend() == "rq":
+        return enqueue_rq_task(perform_resume_batch, batch_id, payload)
+    threading.Thread(
+        target=resume_batch_in_background,
         args=(batch_id, payload),
         daemon=True,
     ).start()
@@ -655,7 +712,9 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     batch_id = parts[2]
                     if len(parts) == 4 and parts[3] == "runs":
-                        self.json_response({"runs": list_runs_by_batch(conn, batch_id)})
+                        include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
+                        rows = list_runs_by_batch(conn, batch_id, include_history=include_history)
+                        self.json_response({"runs": rows})
                         return
                     batch = get_sampling_batch(conn, batch_id)
                     if not batch:
@@ -671,13 +730,15 @@ class Handler(SimpleHTTPRequestHandler):
                     self.json_response(build_analytics_summary(conn, project_id, batch_id))
                 elif parsed.path == "/api/export/runs.csv":
                     project_id = int(query.get("project_id", [0])[0])
-                    self.csv_response(runs_to_csv(list_runs(conn, project_id, limit=10000)), "geo-runs.csv")
+                    include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
+                    self.csv_response(runs_to_csv(list_runs(conn, project_id, limit=10000, include_history=include_history)), "geo-runs.csv")
                 elif parsed.path == "/api/export/summary.csv":
                     project_id = int(query.get("project_id", [0])[0])
                     self.csv_response(analytics_to_csv(analytics(conn, project_id)), "geo-summary.csv")
                 elif parsed.path == "/api/export/runs.xls":
                     project_id = int(query.get("project_id", [0])[0])
-                    self.excel_html_response(runs_to_excel_html(list_runs(conn, project_id, limit=10000)), "geo-runs.xls")
+                    include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
+                    self.excel_html_response(runs_to_excel_html(list_runs(conn, project_id, limit=10000, include_history=include_history)), "geo-runs.xls")
                 elif parsed.path == "/api/export/summary.xls":
                     project_id = int(query.get("project_id", [0])[0])
                     self.excel_html_response(analytics_to_excel_html(analytics(conn, project_id)), "geo-summary.xls")
@@ -688,7 +749,8 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     batch_id = parts[3]
                     export_name = parts[4]
-                    rows = list_runs_by_batch(conn, batch_id)
+                    include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
+                    rows = list_runs_by_batch(conn, batch_id, include_history=include_history)
                     if export_name == "runs.xls":
                         self.excel_html_response(runs_to_excel_html(rows), f"geo-batch-{batch_id}-runs.xls")
                         return
@@ -704,7 +766,8 @@ class Handler(SimpleHTTPRequestHandler):
                     project_id = int(query.get("project_id", [0])[0])
                     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                     filename = f"geo-runs-{project_id}-{stamp}.xls"
-                    path = self.save_export_file(filename, runs_to_excel_html(list_runs(conn, project_id, limit=10000)))
+                    include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
+                    path = self.save_export_file(filename, runs_to_excel_html(list_runs(conn, project_id, limit=10000, include_history=include_history)))
                     self.json_response({"ok": True, "path": path, "filename": filename})
                 elif parsed.path == "/api/export/summary/save":
                     project_id = int(query.get("project_id", [0])[0])
@@ -935,6 +998,60 @@ class Handler(SimpleHTTPRequestHandler):
                         {
                             "batch_id": batch_id,
                             "total": len(failed_runs),
+                            "status": "queued",
+                            "task_queue_backend": task_queue_backend(),
+                            "job_id": job_id,
+                        }
+                    )
+                elif parsed.path.startswith("/api/batches/") and parsed.path.endswith("/pause"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) != 4:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[2]
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    if batch.get("status") == "queued":
+                        update_sampling_batch(conn, batch_id, {"status": "paused", "updated_at": utc_now()})
+                        conn.commit()
+                        set_sampling_job(batch_id, status="paused", updated_at=utc_now())
+                    elif batch.get("status") == "running":
+                        request_batch_pause(batch_id, DEFAULT_DB_PATH)
+                        set_sampling_job(batch_id, status="pause_requested", updated_at=utc_now())
+                    updated = get_sampling_batch(conn, batch_id) or batch
+                    self.json_response(progress_response_for_batch(conn, updated, get_sampling_job(batch_id)))
+                elif parsed.path.startswith("/api/batches/") and parsed.path.endswith("/resume"):
+                    parts = [unquote(item) for item in parsed.path.split("/") if item]
+                    if len(parts) != 4:
+                        self.json_response({"error": "接口不存在"}, 404)
+                        return
+                    batch_id = parts[2]
+                    batch = get_sampling_batch(conn, batch_id)
+                    if not batch:
+                        self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    if batch.get("status") not in {"paused", "pause_requested", "failed", "queued"}:
+                        self.json_response({"error": "当前批次状态不能继续执行"}, 409)
+                        return
+                    set_sampling_job(
+                        batch_id,
+                        project_id=batch["project_id"],
+                        total=batch.get("total_count", 0),
+                        completed=batch.get("completed_count", 0),
+                        failed=batch.get("failed_count", 0),
+                        success=batch.get("success_count", 0),
+                        status="queued",
+                        updated_at=utc_now(),
+                    )
+                    update_sampling_batch(conn, batch_id, {"status": "queued", "updated_at": utc_now()})
+                    conn.commit()
+                    job_id = dispatch_resume_batch(batch_id, payload)
+                    self.json_response(
+                        {
+                            "batch_id": batch_id,
+                            "total": batch.get("total_count", 0),
                             "status": "queued",
                             "task_queue_backend": task_queue_backend(),
                             "job_id": job_id,

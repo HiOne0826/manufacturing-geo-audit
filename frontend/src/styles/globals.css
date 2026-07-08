@@ -369,7 +369,8 @@ td span { display: block; color: var(--muted); margin-top: 3px; }
   font-size: 12px;
 }
 .status-completed { color: var(--success); background: #e8f6ef; }
-.status-running, .status-queued { color: var(--warning); background: #fff4e5; }
+.status-running, .status-queued, .status-pause_requested { color: var(--warning); background: #fff4e5; }
+.status-paused { color: var(--text-muted); background: #eef2f7; }
 .status-failed { color: var(--danger); background: #fdecec; }
 .model-grid {
   display: grid;
@@ -640,7 +641,7 @@ dd { margin: 0; }
 .status-line-completed { border-left-color: var(--success); }
 .status-line-running { border-left-color: var(--warning); }
 .status-line-failed { border-left-color: var(--danger); }
-.status-line-queued, .status-line-unknown { border-left-color: var(--line-strong); }
+.status-line-paused, .status-line-queued, .status-line-unknown { border-left-color: var(--line-strong); }
 .provider-summary { display: grid; gap: 8px; }
 .provider-summary div, .model-health {
   display: grid;

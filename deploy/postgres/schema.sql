@@ -108,7 +108,9 @@ CREATE TABLE IF NOT EXISTS model_runs (
     reasoning_effort TEXT DEFAULT '',
     thinking_budget INTEGER,
     error_message TEXT DEFAULT '',
-    raw_response_json JSONB DEFAULT '{}'::jsonb
+    raw_response_json JSONB DEFAULT '{}'::jsonb,
+    is_current INTEGER DEFAULT 1,
+    superseded_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS answer_evaluations (

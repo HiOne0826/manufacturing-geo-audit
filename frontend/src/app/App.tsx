@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { BarChart3, Boxes, FileDown, FileSpreadsheet, Gauge, KeyRound, Layers3, ListChecks, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
+import { BarChart3, Boxes, FileDown, FileSpreadsheet, Gauge, KeyRound, Layers3, ListChecks, Pause, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
 import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
@@ -42,7 +42,11 @@ function citationUrls(value?: string) {
 }
 
 function isTerminalStatus(status?: string) {
-  return status === "completed" || status === "failed";
+  return status === "completed" || status === "failed" || status === "paused";
+}
+
+function isPausableStatus(status?: string) {
+  return status === "queued" || status === "running";
 }
 
 export function App() {
@@ -547,6 +551,20 @@ function SamplingPage() {
     onSuccess: (data) => { setActiveBatch(data.batch_id); queryClient.invalidateQueries({ queryKey: ["batches"] }); }
   });
   const rerun = useMutation({ mutationFn: () => batchesApi.rerunFailed(activeBatch), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["progress", activeBatch] }) });
+  const pause = useMutation({
+    mutationFn: () => batchesApi.pause(activeBatch),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["progress", activeBatch] });
+      queryClient.invalidateQueries({ queryKey: ["batches"] });
+    }
+  });
+  const resume = useMutation({
+    mutationFn: () => batchesApi.resume(activeBatch),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["progress", activeBatch] });
+      queryClient.invalidateQueries({ queryKey: ["batches"] });
+    }
+  });
   const progress = useQuery({ queryKey: ["progress", activeBatch], queryFn: () => batchesApi.progress(activeBatch), enabled: Boolean(activeBatch), refetchInterval: (query) => query.state.data?.status === "completed" || query.state.data?.status === "failed" ? false : 1200 });
   useEffect(() => {
     if (activeBatch || !batches.data?.batches.length) return;
@@ -576,8 +594,12 @@ function SamplingPage() {
               {progress.isError ? <div className="error-box">{progress.error.message}</div> : null}
               <SourceStatusList rows={progress.data?.source_statuses || []} compact />
               {rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}
+              {pause.error ? <div className="error-box">{pause.error.message}</div> : null}
+              {resume.error ? <div className="error-box">{resume.error.message}</div> : null}
               <div className="inline-actions">
                 <Link className="button ghost" to={`/batches/${activeBatch}`}>{failedSources ? "查看失败原因" : "查看批次详情"}</Link>
+                {isPausableStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={pause.isPending} onClick={() => pause.mutate()}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}
+                {progress.data?.status === "paused" ? <button className="ghost" type="button" disabled={resume.isPending} onClick={() => resume.mutate()}><Play size={15} />{resume.isPending ? "正在继续" : "继续执行"}</button> : null}
                 {failedSources && isTerminalStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={rerun.isPending} onClick={() => rerun.mutate()}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}
               </div>
             </div>
@@ -657,10 +679,27 @@ function BatchDetailPage() {
       queryClient.invalidateQueries({ queryKey: ["batch-runs", batchId] });
     }
   });
+  const pause = useMutation({
+    mutationFn: () => batchesApi.pause(batchId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["batch", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["progress", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["batches"] });
+    }
+  });
+  const resume = useMutation({
+    mutationFn: () => batchesApi.resume(batchId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["batch", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["progress", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["batch-runs", batchId] });
+      queryClient.invalidateQueries({ queryKey: ["batches"] });
+    }
+  });
   const rows = runs.data?.runs || [];
   const batchStatus = progress.data?.status || batch.data?.batch.status;
   const hasFailures = (progress.data?.source_statuses || []).some((item) => item.failed > 0) || rows.some((row) => row.status === "failed");
-  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batch.data.batch.status} /><ProgressBar batch={batch.data.batch} /></> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
+  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{isPausableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}{batchStatus === "paused" ? <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}><Play size={15} />{resume.isPending ? "正在继续" : "继续执行"}</button> : null}{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batchStatus || batch.data.batch.status} /><ProgressBar batch={progress.data || batch.data.batch} /></> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}{pause.error ? <div className="error-box">{pause.error.message}</div> : null}{resume.error ? <div className="error-box">{resume.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
 }
 
 function AnalysisPage() {

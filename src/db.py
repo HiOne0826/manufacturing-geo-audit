@@ -524,6 +524,8 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 thinking_budget INTEGER,
                 error_message TEXT DEFAULT '',
                 raw_response_json TEXT DEFAULT '{}',
+                is_current INTEGER DEFAULT 1,
+                superseded_at TEXT DEFAULT '',
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
             );
@@ -608,6 +610,8 @@ def migrate_model_runs_schema(conn: sqlite3.Connection) -> None:
         "reasoning_effort": "ALTER TABLE model_runs ADD COLUMN reasoning_effort TEXT DEFAULT ''",
         "thinking_budget": "ALTER TABLE model_runs ADD COLUMN thinking_budget INTEGER",
         "model_config_id": "ALTER TABLE model_runs ADD COLUMN model_config_id INTEGER DEFAULT 0",
+        "is_current": "ALTER TABLE model_runs ADD COLUMN is_current INTEGER DEFAULT 1",
+        "superseded_at": "ALTER TABLE model_runs ADD COLUMN superseded_at TEXT DEFAULT ''",
     }
     for name, sql in additions.items():
         if name not in columns:
@@ -1284,9 +1288,89 @@ def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = Non
     return result
 
 
-def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
+def run_logical_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("question_id"),
+        row.get("model_config_id"),
+        bool(row.get("search_enabled")),
+        row.get("search_mode") or "",
+        row.get("thinking_type") or "",
+        row.get("reasoning_effort") or "",
+        row.get("thinking_budget"),
+        int(row.get("repeat_index") or 1),
+    )
+
+
+def refresh_current_run_flags(conn: sqlite3.Connection, batch_id: str | None = None) -> dict[str, int]:
+    where = "WHERE batch_id = ?" if batch_id else ""
+    params: tuple[Any, ...] = (batch_id,) if batch_id else ()
     rows = conn.execute(
+        f"""
+        SELECT id, batch_id, question_id, model_config_id, search_enabled, search_mode,
+               thinking_type, reasoning_effort, thinking_budget, repeat_index
+        FROM model_runs
+        {where}
+        ORDER BY id DESC
+        """,
+        params,
+    ).fetchall()
+    current_ids: list[int] = []
+    seen = set()
+    for row in rows:
+        item = dict(row)
+        key = (item.get("batch_id"), *run_logical_key(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        current_ids.append(int(item["id"]))
+    conn.execute(
+        f"UPDATE model_runs SET is_current = 0, superseded_at = ? {where}",
+        (utc_now(), *params),
+    )
+    if current_ids:
+        placeholders = ",".join("?" for _ in current_ids)
+        conn.execute(
+            f"UPDATE model_runs SET is_current = 1, superseded_at = '' WHERE id IN ({placeholders})",
+            tuple(current_ids),
+        )
+    return {"total": len(rows), "current": len(current_ids), "historical": len(rows) - len(current_ids)}
+
+
+def mark_superseded_runs(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
+    conn.execute(
         """
+        UPDATE model_runs
+        SET is_current = 0, superseded_at = ?
+        WHERE batch_id = ?
+          AND question_id = ?
+          AND model_config_id = ?
+          AND search_enabled = ?
+          AND COALESCE(search_mode, '') = ?
+          AND COALESCE(thinking_type, '') = ?
+          AND COALESCE(reasoning_effort, '') = ?
+          AND COALESCE(thinking_budget, -1) = ?
+          AND repeat_index = ?
+          AND COALESCE(is_current, 1) = 1
+        """,
+        (
+            run.get("requested_at") or utc_now(),
+            run["batch_id"],
+            run["question_id"],
+            int(run.get("model_config_id", 0) or 0),
+            1 if run.get("search_enabled") else 0,
+            run.get("search_mode", "off") or "",
+            run.get("thinking_type", "disabled") or "",
+            run.get("reasoning_effort", "") or "",
+            run.get("thinking_budget") if run.get("thinking_budget") is not None else -1,
+            int(run.get("repeat_index", 1)),
+        ),
+    )
+
+
+def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 10000, include_history: bool = False) -> list[dict[str, Any]]:
+    current_filter = "" if include_history else "AND COALESCE(r.is_current, 1) = 1"
+    rows = conn.execute(
+        f"""
         SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
                q.product_category, q.product_line, q.purchase_stage, q.scenario,
                q.priority AS question_priority, q.suggested_platforms,
@@ -1297,6 +1381,7 @@ def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 100
         JOIN questions q ON q.id = r.question_id
         LEFT JOIN answer_evaluations e ON e.run_id = r.run_id
         WHERE r.batch_id = ?
+        {current_filter}
         ORDER BY r.id DESC
         LIMIT ?
         """,
@@ -1306,14 +1391,15 @@ def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 100
 
 
 def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
+    mark_superseded_runs(conn, run)
     conn.execute(
         """
         INSERT INTO model_runs (
             run_id, batch_id, project_id, question_id, model_config_id, provider, model, model_version,
             search_enabled, temperature, repeat_index, requested_at, response_text,
             citations_json, latency_ms, cost_estimate, status, search_mode, thinking_type,
-            reasoning_effort, thinking_budget, error_message, raw_response_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            reasoning_effort, thinking_budget, error_message, raw_response_json, is_current, superseded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run["run_id"],
@@ -1339,6 +1425,8 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             run.get("thinking_budget"),
             run.get("error_message", ""),
             json_db_value(conn, run.get("raw_response", {})),
+            1,
+            "",
         ),
     )
 
@@ -1350,6 +1438,7 @@ def list_failed_runs_by_batch(conn: sqlite3.Connection, batch_id: str) -> list[d
         FROM model_runs r
         JOIN questions q ON q.id = r.question_id
         WHERE r.batch_id = ? AND r.status = 'failed'
+          AND COALESCE(r.is_current, 1) = 1
           AND NOT EXISTS (
               SELECT 1
               FROM model_runs newer
@@ -1418,9 +1507,10 @@ def insert_evaluation(conn: sqlite3.Connection, evaluation: dict[str, Any]) -> N
     )
 
 
-def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200) -> list[dict[str, Any]]:
+def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200, include_history: bool = False) -> list[dict[str, Any]]:
+    current_filter = "" if include_history else "AND COALESCE(r.is_current, 1) = 1"
     rows = conn.execute(
-        """
+        f"""
         SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
                q.product_category, q.product_line, q.purchase_stage, q.scenario,
                q.priority AS question_priority, q.suggested_platforms,
@@ -1431,6 +1521,7 @@ def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200) -> li
         JOIN questions q ON q.id = r.question_id
         LEFT JOIN answer_evaluations e ON e.run_id = r.run_id
         WHERE r.project_id = ?
+        {current_filter}
         ORDER BY r.id DESC
         LIMIT ?
         """,

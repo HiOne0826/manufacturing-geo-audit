@@ -15,7 +15,7 @@ from pathlib import Path
 
 import app
 from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_run_options, openai_compatible_request, openai_responses_request
-from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch
+from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
@@ -961,8 +961,76 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(persisted_status["source_statuses"][0]["status"], "completed")
         runs = self.request_json("GET", f"/api/runs?project_id={project_id}")["runs"]
         self.assertEqual(len(runs), 2)
-        self.assertIn("run_id", self.request_text(f"/api/export/runs.csv?project_id={project_id}"))
+        self.assertIn("运行ID", self.request_text(f"/api/export/runs.csv?project_id={project_id}"))
         self.assertIn("<table", self.request_text(f"/api/export/runs.xls?project_id={project_id}"))
+
+    def test_batch_runs_default_to_latest_logical_records(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        with get_conn(self.db_path) as conn:
+            question = list_questions(conn, project_id)[0]
+            batch_id = "batch-latest-runs"
+            create_sampling_batch(
+                conn,
+                {
+                    "batch_id": batch_id,
+                    "project_id": project_id,
+                    "status": "completed",
+                    "total_count": 1,
+                    "success_count": 1,
+                    "failed_count": 0,
+                    "completed_count": 1,
+                    "config": {"models": [{"model_config_id": model_id, "search_enabled": True}], "repeat_count": 1},
+                    "created_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+            base = {
+                "batch_id": batch_id,
+                "project_id": project_id,
+                "question_id": question["id"],
+                "model_config_id": model_id,
+                "provider": "mock",
+                "model": "mock-model",
+                "model_version": "mock-model",
+                "search_enabled": True,
+                "search_mode": "auto",
+                "thinking_type": "disabled",
+                "repeat_index": 1,
+                "temperature": 0,
+                "latency_ms": 1,
+                "cost_estimate": 0,
+                "raw_response": {},
+            }
+            insert_run(
+                conn,
+                {
+                    **base,
+                    "run_id": "old-failed-run",
+                    "requested_at": "2026-07-08T00:00:00+00:00",
+                    "response_text": "",
+                    "citations": [],
+                    "status": "failed",
+                    "error_message": "旧失败不应默认展示",
+                },
+            )
+            insert_run(
+                conn,
+                {
+                    **base,
+                    "run_id": "new-success-run",
+                    "requested_at": "2026-07-08T00:01:00+00:00",
+                    "response_text": "后续成功",
+                    "citations": [],
+                    "status": "success",
+                    "error_message": "",
+                },
+            )
+
+        latest_runs = self.request_json("GET", f"/api/batches/{batch_id}/runs")["runs"]
+        history_runs = self.request_json("GET", f"/api/batches/{batch_id}/runs?history=1")["runs"]
+        self.assertEqual([row["run_id"] for row in latest_runs], ["new-success-run"])
+        self.assertEqual(len(history_runs), 2)
+        self.assertTrue(any(row["run_id"] == "old-failed-run" for row in history_runs))
 
     def test_progress_reports_two_sources_from_batch_config_and_runs(self):
         project_id, first_model_id = self.create_mock_project(question_count=2)
@@ -1317,6 +1385,62 @@ class HarnessDirectTests(unittest.TestCase):
             self.assertEqual(result["success"] + result["failed"], result["total"])
             self.assertEqual(len(runs), 450)
 
+    def test_run_batch_stops_submitting_new_tasks_when_pause_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "pause.db"
+            init_db(db_path)
+            pause_requested = False
+            with get_conn(db_path) as conn:
+                project_id = create_project(
+                    conn,
+                    {
+                        "client_name": "暂停测试客户",
+                        "brand_name": "暂停测试品牌",
+                        "product_category": "测试品类",
+                    },
+                )
+                rows = [
+                    {
+                        "question_id": f"P{idx:03d}",
+                        "question": f"第 {idx} 个暂停测试问题，暂停测试品牌是否出现？",
+                        "question_type": "pause",
+                        "target_brand": "暂停测试品牌",
+                    }
+                    for idx in range(1, 4)
+                ]
+                self.assertEqual(import_questions_rows(conn, project_id, rows), 3)
+                model_id = create_model_config(
+                    conn,
+                    {
+                        "provider": "mock",
+                        "label": "Mock",
+                        "model": "mock-model",
+                        "supports_pure": True,
+                        "active": True,
+                    },
+                )
+
+                def on_progress(_progress):
+                    nonlocal pause_requested
+                    pause_requested = True
+
+                result = run_batch(
+                    conn,
+                    project_id,
+                    {
+                        "models": [{"model_config_id": model_id, "search_enabled": False}],
+                        "repeat_count": 1,
+                        "max_workers": 1,
+                    },
+                    batch_id="pause-test-batch",
+                    progress_callback=on_progress,
+                    should_pause=lambda: pause_requested,
+                )
+                runs = list_runs(conn, project_id, limit=10)
+            self.assertEqual(result["status"], "paused")
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(len(runs), 1)
+
     def test_one_model_failure_does_not_stop_batch(self):
         old_value = os.environ.pop("ALLOW_LIVE_MODEL_CALLS", None)
         try:
@@ -1436,7 +1560,7 @@ class HarnessDirectTests(unittest.TestCase):
                 self.assertTrue(all(row["error_message"] for row in failed_runs))
                 conn.execute("UPDATE model_configs SET model = 'mock-fixed' WHERE id = ?", (model_id,))
                 rerun_result = rerun_failed_runs(conn, "rerun-failed-batch", failed_runs, {"max_workers": 2, "retry_count": 0})
-                runs = list_runs(conn, project_id, limit=10)
+                runs = list_runs(conn, project_id, limit=10, include_history=True)
             self.assertEqual(rerun_result["total"], 2)
             self.assertEqual(rerun_result["success"], 2)
             self.assertEqual(rerun_result["failed"], 0)

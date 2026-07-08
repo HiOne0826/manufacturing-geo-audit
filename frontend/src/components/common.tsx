@@ -8,7 +8,7 @@ export function StatusBadge({ status }: { status?: string }) {
 }
 
 export function statusLabel(status: string) {
-  return ({ queued: "排队", running: "运行中", completed: "完成", failed: "失败", unknown: "未知" } as Record<string, string>)[status] || status;
+  return ({ queued: "排队", running: "运行中", pause_requested: "暂停中", paused: "已暂停", completed: "完成", failed: "失败", unknown: "未知" } as Record<string, string>)[status] || status;
 }
 
 export function Metric({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {

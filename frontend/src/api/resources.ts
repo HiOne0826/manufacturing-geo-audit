@@ -40,8 +40,11 @@ export const modelsApi = {
 export const batchesApi = {
   list: (projectId?: number | "all" | null) => api<{ batches: SamplingBatch[] }>(`/api/batches${projectId ? `?project_id=${projectId}` : ""}`),
   get: (batchId: string) => api<{ batch: SamplingBatch }>(`/api/batches/${encodeURIComponent(batchId)}`),
-  runs: (batchId: string) => api<{ runs: ModelRun[] }>(`/api/batches/${encodeURIComponent(batchId)}/runs`),
+  runs: (batchId: string) => api<{ runs: ModelRun[] }>(`/api/batches/${encodeURIComponent(batchId)}/runs?latest=1`),
+  runHistory: (batchId: string) => api<{ runs: ModelRun[] }>(`/api/batches/${encodeURIComponent(batchId)}/runs?history=1`),
   rerunFailed: (batchId: string) => api<{ batch_id: string; total: number; status: string }>(`/api/batches/${encodeURIComponent(batchId)}/rerun_failed`, { method: "POST", body: JSON.stringify({}) }),
+  pause: (batchId: string) => api<SamplingBatch>(`/api/batches/${encodeURIComponent(batchId)}/pause`, { method: "POST", body: JSON.stringify({}) }),
+  resume: (batchId: string) => api<{ batch_id: string; total: number; status: string }>(`/api/batches/${encodeURIComponent(batchId)}/resume`, { method: "POST", body: JSON.stringify({}) }),
   progress: (batchId: string) => api<SamplingBatch>(`/api/runs/progress?batch_id=${encodeURIComponent(batchId)}`)
 };
 

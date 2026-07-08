@@ -4,7 +4,7 @@ import os
 import json
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -336,6 +336,33 @@ def build_tasks(
     return tasks
 
 
+def logical_key_from_run(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row.get("question_id") or 0),
+        int(row.get("model_config_id") or 0),
+        bool(row.get("search_enabled")),
+        row.get("search_mode") or "",
+        row.get("thinking_type") or "",
+        row.get("reasoning_effort") or "",
+        row.get("thinking_budget"),
+        int(row.get("repeat_index") or 1),
+    )
+
+
+def logical_key_from_task(task: dict[str, Any]) -> tuple[Any, ...]:
+    base = task["base"]
+    return (
+        int(base.get("question_id") or 0),
+        int(base.get("model_config_id") or 0),
+        bool(base.get("search_enabled")),
+        base.get("search_mode") or "",
+        base.get("thinking_type") or "",
+        base.get("reasoning_effort") or "",
+        base.get("thinking_budget"),
+        int(base.get("repeat_index") or 1),
+    )
+
+
 def run_prepared_tasks(
     *,
     tasks: list[dict[str, Any]],
@@ -344,6 +371,7 @@ def run_prepared_tasks(
     config: dict[str, Any],
     batch_id: str,
     progress_callback=None,
+    should_pause=None,
 ) -> dict[str, Any]:
     total_expected = len(tasks)
     completed = 0
@@ -357,39 +385,71 @@ def run_prepared_tasks(
     max_workers = min(sampling_max_workers(config), max(1, total_expected))
     max_retries = retry_count(config)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                execute_sampling_task,
-                task,
-                db_target=db_target,
-                project=project,
-                semaphore=semaphores[provider_concurrency_group(task["base"]["provider"] or "unknown")],
-                max_retries=max_retries,
-            )
-            for task in tasks
-        ]
-        for future in as_completed(futures):
-            outcome = future.result()
-            completed += 1
-            if outcome["status"] == "failed":
-                failed += 1
-            if progress_callback:
-                progress_callback(
-                    {
-                        "batch_id": batch_id,
-                        "total": total_expected,
-                        "completed": completed,
-                        "failed": failed,
-                        "success": completed - failed,
-                        "provider": outcome["provider"],
-                        "model": outcome["model"],
-                        "question_id": outcome["question_id"],
-                        "repeat_index": outcome["repeat_index"],
-                    }
-                )
+    paused = False
 
-    return {"batch_id": batch_id, "total": completed, "failed": failed, "success": completed - failed}
+    def submit_task(executor, task):
+        return executor.submit(
+            execute_sampling_task,
+            task,
+            db_target=db_target,
+            project=project,
+            semaphore=semaphores[provider_concurrency_group(task["base"]["provider"] or "unknown")],
+            max_retries=max_retries,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        task_iter = iter(tasks)
+        pending = set()
+
+        while len(pending) < max_workers:
+            if should_pause and should_pause():
+                paused = True
+                break
+            try:
+                pending.add(submit_task(executor, next(task_iter)))
+            except StopIteration:
+                break
+
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                outcome = future.result()
+                completed += 1
+                if outcome["status"] == "failed":
+                    failed += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "batch_id": batch_id,
+                            "total": total_expected,
+                            "completed": completed,
+                            "failed": failed,
+                            "success": completed - failed,
+                            "provider": outcome["provider"],
+                            "model": outcome["model"],
+                            "question_id": outcome["question_id"],
+                            "repeat_index": outcome["repeat_index"],
+                        }
+                    )
+
+            while len(pending) < max_workers:
+                if should_pause and should_pause():
+                    paused = True
+                    break
+                try:
+                    pending.add(submit_task(executor, next(task_iter)))
+                except StopIteration:
+                    break
+            if paused:
+                continue
+
+    return {
+        "batch_id": batch_id,
+        "total": completed,
+        "failed": failed,
+        "success": completed - failed,
+        "status": "paused" if paused else "completed",
+    }
 
 
 def run_batch(
@@ -399,6 +459,7 @@ def run_batch(
     *,
     batch_id: str | None = None,
     progress_callback=None,
+    should_pause=None,
 ) -> dict[str, Any]:
     project = get_project(conn, project_id)
     if not project:
@@ -431,7 +492,37 @@ def run_batch(
         config=config,
         batch_id=batch_id,
         progress_callback=progress_callback,
+        should_pause=should_pause,
     )
+
+
+def build_missing_tasks_for_batch(conn, batch_id: str, config: dict[str, Any] | None = None) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+    from .db import get_sampling_batch, list_runs_by_batch
+
+    batch = get_sampling_batch(conn, batch_id)
+    if not batch:
+        raise ValueError("批次不存在")
+    project_id = int(batch["project_id"])
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    run_config = {**(batch.get("config") or {}), **(config or {})}
+    model_configs: dict[int, dict[str, Any]] = {}
+    for provider_cfg in run_config.get("models") or []:
+        model_config_id = int(provider_cfg.get("model_config_id", 0))
+        model_config = get_model_config(conn, model_config_id)
+        if not model_config:
+            raise ValueError("模型配置不存在")
+        model_configs[model_config_id] = model_config
+    planned_tasks = build_tasks(
+        batch_id=batch_id,
+        project_id=project_id,
+        config=run_config,
+        questions=list_questions(conn, project_id),
+        model_configs=model_configs,
+    )
+    completed_keys = {logical_key_from_run(row) for row in list_runs_by_batch(conn, batch_id, limit=100000)}
+    return project_id, run_config, [task for task in planned_tasks if logical_key_from_task(task) not in completed_keys]
 
 
 def rerun_failed_runs(conn, batch_id: str, failed_runs: list[dict[str, Any]], config: dict[str, Any] | None = None) -> dict[str, Any]:
