@@ -341,7 +341,12 @@ def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> d
         base.update(job)
     rows = latest_logical_runs(list_runs_by_batch(conn, batch["batch_id"]))
     if rows and not job:
-        base.update(latest_run_progress(rows, planned_batch_total(conn, batch)))
+        latest_progress = latest_run_progress(rows, planned_batch_total(conn, batch))
+        base.update(latest_progress)
+        if latest_progress["failed"]:
+            base["status"] = "failed"
+        elif latest_progress["completed"] < latest_progress["total"]:
+            base["status"] = "queued"
     base["source_statuses"] = source_statuses_for_batch(conn, batch, job)
     return base
 
