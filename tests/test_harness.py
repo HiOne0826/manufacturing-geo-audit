@@ -489,31 +489,31 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertIn("Network is unreachable", str(ctx.exception))
         post_json.assert_not_called()
 
-    def test_qwen_search_uses_brave_external_context_for_urls(self):
+    def test_qwen_search_uses_native_enable_search_without_brave(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
                 "search_mode": "force",
+                "search_strategy": "turbo",
                 "thinking_type": "disabled",
             }
         )
         with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test-key"}), \
              mock.patch("src.adapters.get_json") as get_json, \
              mock.patch("src.adapters.post_json") as post_json:
-            get_json.return_value = {
-                "web": {
-                    "results": [
-                        {
-                            "title": "OpenRouter Web Search",
-                            "url": "https://openrouter.ai/docs/guides/features/plugins/web-search",
-                            "description": "OpenRouter web search plugin documentation.",
-                        }
-                    ]
-                }
-            }
             post_json.return_value = {
                 "model": "qwen-plus",
-                "choices": [{"message": {"content": "根据资料，OpenRouter Web Search 支持多个 engine。[1]"}}],
+                "output": {
+                    "choices": [{"message": {"content": "根据联网搜索结果回答。"}}],
+                    "search_results": [
+                        {"title": "不应读取", "url": "https://example.invalid"}
+                    ],
+                    "search_info": {
+                        "search_results": [
+                            {"title": "阿里云联网搜索", "url": "https://help.aliyun.com/zh/model-studio/web-search/"}
+                        ]
+                    },
+                },
             }
             result = openai_compatible_request(
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -525,13 +525,79 @@ class HarnessHttpTests(unittest.TestCase):
                 options,
             )
 
+        self.assertEqual(
+            post_json.call_args.args[0],
+            "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+        )
         payload = post_json.call_args.args[2]
-        self.assertIn("Brave Search 返回的公开网页检索结果", payload["messages"][1]["content"])
+        get_json.assert_not_called()
+        self.assertEqual(payload["input"]["messages"][1]["content"], "OpenRouter Web Search 支持哪些 engine？")
+        self.assertTrue(payload["parameters"]["enable_search"])
+        self.assertEqual(payload["parameters"]["search_options"]["forced_search"], True)
+        self.assertEqual(payload["parameters"]["search_options"]["search_strategy"], "turbo")
+        self.assertTrue(payload["parameters"]["search_options"]["enable_source"])
+        self.assertTrue(payload["parameters"]["search_options"]["enable_citation"])
+        self.assertEqual(payload["parameters"]["search_options"]["citation_format"], "[ref_<number>]")
         self.assertEqual(
             result["citations"],
-            [{"url": "https://openrouter.ai/docs/guides/features/plugins/web-search", "title": "OpenRouter Web Search"}],
+            [{"url": "https://help.aliyun.com/zh/model-studio/web-search/", "title": "阿里云联网搜索"}],
         )
-        self.assertIn("brave_results", result["raw_response"])
+        self.assertNotIn("brave_results", result["raw_response"])
+
+    def test_ernie_search_uses_native_enable_search_without_brave(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "force",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test-key"}), \
+             mock.patch("src.adapters.get_json") as get_json, \
+             mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "ernie-4.5-turbo-32k",
+                "search_results": [
+                    {"title": "百度智能云联网搜索", "url": "https://cloud.baidu.com/doc/qianfan-docs/s/Wm8r4sw29"}
+                ],
+                "choices": [
+                    {
+                        "message": {
+                            "content": "根据联网搜索结果回答。",
+                        }
+                    }
+                ],
+            }
+            result = openai_compatible_request(
+                "https://qianfan.baidubce.com/v2",
+                "ernie-test-key",
+                "ernie-4.5-turbo-32k",
+                "联网搜索如何开启？",
+                0.1,
+                "ernie",
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        get_json.assert_not_called()
+        self.assertEqual(payload["messages"][1]["content"], "联网搜索如何开启？")
+        self.assertNotIn("enable_search", payload)
+        self.assertEqual(
+            payload["web_search"],
+            {
+                "enable": True,
+                "enable_trace": True,
+                "enable_citation": True,
+                "search_mode": "auto",
+                "search_number": 10,
+                "reference_number": 5,
+            },
+        )
+        self.assertEqual(
+            result["citations"],
+            [{"url": "https://cloud.baidu.com/doc/qianfan-docs/s/Wm8r4sw29", "title": "百度智能云联网搜索"}],
+        )
+        self.assertNotIn("brave_results", result["raw_response"])
 
     def test_openrouter_online_payload_uses_web_plugin_and_citations(self):
         options = normalize_run_options(

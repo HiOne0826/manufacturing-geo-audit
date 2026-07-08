@@ -19,7 +19,7 @@ class AdapterError(RuntimeError):
 
 
 OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
-BRAVE_AUGMENTED_PROVIDERS = {"deepseek", "qwen", "ernie"}
+BRAVE_AUGMENTED_PROVIDERS = {"deepseek"}
 
 PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "openai": {
@@ -406,6 +406,15 @@ def normalize_base(base: str) -> str:
     return (base or "").rstrip("/")
 
 
+def dashscope_generation_url(base: str) -> str:
+    normalized = normalize_base(base)
+    if normalized.endswith("/compatible-mode/v1"):
+        return f"{normalized[: -len('/compatible-mode/v1')]}/api/v1/services/aigc/text-generation/generation"
+    if normalized.endswith("/api/v1"):
+        return f"{normalized}/services/aigc/text-generation/generation"
+    return "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+
+
 def mask_key(value: str) -> str:
     if not value:
         return ""
@@ -415,6 +424,13 @@ def mask_key(value: str) -> str:
 
 
 def normalize_choice_text(data: dict[str, Any]) -> str:
+    output = data.get("output") or {}
+    output_choices = output.get("choices") or []
+    if output_choices:
+        message = output_choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
     choices = data.get("choices") or []
     if not choices:
         return ""
@@ -508,6 +524,10 @@ def extract_qwen_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     for item in search_info.get("search_results") or []:
         if isinstance(item, dict):
             citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
+    output_search_info = (data.get("output") or {}).get("search_info") or {}
+    for item in output_search_info.get("search_results") or []:
+        if isinstance(item, dict):
+            citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
     for choice in data.get("choices") or []:
         message = choice.get("message") or {}
         message_search_info = message.get("search_info") or {}
@@ -534,12 +554,18 @@ def extract_hunyuan_citations(data: dict[str, Any]) -> list[dict[str, str]]:
 
 def extract_ernie_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     citations = extract_generic_citations(data)
+    for item in data.get("search_results") or []:
+        if isinstance(item, dict):
+            citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
     web_search = data.get("web_search") or {}
     for item in web_search.get("references") or []:
         if isinstance(item, dict):
             citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
     for choice in data.get("choices") or []:
         message = choice.get("message") or {}
+        for item in message.get("search_results") or []:
+            if isinstance(item, dict):
+                citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
         for item in (message.get("references") or message.get("citations") or []):
             if isinstance(item, dict):
                 citations.append({"url": item.get("url", ""), "title": item.get("title", "")})
@@ -871,7 +897,10 @@ def build_qwen_chat_payload(
     payload = build_openai_chat_payload(model, question, temperature)
     if options["search_enabled"]:
         payload["enable_search"] = True
-        search_options: dict[str, Any] = {}
+        search_options: dict[str, Any] = {
+            "enable_source": True,
+            "enable_citation": True,
+        }
         if options["search_mode"] == "force":
             search_options["forced_search"] = True
         if options["search_strategy"]:
@@ -887,12 +916,10 @@ def build_qwen_chat_payload(
             ]
         if options["search_prompt_intervene"]:
             search_options["intention_options"] = {"prompt_intervene": options["search_prompt_intervene"]}
-        if options["search_enable_source"]:
-            search_options["enable_source"] = True
-        if options["search_enable_citation"]:
-            search_options["enable_citation"] = True
         if options["search_citation_format"]:
             search_options["citation_format"] = options["search_citation_format"]
+        else:
+            search_options["citation_format"] = "[ref_<number>]"
         if search_options:
             payload["search_options"] = search_options
     if options["reasoning_effort"]:
@@ -904,6 +931,25 @@ def build_qwen_chat_payload(
     if options["thinking_budget"] is not None:
         payload["thinking_budget"] = options["thinking_budget"]
     return payload
+
+
+def build_qwen_generation_payload(
+    model: str,
+    question: str,
+    temperature: float,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    chat_payload = build_qwen_chat_payload(model, question, temperature, options)
+    return {
+        "model": model,
+        "input": {"messages": chat_payload["messages"]},
+        "parameters": {
+            "enable_search": True,
+            "search_options": chat_payload.get("search_options", {"enable_source": True, "enable_citation": True}),
+            "result_format": "message",
+            "temperature": temperature,
+        },
+    }
 
 
 def build_kimi_chat_payload(
@@ -943,7 +989,14 @@ def build_ernie_chat_payload(
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
     if options["search_enabled"]:
-        payload["enable_search"] = True
+        payload["web_search"] = {
+            "enable": True,
+            "enable_trace": True,
+            "enable_citation": True,
+            "search_mode": "auto",
+            "search_number": 10,
+            "reference_number": 5,
+        }
     if options["thinking_type"] in {"enabled", "auto"}:
         payload["enable_thinking"] = True
     elif options["thinking_type"] == "disabled":
@@ -1040,12 +1093,20 @@ def openai_compatible_request(
         except AdapterError as exc:
             label = {"deepseek": "DeepSeek", "qwen": "通义千问", "ernie": "文心一言"}.get(provider, provider)
             raise AdapterError(f"{label} 联网口径依赖 Brave Search 失败：{exc}") from exc
-    payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
-    data = post_json(
-        f"{normalize_base(base)}/chat/completions",
-        {"Authorization": f"Bearer {api_key}"},
-        payload,
-    )
+    if provider == "qwen" and options["search_enabled"]:
+        payload = build_qwen_generation_payload(model, request_question, temperature, options)
+        data = post_json(
+            dashscope_generation_url(base),
+            {"Authorization": f"Bearer {api_key}"},
+            payload,
+        )
+    else:
+        payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
+        data = post_json(
+            f"{normalize_base(base)}/chat/completions",
+            {"Authorization": f"Bearer {api_key}"},
+            payload,
+        )
     citations = dedupe_citations(extract_generic_citations(data))
     if provider == "qwen":
         citations = extract_qwen_citations(data)
