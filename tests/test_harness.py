@@ -972,15 +972,32 @@ class HarnessHttpTests(unittest.TestCase):
             )
             conn.commit()
         app.SAMPLING_JOBS.clear()
+        imported = self.request_json(
+            "POST",
+            "/api/questions/import_rows",
+            {
+                "project_id": project_id,
+                "rows": [
+                    {
+                        "question_id": "T003",
+                        "question": "第 3 个测试问题，测试品牌表现如何？",
+                        "question_type": "brand_direct",
+                        "target_brand": "测试品牌",
+                        "competitor_brands": "竞品A;竞品B",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(imported["count"], 1)
 
         status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
-        self.assertEqual(status["total"], 2)
+        self.assertEqual(status["total"], 3)
         self.assertEqual(status["completed"], 2)
         self.assertEqual(status["success"], 2)
         self.assertEqual(status["failed"], 0)
-        self.assertEqual(status["source_statuses"][0]["total"], 2)
+        self.assertEqual(status["source_statuses"][0]["total"], 3)
         self.assertEqual(status["source_statuses"][0]["completed"], 2)
-        self.assertEqual(status["source_statuses"][0]["queued"], 0)
+        self.assertEqual(status["source_statuses"][0]["queued"], 1)
 
     def test_analytics_summary_reports_visibility_and_quality(self):
         project_id, model_id = self.create_mock_project(question_count=2)

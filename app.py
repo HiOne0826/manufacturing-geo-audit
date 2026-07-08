@@ -235,8 +235,15 @@ def latest_logical_runs(rows: list[dict]) -> list[dict]:
     return latest
 
 
-def latest_run_progress(rows: list[dict]) -> dict:
-    total = len(rows)
+def planned_batch_total(conn, batch: dict) -> int:
+    try:
+        return estimate_batch_total(conn, int(batch["project_id"]), batch.get("config") or {})
+    except Exception:
+        return int(batch.get("total_count", 0) or 0)
+
+
+def latest_run_progress(rows: list[dict], total: int) -> dict:
+    total = max(total, len(rows))
     success = sum(1 for row in rows if row.get("status") == "success")
     failed = sum(1 for row in rows if row.get("status") == "failed")
     completed = success + failed
@@ -281,7 +288,7 @@ def finalize_source_status(item: dict, batch_status: str, current_platform: str 
 
 def source_statuses_for_batch(conn, batch: dict, job: dict | None = None) -> list[dict]:
     rows = latest_logical_runs(list_runs_by_batch(conn, batch["batch_id"]))
-    statuses = {} if rows else planned_source_statuses(conn, batch)
+    statuses = planned_source_statuses(conn, batch)
     for row in rows:
         platform = row.get("test_platform") or test_platform_name(row.get("provider"), row.get("model"))
         current = statuses.setdefault(
@@ -334,7 +341,7 @@ def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> d
         base.update(job)
     rows = latest_logical_runs(list_runs_by_batch(conn, batch["batch_id"]))
     if rows and not job:
-        base.update(latest_run_progress(rows))
+        base.update(latest_run_progress(rows, planned_batch_total(conn, batch)))
     base["source_statuses"] = source_statuses_for_batch(conn, batch, job)
     return base
 
