@@ -78,9 +78,9 @@ def main() -> int:
 
     rows = [
         {
-            "question_id": f"S{idx:03d}",
-            "question": f"Smoke 第 {idx} 个问题，Smoke 测试品牌表现如何？",
-            "question_type": "smoke",
+            "问题ID": f"S{idx:03d}",
+            "问题内容": f"Smoke 第 {idx} 个问题，Smoke 测试品牌表现如何？",
+            "问题类型": "smoke",
             "target_brand": "Smoke 测试品牌",
             "competitor_brands": "竞品A;竞品B",
         }

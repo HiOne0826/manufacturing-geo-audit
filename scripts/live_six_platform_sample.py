@@ -100,9 +100,9 @@ def main() -> int:
             project_id,
             [
                 {
-                    "question_id": "LIVE001",
-                    "question": "国内自动化涂装设备和涂胶控制系统有哪些值得优先了解的品牌？请简要说明理由。",
-                    "question_type": "品牌推荐",
+                    "问题ID": "LIVE001",
+                    "问题内容": "国内自动化涂装设备和涂胶控制系统有哪些值得优先了解的品牌？请简要说明理由。",
+                    "问题类型": "品牌推荐",
                     "target_brand": "英歌瑞",
                     "competitor_brands": "机器人涂装集成商;新能源涂装设备厂家",
                     "priority": "high",

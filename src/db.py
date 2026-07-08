@@ -15,11 +15,15 @@ from src.platforms import test_platform_name
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = Path(os.environ.get("GEO_AUDIT_DB_PATH", ROOT / "data" / "geo_audit.db"))
 POSTGRES_SCHEMA_PATH = ROOT / "deploy" / "postgres" / "schema.sql"
-QUESTION_CONTENT_KEYS = ("question", "问题", "问题内容", "问题文本", "question_content")
+QUESTION_CONTENT_KEYS = ("问题内容",)
 
 
 def normalize_question_row(row: dict[str, Any]) -> dict[str, Any]:
     return {str(key).replace("\ufeff", "").strip(): value for key, value in row.items() if key is not None}
+
+
+def json_text_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def extract_question_content(row: dict[str, Any]) -> str:
@@ -464,6 +468,7 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 locale TEXT DEFAULT 'zh-CN',
                 priority TEXT DEFAULT 'medium',
                 notes TEXT DEFAULT '',
+                import_row_json TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
@@ -630,6 +635,7 @@ def migrate_questions_schema(conn: sqlite3.Connection) -> None:
         "top30_pushed": "ALTER TABLE questions ADD COLUMN top30_pushed TEXT DEFAULT ''",
         "first_screen_order": "ALTER TABLE questions ADD COLUMN first_screen_order INTEGER DEFAULT 0",
         "filter_reason": "ALTER TABLE questions ADD COLUMN filter_reason TEXT DEFAULT ''",
+        "import_row_json": "ALTER TABLE questions ADD COLUMN import_row_json TEXT DEFAULT '{}'",
     }
     for name, sql in additions.items():
         if name not in columns:
@@ -890,30 +896,31 @@ def _insert_question_row(
             project_id, question_id, industry, product_category, question_type,
             question, question_source, product_line, purchase_stage, scenario,
             suggested_platforms, optimization_goal, top30_pushed, first_screen_order, filter_reason,
-            target_brand, competitor_brands, locale, priority, notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            target_brand, competitor_brands, locale, priority, notes, import_row_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(row.get("project_id") or project["id"]),
-            pick("question_id", "问题ID", default=fallback_id),
+            pick("问题ID", default=fallback_id),
             pick("industry", "行业", default="制造业"),
-            pick("product_category", "产品品类", "产品类型", default=project.get("product_category", "")),
-            pick("question_type", "问题类型", "问题来源", default="custom"),
+            pick("产品品类", "产品类型", default=project.get("product_category", "")),
+            pick("问题类型", default="custom"),
             question,
-            pick("question_source", "问题来源", default=""),
-            pick("product_line", "产品线", default=project.get("product_category", "")),
-            pick("purchase_stage", "采购阶段", default=""),
-            pick("scenario", "场景", default=""),
-            pick("suggested_platforms", "建议测试平台", default=""),
-            pick("optimization_goal", "首先核心样本可优先筛选高优先级问题", "优化目标", default=""),
-            pick("top30_pushed", "拜访前30题", "推进前30词", default=""),
-            int(pick("first_screen_order", "首轮顺序", "首发顺序", default="0") or 0),
+            pick("问题来源", default=""),
+            pick("产品线", default=project.get("product_category", "")),
+            pick("采购阶段", default=""),
+            pick("场景", default=""),
+            pick("平台", default=""),
+            pick("首先核心样本可优先筛选高优先级问题", "优化目标", default=""),
+            pick("拜访前30题", "推进前30词", default=""),
+            int(pick("首轮顺序", "首发顺序", default="0") or 0),
             pick("filter_reason", "筛选理由", default=""),
             pick("target_brand", "目标品牌", default=project.get("brand_name", "")),
             pick("competitor_brands", "竞品", default=project.get("competitors", "")),
             pick("locale", "地区", default="zh-CN"),
             pick("priority", "优先级", default="medium"),
             pick("notes", "备注", default=""),
+            json_text_value(row),
             utc_now(),
         ),
     )
@@ -931,9 +938,9 @@ def import_questions_text(conn: sqlite3.Connection, project_id: int, text: str) 
             conn,
             project,
             {
-                "question": question,
-                "question_type": "品牌推荐",
-                "priority": "medium",
+                "问题内容": question,
+                "问题类型": "品牌推荐",
+                "优先级": "medium",
             },
             f"TXT{idx:03d}",
         )
@@ -943,9 +950,7 @@ def import_questions_text(conn: sqlite3.Connection, project_id: int, text: str) 
 
 def looks_like_csv(text: str) -> bool:
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    return "," in first_line and any(
-        key in first_line for key in ("question", "问题", "问题内容", "问题类型", "产品线")
-    )
+    return "," in first_line and "问题内容" in first_line
 
 
 def import_questions_csv(conn: sqlite3.Connection, project_id: int, csv_text: str) -> int:
@@ -953,10 +958,15 @@ def import_questions_csv(conn: sqlite3.Connection, project_id: int, csv_text: st
     if not project:
         raise ValueError("项目不存在")
     if not looks_like_csv(csv_text):
+        first_line = next((line.strip() for line in csv_text.splitlines() if line.strip()), "")
+        if "," in first_line or "\t" in first_line:
+            return 0
         return import_questions_text(conn, project_id, csv_text)
     reader = csv.DictReader(csv_text.splitlines())
     count = 0
     for idx, row in enumerate(reader, start=1):
+        if not extract_question_content(row):
+            continue
         _insert_question_row(conn, project, row, f"CSV{idx:03d}")
         count += 1
     return count
@@ -968,6 +978,8 @@ def import_questions_rows(conn: sqlite3.Connection, project_id: int, rows: list[
         raise ValueError("项目不存在")
     count = 0
     for idx, row in enumerate(rows, start=1):
+        if not extract_question_content(row):
+            continue
         _insert_question_row(conn, project, row, f"FILE{idx:03d}")
         count += 1
     return count
@@ -998,7 +1010,10 @@ def list_questions(conn: sqlite3.Connection, project_id: int | None = None) -> l
         params = (project_id,)
     sql += " ORDER BY q.id DESC"
     rows = conn.execute(sql, params).fetchall()
-    return [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    for item in items:
+        item.pop("import_row_json", None)
+    return items
 
 
 def update_question(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
@@ -1373,7 +1388,7 @@ def list_runs_by_batch(conn: sqlite3.Connection, batch_id: str, limit: int = 100
         f"""
         SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
                q.product_category, q.product_line, q.purchase_stage, q.scenario,
-               q.priority AS question_priority, q.suggested_platforms,
+               q.priority AS question_priority, q.suggested_platforms, q.import_row_json,
                e.target_brand_mentioned,
                e.target_brand_rank, e.recommendation_strength, e.competitors_mentioned,
                e.owned_site_cited, e.third_party_cited, e.risk_level
@@ -1513,7 +1528,7 @@ def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200, inclu
         f"""
         SELECT r.*, q.question_id AS source_question_id, q.question, q.question_type,
                q.product_category, q.product_line, q.purchase_stage, q.scenario,
-               q.priority AS question_priority, q.suggested_platforms,
+               q.priority AS question_priority, q.suggested_platforms, q.import_row_json,
                e.target_brand_mentioned,
                e.target_brand_rank, e.recommendation_strength, e.competitors_mentioned,
                e.owned_site_cited, e.third_party_cited, e.risk_level

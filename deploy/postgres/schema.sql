@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS questions (
     locale TEXT DEFAULT 'zh-CN',
     priority TEXT DEFAULT 'medium',
     notes TEXT DEFAULT '',
+    import_row_json JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -194,7 +194,7 @@ class AgentApiTests(unittest.TestCase):
             "/api/agent/batches",
             {
                 "project_id": project_id,
-                "csv_text": "question_id,question,question_type,target_brand\nA001,请介绍Agent品牌,agent,Agent品牌\n",
+                "csv_text": "问题ID,问题内容,问题类型,平台\nA001,请介绍Agent品牌,agent,Agent Mock\n",
                 "model_ids": [model_id],
                 "options": {"repeat_count": 1, "max_workers": 2},
             },
@@ -279,9 +279,9 @@ class HarnessHttpTests(unittest.TestCase):
         )
         rows = [
             {
-                "question_id": f"T{idx:03d}",
-                "question": f"第 {idx} 个测试问题，测试品牌表现如何？",
-                "question_type": "brand_direct",
+                "问题ID": f"T{idx:03d}",
+                "问题内容": f"第 {idx} 个测试问题，测试品牌表现如何？",
+                "问题类型": "brand_direct",
                 "target_brand": "测试品牌",
                 "competitor_brands": "竞品A;竞品B",
             }
@@ -330,9 +330,9 @@ class HarnessHttpTests(unittest.TestCase):
         project_id, _ = self.create_mock_project(question_count=0)
         csv_text = "\n".join(
             [
-                "问题ID,问题内容 ,回答文本,问题类型,产品线,采购阶段,场景,优先级,建议测试平台",
-                "Q001,汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？,这段回答不应导入,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,ChatGPT",
-                "Q002,新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？,这段回答也不应导入,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,DeepSeek",
+                "问题ID,问题内容,问题类型,产品线,平台,回答原文,品牌名是否出现,品牌名出现名称,推荐排名,是否Top3,官网域名类型,竞品出现,引用来源,原始数据,测试时间",
+                "Q001,汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？,品牌推荐,FDS,ChatGPT,这段回答不应导入,,,,,,,,,",
+                "Q002,新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？,品牌推荐,FDS,DeepSeek,这段回答也不应导入,,,,,,,,,",
             ]
         )
         imported = self.request_json(
@@ -792,7 +792,7 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(result["provider"], "openrouter_gemini")
         self.assertEqual(result["model"], "gemini-2.5-flash")
 
-    def test_customer_excel_export_uses_test_platform_and_hides_internal_columns(self):
+    def test_customer_excel_export_uses_template_columns_and_suffixes_internal_columns(self):
         body = runs_to_excel_html(
             [
                 {
@@ -807,6 +807,22 @@ class HarnessHttpTests(unittest.TestCase):
                     "scenario": "汽车焊装/轻量化连接",
                     "question_priority": "高",
                     "suggested_platforms": "ChatGPT; DeepSeek",
+                    "import_row_json": json.dumps(
+                        {
+                            "问题ID": "Q001",
+                            "问题内容": "测试问题",
+                            "问题类型": "品牌推荐",
+                            "产品线": "FDS",
+                            "平台": "ChatGPT",
+                            "品牌名是否出现": "待分析",
+                            "品牌名出现名称": "",
+                            "推荐排名": "",
+                            "是否Top3": "",
+                            "官网域名类型": "",
+                            "竞品出现": "",
+                        },
+                        ensure_ascii=False,
+                    ),
                     "provider": "doubao",
                     "model": "doubao-seed-2-0-mini-260428",
                     "search_enabled": True,
@@ -828,24 +844,25 @@ class HarnessHttpTests(unittest.TestCase):
                         {"url": "https://example.com/a", "title": "A"},
                         {"uri": "https://example.com/b", "title": "B"},
                     ]),
+                    "raw_response_json": json.dumps({"answer": "回答内容"}, ensure_ascii=False),
                     "error_message": "",
                 }
             ]
         )
-        expected_order = ["问题ID", "问题内容", "回答文本", "引用来源", "问题类型", "产品类型", "产品线", "采购阶段", "场景", "优先级", "建议测试平台", "运行ID", "批次ID", "测试平台", "联网搜索", "生成时间", "状态", "耗时", "错误信息"]
-        self.assertLess(body.index("问题ID"), body.index("回答文本"))
-        self.assertLess(body.index("回答文本"), body.index("引用来源"))
-        self.assertLess(body.index("引用来源"), body.index("问题类型"))
-        self.assertLess(body.index("建议测试平台"), body.index("运行ID"))
+        expected_order = ["问题ID", "问题内容", "问题类型", "产品线", "平台", "回答原文", "品牌名是否出现", "品牌名出现名称", "推荐排名", "是否Top3", "官网域名类型", "竞品出现", "引用来源", "原始数据", "测试时间", "运行ID（内部信息）", "批次ID（内部信息）", "测试平台（内部信息）", "联网搜索（内部信息）", "状态（内部信息）", "耗时（内部信息）", "错误信息（内部信息）"]
+        self.assertLess(body.index("平台"), body.index("回答原文"))
+        self.assertLess(body.index("回答原文"), body.index("品牌名是否出现"))
+        self.assertLess(body.index("测试时间"), body.index("运行ID（内部信息）"))
         for header in expected_order:
             self.assertIn(header, body)
-        for value in ["Q001", "产品类型A", "FDS", "认知阶段", "汽车焊装/轻量化连接", "高", "ChatGPT; DeepSeek", "回答内容", "https://example.com/a; https://example.com/b"]:
+        for value in ["Q001", "FDS", "豆包", "待分析", "回答内容", "https://example.com/a; https://example.com/b", "{&quot;answer&quot;:&quot;回答内容&quot;}"]:
             self.assertIn(value, body)
-        self.assertIn("测试平台", body)
+        self.assertNotIn("<td>ChatGPT</td>", body)
+        self.assertIn("测试平台（内部信息）", body)
         self.assertIn("豆包", body)
-        self.assertNotIn("doubao-seed-2-0-mini-260428", body)
-        for hidden_header in ["搜索策略", "思考模式", "推理强度", "思考预算", "重复次数", "推荐强度", "竞品共现", "官网引用", "第三方引用", "风险等级"]:
-            self.assertNotIn(hidden_header, body)
+        self.assertIn("doubao-seed-2-0-mini-260428", body)
+        for internal_header in ["思考模式（内部信息）", "推理强度（内部信息）", "思考预算（内部信息）", "重复次数（内部信息）", "推荐强度（内部信息）", "竞品共现（内部信息）", "官网引用（内部信息）", "第三方引用（内部信息）", "风险等级（内部信息）"]:
+            self.assertIn(internal_header, body)
         csv_body = runs_to_csv([
             {
                 "run_id": "run-test",
@@ -861,18 +878,23 @@ class HarnessHttpTests(unittest.TestCase):
                 "scenario": "汽车焊装/轻量化连接",
                 "question_priority": "高",
                 "suggested_platforms": "ChatGPT; DeepSeek",
+                "import_row_json": json.dumps({"问题ID": "Q001", "问题内容": "测试问题", "问题类型": "品牌推荐", "产品线": "FDS", "平台": "ChatGPT"}, ensure_ascii=False),
                 "provider": "doubao",
                 "model": "doubao-seed-2-0-mini-260428",
                 "search_enabled": True,
                 "requested_at": "2026-07-04T00:00:00+00:00",
                 "status": "success",
                 "latency_ms": 123,
+                "raw_response_json": {"answer": "回答内容"},
                 "error_message": "",
             }
         ])
-        self.assertTrue(csv_body.splitlines()[0].startswith("问题ID,问题内容,回答文本,引用来源,问题类型,产品类型,产品线,采购阶段,场景,优先级,建议测试平台,运行ID"))
+        self.assertTrue(csv_body.splitlines()[0].startswith("问题ID,问题内容,问题类型,产品线,平台,回答原文,品牌名是否出现"))
         self.assertIn("回答内容", csv_body)
         self.assertIn("https://example.com/a; https://example.com/b", csv_body)
+        self.assertIn('"{""answer"":""回答内容""}"', csv_body)
+        self.assertIn(",豆包,", csv_body)
+        self.assertNotIn(",ChatGPT,", csv_body)
 
         routed = runs_to_excel_html(
             [
@@ -908,8 +930,9 @@ class HarnessHttpTests(unittest.TestCase):
         )
         self.assertIn("OpenRouter-GPT", routed)
         self.assertIn("OpenRouter-Gemini", routed)
-        self.assertNotIn("openai/gpt-5.2", routed)
-        self.assertNotIn("google/gemini-2.5-flash", routed)
+        self.assertIn("模型（内部信息）", routed)
+        self.assertIn("openai/gpt-5.2", routed)
+        self.assertIn("google/gemini-2.5-flash", routed)
 
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
@@ -1113,9 +1136,9 @@ class HarnessHttpTests(unittest.TestCase):
                 "project_id": project_id,
                 "rows": [
                     {
-                        "question_id": "T003",
-                        "question": "第 3 个测试问题，测试品牌表现如何？",
-                        "question_type": "brand_direct",
+                        "问题ID": "T003",
+                        "问题内容": "第 3 个测试问题，测试品牌表现如何？",
+                        "问题类型": "brand_direct",
                         "target_brand": "测试品牌",
                         "competitor_brands": "竞品A;竞品B",
                     }
@@ -1219,19 +1242,19 @@ class HarnessDirectTests(unittest.TestCase):
                 rows = [
                     {
                         "问题ID": "Q001",
-                        "问题内容 ": "汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？",
-                        "回答文本": "这段回答不应导入",
+                        "问题内容": "汽车白车身多材料连接有哪些 FDS 热熔螺接设备品牌值得推荐？",
                         "问题类型": "品牌推荐",
                         "产品线": "FDS",
-                        "建议测试平台": "ChatGPT",
+                        "平台": "ChatGPT",
+                        "回答原文": "这段回答不应导入",
                     },
                     {
                         "问题ID": "Q002",
-                        "问题内容 ": "新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？",
-                        "回答文本": "这段回答也不应导入",
+                        "问题内容": "新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？",
                         "问题类型": "品牌推荐",
                         "产品线": "FDS",
-                        "建议测试平台": "DeepSeek",
+                        "平台": "DeepSeek",
+                        "回答原文": "这段回答也不应导入",
                     },
                 ]
                 self.assertEqual(import_question_content_rows(conn, project_id, rows), 2)
@@ -1348,9 +1371,9 @@ class HarnessDirectTests(unittest.TestCase):
                 )
                 rows = [
                     {
-                        "question_id": f"L{idx:03d}",
-                        "question": f"第 {idx} 个本地负载问题，测试品牌是否出现？",
-                        "question_type": "load",
+                        "问题ID": f"L{idx:03d}",
+                        "问题内容": f"第 {idx} 个本地负载问题，测试品牌是否出现？",
+                        "问题类型": "load",
                         "target_brand": "测试品牌",
                         "competitor_brands": "竞品A;竞品B",
                     }
@@ -1401,9 +1424,9 @@ class HarnessDirectTests(unittest.TestCase):
                 )
                 rows = [
                     {
-                        "question_id": f"P{idx:03d}",
-                        "question": f"第 {idx} 个暂停测试问题，暂停测试品牌是否出现？",
-                        "question_type": "pause",
+                        "问题ID": f"P{idx:03d}",
+                        "问题内容": f"第 {idx} 个暂停测试问题，暂停测试品牌是否出现？",
+                        "问题类型": "pause",
                         "target_brand": "暂停测试品牌",
                     }
                     for idx in range(1, 4)
@@ -1458,9 +1481,9 @@ class HarnessDirectTests(unittest.TestCase):
                     )
                     rows = [
                         {
-                            "question_id": f"M{idx:03d}",
-                            "question": f"第 {idx} 个混合批次问题，混合测试品牌是否出现？",
-                            "question_type": "mixed",
+                            "问题ID": f"M{idx:03d}",
+                            "问题内容": f"第 {idx} 个混合批次问题，混合测试品牌是否出现？",
+                            "问题类型": "mixed",
                             "target_brand": "混合测试品牌",
                         }
                         for idx in range(1, 3)
@@ -1525,9 +1548,9 @@ class HarnessDirectTests(unittest.TestCase):
                 )
                 rows = [
                     {
-                        "question_id": f"R{idx:03d}",
-                        "question": f"第 {idx} 个重跑问题，重跑测试品牌是否出现？",
-                        "question_type": "rerun",
+                        "问题ID": f"R{idx:03d}",
+                        "问题内容": f"第 {idx} 个重跑问题，重跑测试品牌是否出现？",
+                        "问题类型": "rerun",
                         "target_brand": "重跑测试品牌",
                     }
                     for idx in range(1, 3)

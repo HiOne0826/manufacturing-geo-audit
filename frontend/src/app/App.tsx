@@ -197,7 +197,7 @@ function QuestionsPage() {
   const parsedQuestionRows = useMemo(() => extractQuestionRows(csvText), [csvText]);
   const pendingImportLabel = selectedFile ? "文件" : parsedQuestions.length;
   const importPaste = useMutation({
-    mutationFn: () => parsedQuestionRows.length ? questionsApi.importRows(projectId!, parsedQuestionRows) : questionsApi.importText(projectId!, parsedQuestions.join("\n")),
+    mutationFn: () => questionsApi.importRows(projectId!, parsedQuestionRows),
     onSuccess: () => {
       setCsvText("");
       queryClient.invalidateQueries({ queryKey: ["questions", projectId] });
@@ -223,13 +223,13 @@ function QuestionsPage() {
           <div className="question-import">
             <div className="import-summary">
               <Metric label="当前问题" value={questions.data?.questions.length || 0} />
-              <Metric label="待导入" value={pendingImportLabel} hint={selectedFile ? selectedFile.name : "采样只使用问题内容"} />
+              <Metric label="待导入" value={pendingImportLabel} hint={selectedFile ? selectedFile.name : "采样只使用“问题内容”列"} />
             </div>
             <label>
               粘贴问题或表格
               <textarea
                 className="question-textarea"
-                placeholder={"每行一个问题，或粘贴带表头的 CSV/TSV。带表头时会保留问题类型、产品线、采购阶段、场景、优先级等字段；采样只使用问题内容。\n\n问题ID,问题内容,回答文本,问题类型,产品线,采购阶段,场景,优先级,建议测试平台\nQ001,汽车白车身多材料连接有哪些推荐品牌？,,品牌推荐,FDS,认知阶段,汽车焊装/轻量化连接,高,ChatGPT"}
+                placeholder={"粘贴带表头的 CSV/TSV，必须包含“问题内容”列。采样只使用“问题内容”，其他模板字段会在导出时保留。\n\n问题ID,问题内容,问题类型,产品线,平台,回答原文,品牌名是否出现,品牌名出现名称,推荐排名,是否Top3,官网域名类型,竞品出现,引用来源,原始数据,测试时间\nQ001,汽车白车身多材料连接有哪些推荐品牌？,品牌推荐,FDS,ChatGPT,,,,,,,,,,"}
                 value={csvText}
                 onChange={(event) => setCsvText(event.target.value)}
               />
@@ -261,20 +261,12 @@ function QuestionsPage() {
   );
 }
 
-const questionContentHeaders = new Set(["question", "问题", "问题内容", "问题文本", "question_content"]);
+const questionContentHeaders = new Set(["问题内容"]);
 
 function extractQuestionContents(text: string) {
   const structuredRows = extractQuestionRows(text);
   if (structuredRows.length) return structuredRows.map((row) => questionValue(row)).filter(Boolean);
-  const fallbackLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const firstLine = fallbackLines[0] || "";
-  const delimiter = firstLine.includes("\t") ? "\t" : firstLine.includes(",") ? "," : "";
-  if (!delimiter) return fallbackLines;
-  const rows = parseDelimitedRows(text, delimiter);
-  if (rows.length < 2) return fallbackLines;
-  const questionIndex = rows[0].findIndex((cell) => questionContentHeaders.has(normalizeHeader(cell)));
-  if (questionIndex < 0) return fallbackLines;
-  return rows.slice(1).map((row) => (row[questionIndex] || "").trim()).filter(Boolean);
+  return [];
 }
 
 function extractQuestionRows(text: string): Record<string, string>[] {
@@ -362,13 +354,9 @@ function QuestionTable({ questions, onDelete, deletingId }: { questions: Questio
           <tr>
             <th>问题ID</th>
             <th>问题内容</th>
-            <th>回答文本</th>
             <th>问题类型</th>
             <th>产品线</th>
-            <th>采购阶段</th>
-            <th>场景</th>
-            <th>优先级</th>
-            <th>建议测试平台</th>
+            <th>平台</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -377,12 +365,8 @@ function QuestionTable({ questions, onDelete, deletingId }: { questions: Questio
             <tr key={q.id}>
               <td>{q.question_id || "-"}</td>
               <td className="question-content-cell">{q.question}</td>
-              <td>-</td>
               <td>{q.question_type || "-"}</td>
               <td>{q.product_line || q.product_category || "-"}</td>
-              <td>{q.purchase_stage || "-"}</td>
-              <td>{q.scenario || "-"}</td>
-              <td>{q.priority || "-"}</td>
               <td>{q.suggested_platforms || "-"}</td>
               <td>
                 <button className="icon-button danger" type="button" disabled={deletingId === q.id} aria-label="删除问题" title="删除问题" onClick={() => onDelete(q.id)}>
@@ -865,23 +849,19 @@ function RunsTable({ runs }: { runs: ModelRun[] }) {
           <tr>
             <th>问题ID</th>
             <th>问题内容</th>
-            <th>回答文本</th>
-            <th>引用来源</th>
             <th>问题类型</th>
-            <th>产品类型</th>
             <th>产品线</th>
-            <th>采购阶段</th>
-            <th>场景</th>
-            <th>优先级</th>
-            <th>建议测试平台</th>
-            <th>运行ID</th>
-            <th>批次ID</th>
-            <th>测试平台</th>
-            <th>联网搜索</th>
-            <th>生成时间</th>
-            <th>状态</th>
-            <th>耗时</th>
-            <th>错误信息</th>
+            <th>平台</th>
+            <th>回答原文</th>
+            <th>引用来源</th>
+            <th>测试时间</th>
+            <th>运行ID（内部信息）</th>
+            <th>批次ID（内部信息）</th>
+            <th>测试平台（内部信息）</th>
+            <th>联网搜索（内部信息）</th>
+            <th>状态（内部信息）</th>
+            <th>耗时（内部信息）</th>
+            <th>错误信息（内部信息）</th>
           </tr>
         </thead>
         <tbody>
@@ -889,20 +869,16 @@ function RunsTable({ runs }: { runs: ModelRun[] }) {
             <tr key={run.id}>
               <td>{run.source_question_id || "-"}</td>
               <td className="question-content-cell">{run.question || "-"}</td>
+              <td>{run.question_type || "-"}</td>
+              <td>{run.product_line || "-"}</td>
+              <td>{runPlatform(run)}</td>
               <td className="answer-text-cell">{run.response_text || "-"}</td>
               <td className="citation-source-cell">{citationUrls(run.citations_json) || "-"}</td>
-              <td>{run.question_type || "-"}</td>
-              <td>{run.product_category || "-"}</td>
-              <td>{run.product_line || "-"}</td>
-              <td>{run.purchase_stage || "-"}</td>
-              <td>{run.scenario || "-"}</td>
-              <td>{run.question_priority || "-"}</td>
-              <td>{run.suggested_platforms || "-"}</td>
+              <td>{formatDateTime(run.requested_at)}</td>
               <td>{run.run_id || "-"}</td>
               <td>{run.batch_id || "-"}</td>
               <td>{runPlatform(run)}</td>
               <td>{run.search_enabled ? "是" : "否"}</td>
-              <td>{formatDateTime(run.requested_at)}</td>
               <td>{run.status || "-"}</td>
               <td>{run.latency_ms || 0} ms</td>
               <td className="error-message-cell">{run.error_message || "-"}</td>

@@ -16,23 +16,39 @@ EXPORT_PLATFORM_NAMES = {
 RUN_EXPORT_COLUMNS = [
     ("问题ID", "source_question_id"),
     ("问题内容", "question"),
-    ("回答文本", "response_text"),
-    ("引用来源", "citation_sources"),
     ("问题类型", "question_type"),
-    ("产品类型", "product_category"),
     ("产品线", "product_line"),
-    ("采购阶段", "purchase_stage"),
-    ("场景", "scenario"),
-    ("优先级", "question_priority"),
-    ("建议测试平台", "suggested_platforms"),
-    ("运行ID", "run_id"),
-    ("批次ID", "batch_id"),
-    ("测试平台", "test_platform"),
-    ("联网搜索", "search_enabled_label"),
-    ("生成时间", "requested_at"),
-    ("状态", "status"),
-    ("耗时", "latency_ms_label"),
-    ("错误信息", "error_message"),
+    ("平台", "test_platform"),
+    ("回答原文", "response_text"),
+    ("品牌名是否出现", "imported:品牌名是否出现"),
+    ("品牌名出现名称", "imported:品牌名出现名称"),
+    ("推荐排名", "imported:推荐排名"),
+    ("是否Top3", "imported:是否Top3"),
+    ("官网域名类型", "imported:官网域名类型"),
+    ("竞品出现", "imported:竞品出现"),
+    ("引用来源", "citation_sources"),
+    ("原始数据", "raw_response_json"),
+    ("测试时间", "requested_at"),
+    ("运行ID（内部信息）", "run_id"),
+    ("批次ID（内部信息）", "batch_id"),
+    ("测试平台（内部信息）", "test_platform"),
+    ("模型（内部信息）", "model"),
+    ("联网搜索（内部信息）", "search_enabled_label"),
+    ("搜索模式（内部信息）", "search_mode"),
+    ("思考模式（内部信息）", "thinking_type"),
+    ("推理强度（内部信息）", "reasoning_effort"),
+    ("思考预算（内部信息）", "thinking_budget"),
+    ("重复次数（内部信息）", "repeat_index"),
+    ("状态（内部信息）", "status"),
+    ("耗时（内部信息）", "latency_ms_label"),
+    ("错误信息（内部信息）", "error_message"),
+    ("品牌命中（内部信息）", "target_brand_mentioned_label"),
+    ("品牌排名（内部信息）", "target_brand_rank"),
+    ("推荐强度（内部信息）", "recommendation_strength"),
+    ("竞品共现（内部信息）", "competitors_mentioned"),
+    ("官网引用（内部信息）", "owned_site_cited_label"),
+    ("第三方引用（内部信息）", "third_party_cited_label"),
+    ("风险等级（内部信息）", "risk_level"),
 ]
 
 
@@ -44,6 +60,10 @@ def export_test_platform_name(row: dict) -> str:
 
 
 def run_export_value(row: dict, key: str) -> str:
+    imported = imported_row(row)
+    if key.startswith("imported:"):
+        label = key.split(":", 1)[1]
+        return str(imported.get(label) or "")
     if key == "test_platform":
         return export_test_platform_name(row)
     if key == "search_enabled_label":
@@ -52,7 +72,57 @@ def run_export_value(row: dict, key: str) -> str:
         return f'{row.get("latency_ms", 0) or 0} ms'
     if key == "citation_sources":
         return citation_urls(row.get("citations_json"))
+    if key == "raw_response_json":
+        return compact_json(row.get("raw_response_json"))
+    if key == "target_brand_mentioned_label":
+        return bool_label(row.get("target_brand_mentioned"))
+    if key == "owned_site_cited_label":
+        return bool_label(row.get("owned_site_cited"))
+    if key == "third_party_cited_label":
+        return bool_label(row.get("third_party_cited"))
+    if key == "source_question_id":
+        return str(imported.get("问题ID") or row.get("source_question_id") or "")
+    if key == "question":
+        return str(imported.get("问题内容") or row.get("question") or "")
+    if key == "question_type":
+        return str(imported.get("问题类型") or row.get("question_type") or "")
+    if key == "product_line":
+        return str(imported.get("产品线") or row.get("product_line") or "")
     return row.get(key, "")
+
+
+def imported_row(row: dict) -> dict:
+    value = row.get("import_row_json")
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def compact_json(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def bool_label(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return "是" if value.strip().lower() in {"1", "true", "yes", "是"} else "否"
+    return "是" if bool(value) else "否"
 
 
 def citation_urls(value: object) -> str:

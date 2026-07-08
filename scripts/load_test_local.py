@@ -48,9 +48,9 @@ def main() -> int:
         )
         rows = [
             {
-                "question_id": f"L{idx:03d}",
-                "question": f"第 {idx} 个本地负载问题，本地负载测试品牌是否出现？",
-                "question_type": "load",
+                "问题ID": f"L{idx:03d}",
+                "问题内容": f"第 {idx} 个本地负载问题，本地负载测试品牌是否出现？",
+                "问题类型": "load",
                 "target_brand": "本地负载测试品牌",
                 "competitor_brands": "竞品A;竞品B",
             }
