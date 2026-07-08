@@ -15,7 +15,7 @@ from pathlib import Path
 
 import app
 from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_run_options, openai_compatible_request, openai_responses_request
-from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs
+from src.db import create_model_config, create_project, get_conn, import_question_content_rows, import_questions_rows, init_db, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
 
@@ -940,6 +940,47 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(sources["mock-model-2"]["completed"], 2)
         self.assertEqual(sources["mock-model"]["status"], "completed")
         self.assertEqual(sources["mock-model-2"]["status"], "completed")
+
+    def test_progress_uses_latest_runs_after_rerun_counts_overwrite_batch_totals(self):
+        project_id, model_id = self.create_mock_project(question_count=2)
+        started = self.request_json(
+            "POST",
+            "/api/runs/start",
+            {
+                "project_id": project_id,
+                "models": [{"model_config_id": model_id, "search_enabled": True}],
+                "repeat_count": 1,
+            },
+        )
+        batch_id = started["batch_id"]
+        for _ in range(50):
+            status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+            if status.get("status") == "completed":
+                break
+            time.sleep(0.1)
+
+        with get_conn(self.db_path) as conn:
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "total_count": 1,
+                    "completed_count": 1,
+                    "success_count": 0,
+                    "failed_count": 1,
+                },
+            )
+            conn.commit()
+        app.SAMPLING_JOBS.clear()
+
+        status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        self.assertEqual(status["total"], 2)
+        self.assertEqual(status["completed"], 2)
+        self.assertEqual(status["success"], 2)
+        self.assertEqual(status["failed"], 0)
+        self.assertEqual(status["source_statuses"][0]["total"], 2)
+        self.assertEqual(status["source_statuses"][0]["completed"], 2)
+        self.assertEqual(status["source_statuses"][0]["queued"], 0)
 
     def test_analytics_summary_reports_visibility_and_quality(self):
         project_id, model_id = self.create_mock_project(question_count=2)
