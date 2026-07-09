@@ -62,7 +62,7 @@ from src.platforms import test_platform_name
 from src.runtime_env import load_dotenv_file
 from src.runner import estimate_batch_total
 from src.db import utc_now
-from src.tasks import mark_batch_failed, perform_batch, perform_rerun_failed, perform_resume_batch, request_batch_pause
+from src.tasks import mark_batch_failed, mark_rq_job_failed, perform_batch, perform_rerun_failed, perform_resume_batch, request_batch_pause
 
 
 ROOT = Path(__file__).resolve().parent
@@ -111,7 +111,12 @@ def enqueue_rq_task(func, *args) -> str:
     queue_name = os.environ.get("RQ_QUEUE_NAME", "geo-audit")
     timeout = int(os.environ.get("RQ_JOB_TIMEOUT", "3600"))
     queue = Queue(queue_name, connection=Redis.from_url(redis_url))
-    job = queue.enqueue(func, *args, job_timeout=timeout)
+    enqueue_kwargs = {"job_timeout": timeout, "on_failure": mark_rq_job_failed}
+    try:
+        job = queue.enqueue(func, *args, **enqueue_kwargs)
+    except TypeError:
+        enqueue_kwargs.pop("on_failure")
+        job = queue.enqueue(func, *args, **enqueue_kwargs)
     return job.id
 
 
@@ -1034,6 +1039,13 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     if batch.get("status") not in {"paused", "pause_requested", "failed", "queued"}:
                         self.json_response({"error": "当前批次状态不能继续执行"}, 409)
+                        return
+                    if batch.get("status") == "pause_requested":
+                        update_sampling_batch(conn, batch_id, {"status": "running", "updated_at": utc_now()})
+                        conn.commit()
+                        set_sampling_job(batch_id, status="running", updated_at=utc_now())
+                        updated = get_sampling_batch(conn, batch_id) or batch
+                        self.json_response(progress_response_for_batch(conn, updated, get_sampling_job(batch_id)))
                         return
                     set_sampling_job(
                         batch_id,

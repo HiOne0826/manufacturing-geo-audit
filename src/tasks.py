@@ -43,6 +43,12 @@ def _full_batch_counts(conn, batch_id: str) -> dict[str, int | str]:
     return {"status": status, "total": total, "completed": completed, "success": success, "failed": failed}
 
 
+def _failure_counts(conn, batch_id: str) -> dict[str, int | str]:
+    counts = _full_batch_counts(conn, batch_id)
+    counts["status"] = "failed"
+    return counts
+
+
 def _pause_requested(batch_id: str, db_target: Path | str | None = None) -> bool:
     with get_conn(db_target) as conn:
         batch = get_sampling_batch(conn, batch_id)
@@ -68,52 +74,56 @@ def perform_batch(
     progress_hook: ProgressHook | None = None,
     db_target: Path | str | None = None,
 ) -> dict[str, Any]:
-    with get_conn(db_target) as conn:
-        update_sampling_batch(conn, batch_id, {"status": "running", "started_at": utc_now(), "updated_at": utc_now()})
-        conn.commit()
+    try:
+        with get_conn(db_target) as conn:
+            update_sampling_batch(conn, batch_id, {"status": "running", "started_at": utc_now(), "updated_at": utc_now()})
+            conn.commit()
 
-        def on_progress(progress: dict[str, Any]) -> None:
-            current_status = (get_sampling_batch(conn, batch_id) or {}).get("status")
-            next_status = "pause_requested" if current_status == "pause_requested" else "running"
+            def on_progress(progress: dict[str, Any]) -> None:
+                current_status = (get_sampling_batch(conn, batch_id) or {}).get("status")
+                next_status = "pause_requested" if current_status == "pause_requested" else "running"
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": next_status,
+                        "total_count": progress["total"],
+                        "completed_count": progress["completed"],
+                        "failed_count": progress["failed"],
+                        "success_count": progress["success"],
+                        "updated_at": utc_now(),
+                    },
+                )
+                conn.commit()
+                if progress_hook:
+                    progress_hook({**progress, "status": next_status})
+
+            result = run_batch(
+                conn,
+                project_id,
+                payload,
+                batch_id=batch_id,
+                progress_callback=on_progress,
+                should_pause=lambda: _pause_requested(batch_id, db_target),
+            )
+            final_status = "paused" if result.get("status") == "paused" else "completed"
             update_sampling_batch(
                 conn,
                 batch_id,
                 {
-                    "status": next_status,
-                    "total_count": progress["total"],
-                    "completed_count": progress["completed"],
-                    "failed_count": progress["failed"],
-                    "success_count": progress["success"],
+                    "status": final_status,
+                    "total_count": estimate_batch_total(conn, project_id, payload),
+                    "completed_count": result["success"] + result["failed"],
+                    "failed_count": result["failed"],
+                    "success_count": result["success"],
+                    "finished_at": utc_now() if final_status == "completed" else None,
                     "updated_at": utc_now(),
                 },
             )
-            conn.commit()
-            if progress_hook:
-                progress_hook({**progress, "status": next_status})
-
-        result = run_batch(
-            conn,
-            project_id,
-            payload,
-            batch_id=batch_id,
-            progress_callback=on_progress,
-            should_pause=lambda: _pause_requested(batch_id, db_target),
-        )
-        final_status = "paused" if result.get("status") == "paused" else "completed"
-        update_sampling_batch(
-            conn,
-            batch_id,
-            {
-                "status": final_status,
-                "total_count": estimate_batch_total(conn, project_id, payload),
-                "completed_count": result["success"] + result["failed"],
-                "failed_count": result["failed"],
-                "success_count": result["success"],
-                "finished_at": utc_now() if final_status == "completed" else None,
-                "updated_at": utc_now(),
-            },
-        )
-    return result
+        return result
+    except Exception as exc:
+        mark_batch_failed(batch_id, str(exc), db_target=db_target)
+        raise
 
 
 def perform_resume_batch(
@@ -123,106 +133,110 @@ def perform_resume_batch(
     db_target: Path | str | None = None,
 ) -> dict[str, Any]:
     payload = payload or {}
-    with get_conn(db_target) as conn:
-        batch = get_sampling_batch(conn, batch_id)
-        if not batch:
-            raise ValueError("批次不存在")
-        if batch.get("status") not in {"paused", "pause_requested", "queued", "failed"}:
-            raise ValueError("只有已暂停、排队或失败的批次可以继续执行")
-        project_id, run_config, tasks = build_missing_tasks_for_batch(conn, batch_id, payload)
-        project = get_project(conn, project_id)
-        if not project:
-            raise ValueError("项目不存在")
-        counts = _full_batch_counts(conn, batch_id)
-        if not tasks:
+    try:
+        with get_conn(db_target) as conn:
+            batch = get_sampling_batch(conn, batch_id)
+            if not batch:
+                raise ValueError("批次不存在")
+            if batch.get("status") not in {"paused", "queued", "failed"}:
+                raise ValueError("只有已暂停、排队或失败的批次可以继续执行")
+            project_id, run_config, tasks = build_missing_tasks_for_batch(conn, batch_id, payload)
+            project = get_project(conn, project_id)
+            if not project:
+                raise ValueError("项目不存在")
+            counts = _full_batch_counts(conn, batch_id)
+            if not tasks:
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": counts["status"],
+                        "total_count": counts["total"],
+                        "completed_count": counts["completed"],
+                        "failed_count": counts["failed"],
+                        "success_count": counts["success"],
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                )
+                return {"batch_id": batch_id, "total": 0, "failed": 0, "success": 0, "status": counts["status"]}
             update_sampling_batch(
                 conn,
                 batch_id,
                 {
-                    "status": counts["status"],
+                    "status": "running",
                     "total_count": counts["total"],
                     "completed_count": counts["completed"],
                     "failed_count": counts["failed"],
                     "success_count": counts["success"],
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
-            )
-            return {"batch_id": batch_id, "total": 0, "failed": 0, "success": 0, "status": counts["status"]}
-        update_sampling_batch(
-            conn,
-            batch_id,
-            {
-                "status": "running",
-                "total_count": counts["total"],
-                "completed_count": counts["completed"],
-                "failed_count": counts["failed"],
-                "success_count": counts["success"],
-                "error_message": "",
-                "started_at": batch.get("started_at") or utc_now(),
-                "finished_at": None,
-                "updated_at": utc_now(),
-            },
-        )
-        conn.commit()
-
-        base_completed = int(counts["completed"])
-        base_failed = int(counts["failed"])
-        base_success = int(counts["success"])
-
-        def on_progress(progress: dict[str, Any]) -> None:
-            current_status = (get_sampling_batch(conn, batch_id) or {}).get("status")
-            next_status = "pause_requested" if current_status == "pause_requested" else "running"
-            update_sampling_batch(
-                conn,
-                batch_id,
-                {
-                    "status": next_status,
-                    "total_count": counts["total"],
-                    "completed_count": base_completed + progress["completed"],
-                    "failed_count": base_failed + progress["failed"],
-                    "success_count": base_success + progress["success"],
+                    "error_message": "",
+                    "started_at": batch.get("started_at") or utc_now(),
+                    "finished_at": None,
                     "updated_at": utc_now(),
                 },
             )
             conn.commit()
-            if progress_hook:
-                progress_hook(
-                    {
-                        **progress,
-                        "status": next_status,
-                        "total": counts["total"],
-                        "completed": base_completed + progress["completed"],
-                        "failed": base_failed + progress["failed"],
-                        "success": base_success + progress["success"],
-                    }
-                )
 
-        result = run_prepared_tasks(
-            tasks=tasks,
-            db_target=db_target,
-            project=project,
-            config=run_config,
-            batch_id=batch_id,
-            progress_callback=on_progress,
-            should_pause=lambda: _pause_requested(batch_id, db_target),
-        )
-        final_counts = _full_batch_counts(conn, batch_id)
-        final_status = "paused" if result.get("status") == "paused" else final_counts["status"]
-        update_sampling_batch(
-            conn,
-            batch_id,
-            {
-                "status": final_status,
-                "total_count": final_counts["total"],
-                "completed_count": final_counts["completed"],
-                "failed_count": final_counts["failed"],
-                "success_count": final_counts["success"],
-                "finished_at": utc_now() if final_status != "paused" else None,
-                "updated_at": utc_now(),
-            },
-        )
-    return {**result, "status": final_status}
+            base_completed = int(counts["completed"])
+            base_failed = int(counts["failed"])
+            base_success = int(counts["success"])
+
+            def on_progress(progress: dict[str, Any]) -> None:
+                current_status = (get_sampling_batch(conn, batch_id) or {}).get("status")
+                next_status = "pause_requested" if current_status == "pause_requested" else "running"
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": next_status,
+                        "total_count": counts["total"],
+                        "completed_count": base_completed + progress["completed"],
+                        "failed_count": base_failed + progress["failed"],
+                        "success_count": base_success + progress["success"],
+                        "updated_at": utc_now(),
+                    },
+                )
+                conn.commit()
+                if progress_hook:
+                    progress_hook(
+                        {
+                            **progress,
+                            "status": next_status,
+                            "total": counts["total"],
+                            "completed": base_completed + progress["completed"],
+                            "failed": base_failed + progress["failed"],
+                            "success": base_success + progress["success"],
+                        }
+                    )
+
+            result = run_prepared_tasks(
+                tasks=tasks,
+                db_target=db_target,
+                project=project,
+                config=run_config,
+                batch_id=batch_id,
+                progress_callback=on_progress,
+                should_pause=lambda: _pause_requested(batch_id, db_target),
+            )
+            final_counts = _full_batch_counts(conn, batch_id)
+            final_status = "paused" if result.get("status") == "paused" else final_counts["status"]
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": final_status,
+                    "total_count": final_counts["total"],
+                    "completed_count": final_counts["completed"],
+                    "failed_count": final_counts["failed"],
+                    "success_count": final_counts["success"],
+                    "finished_at": utc_now() if final_status != "paused" else None,
+                    "updated_at": utc_now(),
+                },
+            )
+        return {**result, "status": final_status}
+    except Exception as exc:
+        mark_batch_failed(batch_id, str(exc), db_target=db_target)
+        raise
 
 
 def perform_rerun_failed(
@@ -231,51 +245,55 @@ def perform_rerun_failed(
     progress_hook: ProgressHook | None = None,
     db_target: Path | str | None = None,
 ) -> dict[str, Any]:
-    with get_conn(db_target) as conn:
-        failed_runs = list_failed_runs_by_batch(conn, batch_id)
-        if not failed_runs:
-            batch = get_sampling_batch(conn, batch_id)
-            return {
-                "batch_id": batch_id,
-                "total": int((batch or {}).get("total_count", 0) or 0),
-                "failed": int((batch or {}).get("failed_count", 0) or 0),
-                "success": int((batch or {}).get("success_count", 0) or 0),
-                "status": (batch or {}).get("status", "completed"),
-            }
-        update_sampling_batch(
-            conn,
-            batch_id,
-            {
-                "status": "running",
-                "total_count": len(failed_runs),
-                "completed_count": 0,
-                "failed_count": 0,
-                "success_count": 0,
-                "error_message": "",
-                "started_at": utc_now(),
-                "finished_at": None,
-                "updated_at": utc_now(),
-            },
-        )
-        conn.commit()
-        result = rerun_failed_runs(conn, batch_id, failed_runs, payload)
-        full_counts = _full_batch_counts(conn, batch_id)
-        update_sampling_batch(
-            conn,
-            batch_id,
-            {
-                "status": full_counts["status"],
-                "total_count": full_counts["total"],
-                "completed_count": full_counts["completed"],
-                "failed_count": full_counts["failed"],
-                "success_count": full_counts["success"],
-                "finished_at": utc_now(),
-                "updated_at": utc_now(),
-            },
-        )
-    if progress_hook:
-        progress_hook({"batch_id": batch_id, **result})
-    return result
+    try:
+        with get_conn(db_target) as conn:
+            failed_runs = list_failed_runs_by_batch(conn, batch_id)
+            if not failed_runs:
+                batch = get_sampling_batch(conn, batch_id)
+                return {
+                    "batch_id": batch_id,
+                    "total": int((batch or {}).get("total_count", 0) or 0),
+                    "failed": int((batch or {}).get("failed_count", 0) or 0),
+                    "success": int((batch or {}).get("success_count", 0) or 0),
+                    "status": (batch or {}).get("status", "completed"),
+                }
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "running",
+                    "total_count": len(failed_runs),
+                    "completed_count": 0,
+                    "failed_count": 0,
+                    "success_count": 0,
+                    "error_message": "",
+                    "started_at": utc_now(),
+                    "finished_at": None,
+                    "updated_at": utc_now(),
+                },
+            )
+            conn.commit()
+            result = rerun_failed_runs(conn, batch_id, failed_runs, payload)
+            full_counts = _full_batch_counts(conn, batch_id)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": full_counts["status"],
+                    "total_count": full_counts["total"],
+                    "completed_count": full_counts["completed"],
+                    "failed_count": full_counts["failed"],
+                    "success_count": full_counts["success"],
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+        if progress_hook:
+            progress_hook({"batch_id": batch_id, **result})
+        return result
+    except Exception as exc:
+        mark_batch_failed(batch_id, str(exc), db_target=db_target)
+        raise
 
 
 def mark_batch_failed(
@@ -286,6 +304,10 @@ def mark_batch_failed(
 ) -> None:
     counts = counts or {}
     with get_conn(db_target) as conn:
+        persisted = _failure_counts(conn, batch_id)
+        completed = counts.get("completed", persisted["completed"])
+        failed = counts.get("failed", persisted["failed"])
+        success = counts.get("success", persisted["success"])
         update_sampling_batch(
             conn,
             batch_id,
@@ -294,8 +316,24 @@ def mark_batch_failed(
                 "error_message": error,
                 "finished_at": utc_now(),
                 "updated_at": utc_now(),
-                "completed_count": counts.get("completed", 0),
-                "failed_count": counts.get("failed", 0),
-                "success_count": counts.get("success", 0),
+                "total_count": counts.get("total", persisted["total"]),
+                "completed_count": completed,
+                "failed_count": failed,
+                "success_count": success,
             },
         )
+        conn.commit()
+
+
+def mark_rq_job_failed(job, connection=None, exc_type=None, exc_value=None, traceback=None) -> None:
+    args = list(getattr(job, "args", ()) or ())
+    if not args:
+        return
+    batch_id = str(args[0] or "")
+    if not batch_id:
+        return
+    timeout = getattr(job, "timeout", None)
+    exc_text = str(exc_value or exc_type or "RQ job failed")
+    if timeout and "timeout" not in exc_text.lower():
+        exc_text = f"{exc_text}; job_timeout={timeout}"
+    mark_batch_failed(batch_id, exc_text)

@@ -18,6 +18,7 @@ from src.adapters import AdapterError, call_configured_model, kimi_search_reques
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
+from src.tasks import mark_batch_failed
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1223,8 +1224,112 @@ class HarnessHttpTests(unittest.TestCase):
             else:
                 os.environ["TASK_QUEUE_BACKEND"] = old_backend
 
+    def test_resume_pause_requested_cancels_pause_without_reenqueue(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        batch_id = "pause-requested-test"
+        with get_conn(app.DEFAULT_DB_PATH) as conn:
+            create_sampling_batch(
+                conn,
+                {
+                    "batch_id": batch_id,
+                    "project_id": project_id,
+                    "status": "pause_requested",
+                    "total_count": 1,
+                    "completed_count": 0,
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "config": {"project_id": project_id, "repeat_count": 1, "models": [{"model_config_id": model_id, "search_enabled": False}]},
+                },
+            )
+            conn.commit()
+        with mock.patch("app.dispatch_resume_batch") as dispatch:
+            response = self.request_json("POST", f"/api/batches/{batch_id}/resume", {})
+        self.assertEqual(response["status"], "running")
+        dispatch.assert_not_called()
+        persisted = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        self.assertEqual(persisted["status"], "running")
+
 
 class HarnessDirectTests(unittest.TestCase):
+    def test_mark_batch_failed_preserves_persisted_progress_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "failed-progress.db"
+            init_db(db_path)
+            with get_conn(db_path) as conn:
+                project_id = create_project(
+                    conn,
+                    {
+                        "client_name": "失败收尾客户",
+                        "brand_name": "失败收尾品牌",
+                        "product_category": "测试品类",
+                    },
+                )
+                rows = [
+                    {
+                        "问题ID": "F001",
+                        "问题内容": "失败收尾品牌是否出现？",
+                        "问题类型": "failure",
+                    },
+                    {
+                        "问题ID": "F002",
+                        "问题内容": "失败收尾品牌是否值得推荐？",
+                        "问题类型": "failure",
+                    },
+                ]
+                import_questions_rows(conn, project_id, rows)
+                question_id = list_questions(conn, project_id)[0]["id"]
+                model_id = create_model_config(
+                    conn,
+                    {
+                        "provider": "mock",
+                        "label": "Mock",
+                        "model": "mock-success",
+                        "supports_pure": True,
+                        "active": True,
+                    },
+                )
+                create_sampling_batch(
+                    conn,
+                    {
+                        "batch_id": "failed-progress-batch",
+                        "project_id": project_id,
+                        "status": "running",
+                        "total_count": 2,
+                        "completed_count": 1,
+                        "success_count": 1,
+                        "failed_count": 0,
+                        "config": {"project_id": project_id, "repeat_count": 1, "models": [{"model_config_id": model_id, "search_enabled": False}]},
+                    },
+                )
+                insert_run(
+                    conn,
+                    {
+                        "run_id": "run-failed-progress-1",
+                        "batch_id": "failed-progress-batch",
+                        "project_id": project_id,
+                        "question_id": question_id,
+                        "question_text": "失败收尾品牌是否出现？",
+                        "provider": "mock",
+                        "model": "mock-success",
+                        "model_config_id": model_id,
+                        "status": "success",
+                        "requested_at": utc_now(),
+                        "answer_text": "失败收尾品牌出现了。",
+                        "response_text": "失败收尾品牌出现了。",
+                        "latency_ms": 10,
+                    },
+                )
+                conn.commit()
+            mark_batch_failed("failed-progress-batch", "RQ job timed out", db_target=db_path)
+            with get_conn(db_path) as conn:
+                batch = conn.execute("SELECT status, total_count, completed_count, success_count, failed_count, error_message FROM sampling_batches WHERE batch_id = ?", ("failed-progress-batch",)).fetchone()
+        self.assertEqual(batch["status"], "failed")
+        self.assertEqual(batch["total_count"], 2)
+        self.assertEqual(batch["completed_count"], 1)
+        self.assertEqual(batch["success_count"], 1)
+        self.assertEqual(batch["failed_count"], 0)
+        self.assertIn("timed out", batch["error_message"])
+
     def test_import_question_content_rows_ignores_other_table_columns(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "questions.db"
