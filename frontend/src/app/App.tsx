@@ -4,8 +4,8 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { BarChart3, Boxes, FileDown, FileSpreadsheet, Gauge, KeyRound, Layers3, ListChecks, Pause, Play, RefreshCw, Settings, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
-import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
-import type { AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SamplingBatch, SourceRunStatus } from "../api/types";
+import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, settingsApi, systemApi } from "../api/resources";
+import type { AnalyticsSummary, BraveSearchConfig, ModelConfig, ModelRun, Project, Question, SamplingBatch, SourceRunStatus } from "../api/types";
 import { EmptyState, Metric, PageTitle, StatusBadge } from "../components/common";
 import { asCount, formatDateTime, pct } from "../utils/format";
 import { useSelectionStore } from "../store/selectionStore";
@@ -47,6 +47,10 @@ function isTerminalStatus(status?: string) {
 
 function isPausableStatus(status?: string) {
   return status === "queued" || status === "running";
+}
+
+function isRerunnableStatus(status?: string) {
+  return status !== "queued" && status !== "running" && status !== "pause_requested";
 }
 
 function isResumableStatus(status?: string) {
@@ -397,7 +401,9 @@ function QuestionTable({ questions, onDelete, deletingId }: { questions: Questio
 
 function ModelsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: modelsApi.list });
+  const braveSearch = useQuery({ queryKey: ["settings", "brave-search"], queryFn: settingsApi.braveSearch });
   const [draft, setDraft] = useState<ModelFormState>(newModelDraft());
+  const [braveKey, setBraveKey] = useState("");
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editing, setEditing] = useState<ModelConfig | null>(null);
   const create = useMutation({
@@ -416,6 +422,14 @@ function ModelsPage() {
     }
   });
   const test = useMutation({ mutationFn: modelsApi.test });
+  const updateBraveSearch = useMutation({
+    mutationFn: settingsApi.updateBraveSearch,
+    onSuccess: () => {
+      setBraveKey("");
+      queryClient.invalidateQueries({ queryKey: ["settings", "brave-search"] });
+      queryClient.invalidateQueries({ queryKey: ["models"] });
+    }
+  });
   return (
     <main className="page">
       <PageTitle title="模型" description="查看服务商能力、Key 状态和采样默认参数。" action={<button onClick={() => setShowCreateModal(true)}>新增模型</button>} />
@@ -434,10 +448,42 @@ function ModelsPage() {
           <ModelForm value={{ ...editing, api_key: "" }} onChange={(value) => setEditing({ ...editing, ...value })} submitLabel="保存设置" isEdit onSubmit={() => update.mutate({ ...editing, api_key: editing.api_key || "__KEEP__" })} onCancel={() => setEditing(null)} />
         </Modal>
       ) : null}
+      <BraveSearchCard
+        config={braveSearch.data}
+        apiKey={braveKey}
+        pending={updateBraveSearch.isPending}
+        error={updateBraveSearch.error?.message || braveSearch.error?.message}
+        onApiKeyChange={setBraveKey}
+        onSubmit={() => updateBraveSearch.mutate({ api_key: braveKey })}
+      />
       <div className="model-grid">{models.data?.models.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div>
       {test.data ? <pre className="result-box">{JSON.stringify(test.data, null, 2)}</pre> : null}
       {test.error ? <div className="error-box">{test.error.message.includes("真实模型调用默认关闭") ? "真实模型测试当前被后端安全开关拦截。需要本地验收真实调用时，用 ALLOW_LIVE_MODEL_CALLS=1 重启 python3 app.py。" : test.error.message}</div> : null}
     </main>
+  );
+}
+
+function BraveSearchCard({ config, apiKey, pending, error, onApiKeyChange, onSubmit }: { config?: BraveSearchConfig; apiKey: string; pending: boolean; error?: string; onApiKeyChange: (value: string) => void; onSubmit: () => void }) {
+  return (
+    <section className="panel">
+      <div className="panel-head-row">
+        <div>
+          <h2>Brave Search</h2>
+          <p>DeepSeek 联网搜索的外部检索增强配置。</p>
+        </div>
+        <span className={config?.configured ? "key-ok" : "key-missing"}><KeyRound size={14} />{config?.configured ? config.api_key_masked || "已配置" : "未配置"}</span>
+      </div>
+      <form className="inline-form" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
+        <label>API Key<input type="password" value={apiKey} onChange={(event) => onApiKeyChange(event.target.value)} placeholder={config?.configured ? "留空不修改" : "填入 Brave Search API Key"} /></label>
+        <button type="submit" disabled={pending || !apiKey.trim()}>{pending ? "正在保存" : "保存配置"}</button>
+      </form>
+      <dl className="compact-dl">
+        <dt>环境变量</dt><dd>{config?.env_keys?.join(" / ") || "BRAVE_SEARCH_API_KEY / BRAVE_API_KEY"}</dd>
+        <dt>参数路径</dt><dd>{config?.web_search_param_path || "-"}</dd>
+        <dt>使用范围</dt><dd>{config?.used_by?.join("；") || "DeepSeek 联网搜索"}</dd>
+      </dl>
+      {error ? <div className="error-box">{error}</div> : null}
+    </section>
   );
 }
 
@@ -598,7 +644,7 @@ function SamplingPage() {
                 <Link className="button ghost" to={`/batches/${activeBatch}`}>{failedSources ? "查看失败原因" : "查看批次详情"}</Link>
                 {isPausableStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={pause.isPending} onClick={() => pause.mutate()}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}
                 {isResumableStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={resume.isPending} onClick={() => resume.mutate()}><Play size={15} />{resumeActionLabel(progress.data?.status, resume.isPending)}</button> : null}
-                {failedSources && isTerminalStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={rerun.isPending} onClick={() => rerun.mutate()}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}
+                {failedSources && isRerunnableStatus(progress.data?.status) ? <button className="ghost" type="button" disabled={rerun.isPending} onClick={() => rerun.mutate()}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}
               </div>
             </div>
           ) : <EmptyState title="尚未启动采样" />}
@@ -698,7 +744,7 @@ function BatchDetailPage() {
   const batchStatus = progress.data?.status || batch.data?.batch.status;
   const hasFailures = (progress.data?.source_statuses || []).some((item) => item.failed > 0) || rows.some((row) => row.status === "failed");
   const canResume = isResumableStatus(batchStatus) && (batchStatus !== "failed" || hasIncompleteWork(progress.data || batch.data?.batch));
-  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{isPausableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}{canResume ? <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}><Play size={15} />{resumeActionLabel(batchStatus, resume.isPending)}</button> : null}{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batchStatus || batch.data.batch.status} /><ProgressBar batch={progress.data || batch.data.batch} /></> : null}{(progress.data?.error || batch.data?.batch.error) && batchStatus === "failed" ? <div className="error-box">{progress.data?.error || batch.data?.batch.error}</div> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}{pause.error ? <div className="error-box">{pause.error.message}</div> : null}{resume.error ? <div className="error-box">{resume.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
+  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{isPausableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}{canResume ? <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}><Play size={15} />{resumeActionLabel(batchStatus, resume.isPending)}</button> : null}{hasFailures && isRerunnableStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batchStatus || batch.data.batch.status} /><ProgressBar batch={progress.data || batch.data.batch} /></> : null}{(progress.data?.error || batch.data?.batch.error) && batchStatus === "failed" ? <div className="error-box">{progress.data?.error || batch.data?.batch.error}</div> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}{pause.error ? <div className="error-box">{pause.error.message}</div> : null}{resume.error ? <div className="error-box">{resume.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
 }
 
 function AnalysisPage() {

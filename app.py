@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from xml.etree import ElementTree
 
-from src.adapters import PROVIDER_PRESETS, enrich_model_config, test_model_config
+from src.adapters import PROVIDER_PRESETS, enrich_model_config, mask_key, test_model_config
 from src.db import (
     DEFAULT_DB_PATH,
     analytics,
@@ -59,7 +59,7 @@ from src.exporter import (
 )
 from src.analytics_summary import build_analytics_summary
 from src.platforms import test_platform_name
-from src.runtime_env import load_dotenv_file
+from src.runtime_env import BRAVE_SEARCH_ENV_KEYS, load_dotenv_file, resolve_brave_search_api_key
 from src.runner import estimate_batch_total
 from src.db import utc_now
 from src.tasks import mark_batch_failed, mark_rq_job_failed, perform_batch, perform_rerun_failed, perform_resume_batch, request_batch_pause
@@ -75,6 +75,35 @@ SAMPLING_JOBS_LOCK = threading.Lock()
 AUTH_PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/logout", "/api/auth/status"}
 AUTH_SESSION_TTL_SECONDS = 60 * 60 * 12
 UI_PROVIDER_PRESETS = {key: value for key, value in PROVIDER_PRESETS.items() if key != "mock"}
+
+
+def update_env_file_values(path: Path, values: dict[str, str]) -> None:
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in existing:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else ""
+        if key in values:
+            lines.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            lines.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def brave_search_status() -> dict:
+    key = resolve_brave_search_api_key()
+    return {
+        "configured": bool(key),
+        "api_key_masked": mask_key(key),
+        "env_keys": list(BRAVE_SEARCH_ENV_KEYS),
+        "web_search_param_path": "BRAVE_SEARCH_API_KEY; /res/v1/web/search; q/count/country/search_lang/freshness/safesearch",
+        "used_by": ["DeepSeek 联网搜索"],
+    }
 
 
 def auth_password() -> str:
@@ -676,6 +705,8 @@ class Handler(SimpleHTTPRequestHandler):
                             "presets": UI_PROVIDER_PRESETS,
                         }
                     )
+                elif parsed.path == "/api/settings/brave-search":
+                    self.json_response(brave_search_status())
                 elif parsed.path == "/api/questions":
                     project_raw = query.get("project_id", [None])[0]
                     project_id = int(project_raw) if project_raw and project_raw != "all" else None
@@ -830,6 +861,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if payload.get("model"):
                         model_config["model"] = payload["model"]
                     self.json_response(test_model_config(model_config))
+                elif parsed.path == "/api/settings/brave-search":
+                    api_key = str(payload.get("api_key", "")).strip()
+                    if not api_key:
+                        raise ValueError("缺少 Brave Search API Key")
+                    values = {name: api_key for name in BRAVE_SEARCH_ENV_KEYS}
+                    update_env_file_values(ROOT / ".env", values)
+                    for name, value in values.items():
+                        os.environ[name] = value
+                    commit_json({"ok": True, **brave_search_status()})
                 elif parsed.path == "/api/models/preset":
                     preset = PROVIDER_PRESETS.get(payload.get("provider", ""))
                     if not preset:
@@ -988,6 +1028,9 @@ class Handler(SimpleHTTPRequestHandler):
                         self.json_response({"error": "批次不存在"}, 404)
                         return
                     failed_runs = list_failed_runs_by_batch(conn, batch_id)
+                    if not failed_runs:
+                        self.json_response({"error": "当前批次没有可重跑的失败任务"}, 400)
+                        return
                     set_sampling_job(
                         batch_id,
                         project_id=batch["project_id"],

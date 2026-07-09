@@ -62,6 +62,14 @@ export type ModelConfig = {
   notes?: string;
 };
 
+export type BraveSearchConfig = {
+  configured: boolean;
+  api_key_masked?: string;
+  env_keys: string[];
+  web_search_param_path: string;
+  used_by: string[];
+};
+
 export type SamplingBatch = {
   batch_id: string;
   project_id: number;

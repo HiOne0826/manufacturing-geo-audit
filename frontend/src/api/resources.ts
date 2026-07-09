@@ -1,5 +1,5 @@
 import { api } from "./client";
-import type { Analytics, AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SamplingBatch } from "./types";
+import type { Analytics, AnalyticsSummary, BraveSearchConfig, ModelConfig, ModelRun, Project, Question, SamplingBatch } from "./types";
 
 export const authApi = {
   status: () => api<{ ok: boolean; auth_enabled: boolean; authenticated: boolean }>("/api/auth/status"),
@@ -9,6 +9,12 @@ export const authApi = {
 
 export const systemApi = {
   health: () => api<{ ok: boolean; db: string; task_queue_backend: string }>("/api/health")
+};
+
+export const settingsApi = {
+  braveSearch: () => api<BraveSearchConfig>("/api/settings/brave-search"),
+  updateBraveSearch: (payload: { api_key: string }) =>
+    api<{ ok: boolean } & BraveSearchConfig>("/api/settings/brave-search", { method: "POST", body: JSON.stringify(payload) })
 };
 
 export const projectsApi = {

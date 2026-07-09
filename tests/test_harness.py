@@ -966,6 +966,59 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertIn("openai/gpt-5.2", routed)
         self.assertIn("google/gemini-2.5-flash", routed)
 
+    def test_export_uses_wenxin_yiyan_platform_name_for_ernie(self):
+        body = runs_to_excel_html(
+            [
+                {
+                    "run_id": "run-ernie",
+                    "batch_id": "batch-ernie",
+                    "source_question_id": "E001",
+                    "question": "测试文心一言平台名",
+                    "question_type": "品牌推荐",
+                    "product_line": "FDS",
+                    "provider": "ernie",
+                    "model": "ernie-4.5-turbo-32k",
+                    "search_enabled": True,
+                    "status": "success",
+                    "response_text": "回答内容",
+                    "citations_json": "[]",
+                    "raw_response_json": "{}",
+                    "error_message": "",
+                }
+            ]
+        )
+        self.assertIn("文心一言", body)
+        self.assertIn("<td>文心一言</td><td>回答内容</td>", body)
+        self.assertIn("<td>batch-ernie</td><td>文心一言</td><td>ernie-4.5-turbo-32k</td>", body)
+
+    def test_brave_search_status_masks_key_and_env_file_update_preserves_aliases(self):
+        old_brave = os.environ.get("BRAVE_SEARCH_API_KEY")
+        old_alias = os.environ.get("BRAVE_API_KEY")
+        try:
+            os.environ["BRAVE_SEARCH_API_KEY"] = "brave-secret-value"
+            os.environ.pop("BRAVE_API_KEY", None)
+            status = app.brave_search_status()
+            raw = json.dumps(status, ensure_ascii=False)
+            self.assertTrue(status["configured"])
+            self.assertNotIn("brave-secret-value", raw)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env_path = Path(temp_dir) / ".env"
+                env_path.write_text("APP_PASSWORD=test\nBRAVE_SEARCH_API_KEY=old\n", encoding="utf-8")
+                app.update_env_file_values(env_path, {"BRAVE_SEARCH_API_KEY": "new-key", "BRAVE_API_KEY": "new-key"})
+                text = env_path.read_text(encoding="utf-8")
+            self.assertIn("APP_PASSWORD=test", text)
+            self.assertIn("BRAVE_SEARCH_API_KEY=new-key", text)
+            self.assertIn("BRAVE_API_KEY=new-key", text)
+        finally:
+            if old_brave is None:
+                os.environ.pop("BRAVE_SEARCH_API_KEY", None)
+            else:
+                os.environ["BRAVE_SEARCH_API_KEY"] = old_brave
+            if old_alias is None:
+                os.environ.pop("BRAVE_API_KEY", None)
+            else:
+                os.environ["BRAVE_API_KEY"] = old_alias
+
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
         started = self.request_json(
