@@ -5,7 +5,7 @@ import { BarChart3, Boxes, FileDown, FileSpreadsheet, Gauge, KeyRound, Layers3, 
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { apiPath } from "../api/client";
 import { analyticsApi, authApi, batchesApi, modelsApi, projectsApi, questionsApi, runsApi, systemApi } from "../api/resources";
-import type { AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SourceRunStatus } from "../api/types";
+import type { AnalyticsSummary, ModelConfig, ModelRun, Project, Question, SamplingBatch, SourceRunStatus } from "../api/types";
 import { EmptyState, Metric, PageTitle, StatusBadge } from "../components/common";
 import { asCount, formatDateTime, pct } from "../utils/format";
 import { useSelectionStore } from "../store/selectionStore";
@@ -50,12 +50,17 @@ function isPausableStatus(status?: string) {
 }
 
 function isResumableStatus(status?: string) {
-  return status === "paused" || status === "pause_requested";
+  return status === "paused" || status === "pause_requested" || status === "failed";
 }
 
 function resumeActionLabel(status?: string, pending = false) {
   if (status === "pause_requested") return pending ? "正在取消" : "取消暂停";
   return pending ? "正在继续" : "继续执行";
+}
+
+function hasIncompleteWork(batch?: SamplingBatch) {
+  if (!batch) return false;
+  return Number(batch.completed ?? batch.completed_count ?? 0) < Number(batch.total ?? batch.total_count ?? 0);
 }
 
 export function App() {
@@ -692,7 +697,8 @@ function BatchDetailPage() {
   const rows = runs.data?.runs || [];
   const batchStatus = progress.data?.status || batch.data?.batch.status;
   const hasFailures = (progress.data?.source_statuses || []).some((item) => item.failed > 0) || rows.some((row) => row.status === "failed");
-  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{isPausableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}{isResumableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}><Play size={15} />{resumeActionLabel(batchStatus, resume.isPending)}</button> : null}{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batchStatus || batch.data.batch.status} /><ProgressBar batch={progress.data || batch.data.batch} /></> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}{pause.error ? <div className="error-box">{pause.error.message}</div> : null}{resume.error ? <div className="error-box">{resume.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
+  const canResume = isResumableStatus(batchStatus) && (batchStatus !== "failed" || hasIncompleteWork(progress.data || batch.data?.batch));
+  return <main className="page"><PageTitle title={`批次 ${batchId}`} description="查看进度、测试平台表现、失败原因和导出。" action={<div className="inline-actions"><a className="button ghost" href={apiPath(`/api/export/batches/${batchId}/runs.xls`)} target="_blank">导出明细</a>{isPausableStatus(batchStatus) ? <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}><Pause size={15} />{pause.isPending ? "正在暂停" : "暂停"}</button> : null}{canResume ? <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}><Play size={15} />{resumeActionLabel(batchStatus, resume.isPending)}</button> : null}{hasFailures && isTerminalStatus(batchStatus) ? <button onClick={() => rerun.mutate()} disabled={rerun.isPending}>{rerun.isPending ? "正在重跑" : "重跑失败"}</button> : null}</div>} /><Panel title="进度">{batch.data?.batch ? <><StatusBadge status={batchStatus || batch.data.batch.status} /><ProgressBar batch={progress.data || batch.data.batch} /></> : null}{(progress.data?.error || batch.data?.batch.error) && batchStatus === "failed" ? <div className="error-box">{progress.data?.error || batch.data?.batch.error}</div> : null}{rerun.error ? <div className="error-box">{rerun.error.message}</div> : null}{pause.error ? <div className="error-box">{pause.error.message}</div> : null}{resume.error ? <div className="error-box">{resume.error.message}</div> : null}</Panel><section className="two-column"><Panel title="测试平台摘要">{progress.isError ? <div className="error-box">{progress.error.message}</div> : null}<SourceStatusList rows={progress.data?.source_statuses || []} /></Panel><Panel title="失败原因"><div className="failure-list">{rows.filter((row) => row.status === "failed").slice(0, 8).map((row) => <p key={row.id}>{runPlatform(row)}: {row.error_message}</p>)}{!rows.some((row) => row.status === "failed") ? <EmptyState title="暂无失败任务" /> : null}</div></Panel></section><Panel title="运行明细"><RunsTable runs={rows} /></Panel></main>;
 }
 
 function AnalysisPage() {

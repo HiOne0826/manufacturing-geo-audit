@@ -428,7 +428,7 @@ def normalize_choice_text(data: dict[str, Any]) -> str:
     output_choices = output.get("choices") or []
     if output_choices:
         message = output_choices[0].get("message") or {}
-        content = message.get("content", "")
+        content = message.get("content") or ""
         if isinstance(content, str):
             return content
     choices = data.get("choices") or []
@@ -443,6 +443,25 @@ def normalize_choice_text(data: dict[str, Any]) -> str:
                 parts.append(part.get("text", ""))
         return "\n".join(item for item in parts if item)
     return content
+
+
+def first_choice_finish_reason(data: dict[str, Any]) -> tuple[str, str]:
+    choices = data.get("choices") or []
+    if not choices:
+        output = data.get("output") or {}
+        choices = output.get("choices") or []
+    if not choices:
+        return "", ""
+    choice = choices[0] or {}
+    return str(choice.get("finish_reason") or ""), str(choice.get("native_finish_reason") or "")
+
+
+def ensure_openrouter_complete_response(data: dict[str, Any], response_text: str) -> None:
+    finish_reason, native_finish_reason = first_choice_finish_reason(data)
+    if finish_reason == "length" or native_finish_reason == "max_output_tokens":
+        raise AdapterError("OpenRouter 返回被 max_tokens 截断，未产出完整回答")
+    if not response_text.strip():
+        raise AdapterError("OpenRouter 返回成功但回答内容为空")
 
 
 def normalize_responses_text(data: dict[str, Any]) -> str:
@@ -1024,7 +1043,7 @@ def build_openrouter_chat_payload(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
-    payload["max_tokens"] = 512
+    payload["max_tokens"] = 4096
     if options["search_enabled"]:
         plugin: dict[str, Any] = {"id": "web"}
         if options.get("search_limit"):
@@ -1124,8 +1143,11 @@ def openai_compatible_request(
             "brave_search": brave_payload["raw_response"],
             "brave_results": brave_payload["results"],
         }
+    response_text = normalize_choice_text(data)
+    if provider in {"openrouter_gpt", "openrouter_gemini"}:
+        ensure_openrouter_complete_response(data, response_text)
     return {
-        "response_text": normalize_choice_text(data),
+        "response_text": response_text,
         "citations": citations,
         "usage": data.get("usage", {}),
         "raw_response": raw_response,

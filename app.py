@@ -351,10 +351,11 @@ def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> d
     if rows and not job:
         latest_progress = latest_run_progress(rows, planned_batch_total(conn, batch))
         base.update(latest_progress)
-        if latest_progress["failed"]:
-            base["status"] = "failed"
-        elif str(batch.get("status") or "") in {"paused", "pause_requested"}:
+        batch_status = str(batch.get("status") or "")
+        if batch_status in {"queued", "running", "paused", "pause_requested"}:
             base["status"] = batch["status"]
+        elif batch_status == "failed" or latest_progress["failed"]:
+            base["status"] = "failed"
         elif latest_progress["completed"] < latest_progress["total"]:
             base["status"] = "queued"
     base["total_count"] = base.get("total", base.get("total_count", 0))

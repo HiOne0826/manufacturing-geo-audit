@@ -296,6 +296,73 @@ def perform_rerun_failed(
         raise
 
 
+def perform_rerun_runs(
+    batch_id: str,
+    run_ids: list[int],
+    payload: dict[str, Any] | None = None,
+    db_target: Path | str | None = None,
+) -> dict[str, Any]:
+    payload = payload or {}
+    run_ids = [int(item) for item in run_ids if int(item)]
+    if not run_ids:
+        return {"batch_id": batch_id, "total": 0, "failed": 0, "success": 0, "status": "completed"}
+    try:
+        with get_conn(db_target) as conn:
+            placeholders = ",".join("?" for _ in run_ids)
+            rows = conn.execute(
+                f"""
+                SELECT r.*, q.question, q.target_brand, q.competitor_brands
+                FROM model_runs r
+                JOIN questions q ON q.id = r.question_id
+                WHERE r.batch_id = ?
+                  AND r.id IN ({placeholders})
+                  AND COALESCE(r.is_current, 1) = 1
+                ORDER BY r.id ASC
+                """,
+                (batch_id, *run_ids),
+            ).fetchall()
+            runs = [dict(row) for row in rows]
+            if not runs:
+                counts = _full_batch_counts(conn, batch_id)
+                return {"batch_id": batch_id, "total": 0, "failed": 0, "success": 0, "status": counts["status"]}
+            counts = _full_batch_counts(conn, batch_id)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "running",
+                    "total_count": counts["total"],
+                    "completed_count": counts["completed"],
+                    "failed_count": counts["failed"],
+                    "success_count": counts["success"],
+                    "error_message": "",
+                    "finished_at": None,
+                    "updated_at": utc_now(),
+                },
+            )
+            conn.commit()
+            result = rerun_failed_runs(conn, batch_id, runs, payload)
+            full_counts = _full_batch_counts(conn, batch_id)
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": full_counts["status"],
+                    "total_count": full_counts["total"],
+                    "completed_count": full_counts["completed"],
+                    "failed_count": full_counts["failed"],
+                    "success_count": full_counts["success"],
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+            conn.commit()
+        return {**result, "status": full_counts["status"]}
+    except Exception as exc:
+        mark_batch_failed(batch_id, str(exc), db_target=db_target)
+        raise
+
+
 def mark_batch_failed(
     batch_id: str,
     error: str,

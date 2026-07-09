@@ -14,7 +14,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
-from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_run_options, openai_compatible_request, openai_responses_request
+from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
@@ -643,9 +643,40 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(post_json.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openrouter-test-key")
         payload = post_json.call_args.args[2]
-        self.assertEqual(payload["max_tokens"], 512)
+        self.assertEqual(payload["max_tokens"], 4096)
         self.assertEqual(payload["plugins"], [{"id": "web", "max_results": 3, "engine": "native", "include_domains": ["example.com", "industry.example"]}])
         self.assertEqual(result["citations"], [{"url": "https://example.com/source", "title": "Source Title"}])
+
+    def test_openrouter_length_finish_reason_is_not_success(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "force",
+                "search_strategy": "native",
+                "thinking_type": "disabled",
+            }
+        )
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "openai/gpt-5.2",
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "native_finish_reason": "max_output_tokens",
+                        "message": {"role": "assistant", "content": "被截断的回答"},
+                    }
+                ],
+            }
+            with self.assertRaises(AdapterError):
+                openai_compatible_request(
+                    "https://openrouter.ai/api/v1",
+                    "openrouter-test-key",
+                    "openai/gpt-5.2",
+                    "测试问题",
+                    1,
+                    "openrouter_gpt",
+                    options,
+                )
 
     def test_hunyuan_search_payload_forces_search_and_url_metadata(self):
         options = normalize_run_options(
@@ -1162,6 +1193,37 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(status["source_statuses"][0]["completed"], 2)
         self.assertEqual(status["source_statuses"][0]["queued"], 1)
 
+        with get_conn(self.db_path) as conn:
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "failed",
+                    "error_message": "RQ job timed out",
+                },
+            )
+            conn.commit()
+        failed_status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        self.assertEqual(failed_status["status"], "failed")
+        self.assertEqual(failed_status["total"], 3)
+        self.assertEqual(failed_status["completed"], 2)
+        self.assertEqual(failed_status["source_statuses"][0]["total"], 3)
+        self.assertEqual(failed_status["source_statuses"][0]["queued"], 1)
+
+        with get_conn(self.db_path) as conn:
+            update_sampling_batch(
+                conn,
+                batch_id,
+                {
+                    "status": "running",
+                    "failed_count": 1,
+                    "completed_count": 2,
+                },
+            )
+            conn.commit()
+        running_status = self.request_json("GET", f"/api/runs/progress?batch_id={batch_id}")
+        self.assertEqual(running_status["status"], "running")
+
     def test_analytics_summary_reports_visibility_and_quality(self):
         project_id, model_id = self.create_mock_project(question_count=2)
         started = self.request_json(
@@ -1251,6 +1313,23 @@ class HarnessHttpTests(unittest.TestCase):
 
 
 class HarnessDirectTests(unittest.TestCase):
+    def test_normalize_choice_text_does_not_use_reasoning_as_answer(self):
+        text = normalize_choice_text(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "模型把文本放在 reasoning 字段里。",
+                        },
+                    }
+                ]
+            }
+        )
+        self.assertEqual(text, "")
+
     def test_mark_batch_failed_preserves_persisted_progress_counts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "failed-progress.db"
