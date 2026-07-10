@@ -656,6 +656,7 @@ function SamplingPage() {
             const config = selected[model.id];
             const enabled = Boolean(config);
             const mode = config?.mode || "pure";
+            const defaultMode: SamplingMode = model.supports_pure ? "pure" : "search";
             return (
               <article key={model.id} className={`matrix-card ${enabled ? "is-selected" : ""}`}>
                 <header>
@@ -666,7 +667,7 @@ function SamplingPage() {
                       onChange={(event) =>
                         setSelected((prev) =>
                           event.target.checked
-                            ? { ...prev, [model.id]: { mode: "pure", reasoning_enabled: false } }
+                            ? { ...prev, [model.id]: { mode: defaultMode, reasoning_enabled: false } }
                             : (Object.fromEntries(Object.entries(prev).filter(([id]) => Number(id) !== model.id)) as typeof prev)
                         )
                       }
@@ -677,9 +678,9 @@ function SamplingPage() {
                 </header>
                 <p>测试平台：{model.test_platform || model.label}</p>
                 <div className="sampling-mode-group">
-                  <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
+                  <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
                   <button className={mode === "search" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "search" } }))}>联网</button>
-                  <button className={mode === "compare" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "compare" } }))}>本体+联网</button>
+                  <button className={mode === "compare" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "compare" } }))}>本体+联网</button>
                 </div>
                 <label className="matrix-toggle">
                   <input
@@ -693,7 +694,7 @@ function SamplingPage() {
                 <dl>
                   <dt>默认温度</dt><dd>{String(model.sampling_defaults?.temperature ?? "模型默认")}</dd>
                   <dt>联网能力</dt><dd>{model.supports_search ? "支持" : "不支持"}</dd>
-                  <dt>说明</dt><dd>{model.supports_search ? "支持联网采样与本体对照" : "仅支持本体采样"}</dd>
+                  <dt>说明</dt><dd>{model.supports_pure && model.supports_search ? "支持联网采样与本体对照" : model.supports_search ? "仅支持联网采样" : "仅支持本体采样"}</dd>
                 </dl>
               </article>
             );
