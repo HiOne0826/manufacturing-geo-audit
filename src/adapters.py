@@ -312,18 +312,18 @@ PROVIDER_PRESETS = {
         "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "enable_search + search_options",
-        "web_search_param_path": "enable_search; search_options.forced_search/search_strategy/freshness/assigned_site_list/intention_options.prompt_intervene/enable_source/enable_citation/citation_format",
+        "web_search_mode": "Responses API web_search",
+        "web_search_param_path": "POST /responses; tools[].type=web_search; output[].action.sources",
         "supports_reasoning": True,
         "reasoning_param_path": "reasoning.effort / enable_thinking / thinking_budget",
         "reasoning_levels": OPENAI_REASONING_LEVELS,
         "supports_citation": True,
-        "citation_param_path": "search_info.search_results / citations",
+        "citation_param_path": "output[type=web_search_call].action.sources[].url; output[].content[].annotations",
         "supports_site_filter": False,
         "supports_time_filter": False,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "联网搜索按阿里云百炼文档走 enable_search=true，可配 search_options；引用优先从 search_info.search_results 提取。",
+        "notes": "qwen3.7-plus 联网搜索使用阿里云百炼 OpenAI 兼容 Responses API；仅传用户问题，不附加 system prompt；引用从 web_search_call.action.sources 提取。Responses 思考模式不支持 tool_choice=required，模型自行决定是否检索。",
     },
     "hunyuan": {
         "label": "腾讯元宝",
@@ -680,8 +680,6 @@ def tencent_search_request(question: str, options: dict[str, Any]) -> dict[str, 
         payload["Freshness"] = freshness
     if options.get("search_limit") in {10, 20, 30, 40, 50}:
         payload["Cnt"] = int(options["search_limit"])
-    if options.get("search_mode") == "force":
-        payload["Mode"] = 0
     payload_json = json.dumps(payload)
     timestamp = int(time.time())
     headers = {
@@ -1203,6 +1201,25 @@ def build_qwen_generation_payload(
     }
 
 
+def build_qwen_responses_payload(
+    model: str,
+    question: str,
+    temperature: float | None,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the documented Qwen Responses web-search request without prompt injection."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": question,
+        "tools": [{"type": "web_search"}],
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if options["reasoning_effort"]:
+        payload["reasoning"] = {"effort": options["reasoning_effort"]}
+    return payload
+
+
 def build_kimi_chat_payload(
     model: str,
     question: str,
@@ -1407,6 +1424,29 @@ def openai_responses_request(
         if "ToolNotOpen" in str(exc):
             raise AdapterError("豆包账号当前未开通 Web Search 插件能力，请先在火山方舟控制台开通对应搜索插件后再测试联网搜索。") from exc
         raise
+    return {
+        "response_text": normalize_responses_text(data),
+        "citations": extract_openai_response_citations(data),
+        "usage": data.get("usage", {}),
+        "raw_response": data,
+        "returned_model": data.get("model", model),
+    }
+
+
+def qwen_responses_request(
+    base: str,
+    api_key: str,
+    model: str,
+    question: str,
+    temperature: float | None,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    payload = build_qwen_responses_payload(model, question, temperature, options)
+    data = post_json(
+        f"{normalize_base(base)}/responses",
+        {"Authorization": f"Bearer {api_key}"},
+        payload,
+    )
     return {
         "response_text": normalize_responses_text(data),
         "citations": extract_openai_response_citations(data),
@@ -1714,7 +1754,12 @@ def call_configured_model(
             result = kimi_search_request(runtime_base, api_key, runtime_model, question, temperature, options)
         else:
             result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
-    elif runtime_provider in {"deepseek", "qwen", "hunyuan", "ernie", "minimax", "openrouter_gpt", "openrouter_gemini"}:
+    elif runtime_provider == "qwen":
+        if options["search_enabled"]:
+            result = qwen_responses_request(runtime_base, api_key, runtime_model, question, temperature, options)
+        else:
+            result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
+    elif runtime_provider in {"deepseek", "hunyuan", "ernie", "minimax", "openrouter_gpt", "openrouter_gemini"}:
         result = openai_compatible_request(runtime_base, api_key, runtime_model, question, temperature, runtime_provider, options)
     elif runtime_provider == "gemini":
         result = gemini_request(runtime_base, api_key, runtime_model, question, temperature, options)

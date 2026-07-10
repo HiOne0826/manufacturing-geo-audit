@@ -297,19 +297,19 @@ DEFAULT_MODEL_CONFIGS = [
         "daily_limit": 0,
         "supports_pure": 1,
         "supports_search": 1,
-        "web_search_mode": "enable_search + search_options",
-        "web_search_param_path": "enable_search; search_options.forced_search/search_strategy/freshness/assigned_site_list/intention_options.prompt_intervene/enable_source/enable_citation/citation_format",
+        "web_search_mode": "Responses API web_search",
+        "web_search_param_path": "POST /responses; tools[].type=web_search; output[].action.sources",
         "supports_reasoning": 1,
         "reasoning_param_path": "reasoning.effort / enable_thinking / thinking_budget",
         "reasoning_levels": "none;minimal;low;medium;high;xhigh",
         "supports_citation": 1,
-        "citation_param_path": "search_info.search_results / citations",
+        "citation_param_path": "output[type=web_search_call].action.sources[].url; output[].content[].annotations",
         "supports_site_filter": 0,
         "supports_time_filter": 0,
         "supports_user_location": 0,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "联网搜索按阿里云百炼文档走 enable_search=true，可配 search_options；引用优先从 search_info.search_results 提取。",
+        "notes": "qwen3.7-plus 联网搜索使用阿里云百炼 OpenAI 兼容 Responses API；仅传用户问题，不附加 system prompt；引用从 web_search_call.action.sources 提取。Responses 思考模式不支持 tool_choice=required，模型自行决定是否检索。",
     },
     {
         "provider": "hunyuan",
@@ -788,6 +788,18 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
         UPDATE model_configs
         SET model = 'qwen3.7-plus'
         WHERE provider = 'qwen' AND model IN ('qwen-plus', 'qwen3-plus')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET supports_search = 1,
+            web_search_mode = 'Responses API web_search',
+            web_search_param_path = 'POST /responses; tools[].type=web_search; output[].action.sources',
+            supports_citation = 1,
+            citation_param_path = 'output[type=web_search_call].action.sources[].url; output[].content[].annotations',
+            notes = 'qwen3.7-plus 联网搜索使用阿里云百炼 OpenAI 兼容 Responses API；仅传用户问题，不附加 system prompt；引用从 web_search_call.action.sources 提取。Responses 思考模式不支持 tool_choice=required，模型自行决定是否检索。'
+        WHERE provider = 'qwen'
         """
     )
     conn.execute(

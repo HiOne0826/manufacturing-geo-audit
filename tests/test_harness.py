@@ -14,7 +14,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
-from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request
+from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request, qwen_responses_request
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import call_model_with_retries, prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, retry_delay_seconds, run_batch
@@ -548,7 +548,7 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertIn("Network is unreachable", str(ctx.exception))
         post_json.assert_not_called()
 
-    def test_qwen_search_uses_openai_compatible_enable_search_without_brave_or_system_prompt(self):
+    def test_qwen_search_uses_responses_api_without_system_prompt(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
@@ -557,48 +557,42 @@ class HarnessHttpTests(unittest.TestCase):
                 "thinking_type": "disabled",
             }
         )
-        with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test-key"}), \
-             mock.patch("src.adapters.get_json") as get_json, \
-             mock.patch("src.adapters.post_json") as post_json:
+        with mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {
                 "model": "qwen3.7-plus",
-                "choices": [
+                "output": [
                     {
-                        "message": {
-                            "content": "根据联网搜索结果回答。",
-                            "search_info": {
-                                "search_results": [
-                                    {"title": "阿里云联网搜索", "url": "https://help.aliyun.com/zh/model-studio/web-search/"}
-                                ]
-                            },
-                        }
-                    }
+                        "type": "web_search_call",
+                        "action": {
+                            "sources": [
+                                {"title": "阿里云联网搜索", "url": "https://help.aliyun.com/zh/model-studio/web-search/"}
+                            ]
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "根据联网搜索结果回答。", "annotations": []}],
+                    },
                 ],
             }
-            result = openai_compatible_request(
+            result = qwen_responses_request(
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "qwen-test-key",
                 "qwen3.7-plus",
                 "OpenRouter Web Search 支持哪些 engine？",
                 0.7,
-                "qwen",
                 options,
             )
 
         self.assertEqual(
             post_json.call_args.args[0],
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
         )
         payload = post_json.call_args.args[2]
-        get_json.assert_not_called()
-        self.assertEqual(payload["messages"], [{"role": "user", "content": "OpenRouter Web Search 支持哪些 engine？"}])
-        self.assertTrue(payload["enable_search"])
+        self.assertEqual(payload["input"], "OpenRouter Web Search 支持哪些 engine？")
+        self.assertEqual(payload["tools"], [{"type": "web_search"}])
+        self.assertNotIn("tool_choice", payload)
         self.assertEqual(payload["temperature"], 0.7)
-        self.assertEqual(payload["search_options"]["forced_search"], True)
-        self.assertEqual(payload["search_options"]["search_strategy"], "turbo")
-        self.assertTrue(payload["search_options"]["enable_source"])
-        self.assertTrue(payload["search_options"]["enable_citation"])
-        self.assertEqual(payload["search_options"]["citation_format"], "[ref_<number>]")
         self.assertEqual(
             result["citations"],
             [{"url": "https://help.aliyun.com/zh/model-studio/web-search/", "title": "阿里云联网搜索"}],
@@ -861,7 +855,7 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(post_json.call_args_list[0].args[0], "https://wsa.tencentcloudapi.com")
         search_payload = post_json.call_args_list[0].args[2]
         self.assertEqual(search_payload["Query"], "测试问题")
-        self.assertEqual(search_payload["Mode"], 0)
+        self.assertNotIn("Mode", search_payload)
         generation_payload = post_json.call_args_list[1].args[2]
         self.assertNotIn("enable_enhancement", generation_payload)
         self.assertNotIn("temperature", generation_payload)
