@@ -1,0 +1,16 @@
+[Unit]
+Description=Manufacturing GEO Audit DeepSeek Web Worker
+After=network.target redis.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/manufacturing-geo-audit
+ExecStart=/usr/bin/xvfb-run -a /usr/bin/python3 /opt/manufacturing-geo-audit/deepseek_web_worker.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=DEEPSEEK_WEB_HEADLESS=0
+EnvironmentFile=-/opt/manufacturing-geo-audit/.env
+
+[Install]
+WantedBy=multi-user.target

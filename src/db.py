@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -180,7 +180,7 @@ DEFAULT_MODEL_CONFIGS = [
         "provider": "deepseek",
         "label": "DeepSeek",
         "api_family": "DeepSeek API",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://api.deepseek.com/v1",
@@ -202,6 +202,33 @@ DEFAULT_MODEL_CONFIGS = [
         "supports_tool_calling": 1,
         "active": 1,
         "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+    },
+    {
+        "provider": "deepseek_web",
+        "label": "DeepSeek 官网联网搜索",
+        "api_family": "DeepSeek Web UI",
+        "model": "deepseek-web-search",
+        "model_version": "",
+        "model_type": "browser",
+        "api_base": "https://chat.deepseek.com",
+        "api_key": "",
+        "priority": 100,
+        "daily_limit": 0,
+        "supports_pure": 0,
+        "supports_search": 1,
+        "web_search_mode": "DeepSeek 官网联网搜索",
+        "web_search_param_path": "Playwright UI + passive response capture",
+        "supports_reasoning": 0,
+        "reasoning_param_path": "",
+        "reasoning_levels": "",
+        "supports_citation": 1,
+        "citation_param_path": "rendered answer links / passive network metadata",
+        "supports_site_filter": 0,
+        "supports_time_filter": 0,
+        "supports_user_location": 0,
+        "supports_tool_calling": 0,
+        "active": 1,
+        "notes": "通过官方 chat.deepseek.com 网页执行；每题独立会话，仅支持联网搜索批次。",
     },
     {
         "provider": "openrouter_gpt",
@@ -261,7 +288,7 @@ DEFAULT_MODEL_CONFIGS = [
         "provider": "qwen",
         "label": "通义千问",
         "api_family": "阿里云百炼 / DashScope",
-        "model": "qwen-plus",
+        "model": "qwen3.7-plus",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -297,19 +324,19 @@ DEFAULT_MODEL_CONFIGS = [
         "daily_limit": 0,
         "supports_pure": 1,
         "supports_search": 1,
-        "web_search_mode": "搜索增强 / 强制搜索增强",
-        "web_search_param_path": "enable_enhancement=true; force_search_enhancement=true; search_info=true; citation=true",
+        "web_search_mode": "腾讯云联网搜索 API SearchPro + hy3 生成",
+        "web_search_param_path": "wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY",
         "supports_reasoning": 1,
         "reasoning_param_path": "按模型能力控制，当前预置仅记录能力",
         "reasoning_levels": "按模型能力",
         "supports_citation": 1,
-        "citation_param_path": "citation / search_info",
+        "citation_param_path": "SearchPro Response.Pages[].url/title/passage/site",
         "supports_site_filter": 1,
         "supports_time_filter": 1,
         "supports_user_location": 0,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "腾讯元宝数据源基于腾讯混元 OpenAI 兼容接口；联网默认强制启用搜索增强，并要求返回 search_info 与 citation。",
+        "notes": "腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。",
     },
     {
         "provider": "kimi",
@@ -342,7 +369,7 @@ DEFAULT_MODEL_CONFIGS = [
         "provider": "ernie",
         "label": "文心一言",
         "api_family": "百度千帆 / ERNIE API",
-        "model": "ernie-4.5-turbo-32k",
+        "model": "ernie-5.1",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://qianfan.baidubce.com/v2",
@@ -553,6 +580,36 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS sampling_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL UNIQUE,
+                task_key TEXT NOT NULL UNIQUE,
+                batch_id TEXT NOT NULL,
+                project_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                model_config_id INTEGER NOT NULL,
+                repeat_index INTEGER DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt_count INTEGER DEFAULT 0,
+                rq_job_id TEXT DEFAULT '',
+                lease_owner TEXT DEFAULT '',
+                lease_expires_at TEXT,
+                heartbeat_at TEXT,
+                chat_id TEXT DEFAULT '',
+                artifact_dir TEXT DEFAULT '',
+                error_code TEXT DEFAULT '',
+                error_message TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sampling_tasks_batch_status
+            ON sampling_tasks(batch_id, status, id);
+
             CREATE TABLE IF NOT EXISTS answer_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL UNIQUE,
@@ -724,6 +781,39 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
         UPDATE model_configs
         SET model = 'gpt-5.5'
         WHERE provider = 'openai' AND model IN ('gpt-4.1', 'gpt-5.2')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET model = 'qwen3.7-plus'
+        WHERE provider = 'qwen' AND model IN ('qwen-plus', 'qwen3-plus')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET model = 'deepseek-v4-flash'
+        WHERE provider = 'deepseek' AND model IN ('deepseek-chat', 'deepseek-v3', 'deepseek-v3.1')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET model = 'ernie-5.1'
+        WHERE provider = 'ernie' AND model IN ('ernie-4.5-turbo-32k', 'ernie-4.5-turbo-vl-32k')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE model_configs
+        SET supports_search = 1,
+            web_search_mode = '腾讯云联网搜索 API SearchPro + hy3 生成',
+            web_search_param_path = 'wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY',
+            supports_citation = 1,
+            citation_param_path = 'SearchPro Response.Pages[].url/title/passage/site',
+            notes = '腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。'
+        WHERE provider = 'hunyuan'
         """
     )
 
@@ -1303,6 +1393,220 @@ def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = Non
     return result
 
 
+def create_sampling_tasks(conn, tasks: list[dict[str, Any]]) -> int:
+    if not tasks:
+        return 0
+    insert_prefix = "INSERT OR IGNORE INTO"
+    conflict_clause = ""
+    if is_postgres_conn(conn):
+        insert_prefix = "INSERT INTO"
+        conflict_clause = "ON CONFLICT (task_key) DO NOTHING"
+    created = 0
+    for task in tasks:
+        cur = conn.execute(
+            f"""
+            {insert_prefix} sampling_tasks (
+                task_id, task_key, batch_id, project_id, question_id, model_config_id,
+                repeat_index, status, attempt_count, rq_job_id, lease_owner,
+                lease_expires_at, heartbeat_at, chat_id, artifact_dir, error_code,
+                error_message, created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {conflict_clause}
+            """,
+            (
+                task["task_id"],
+                task["task_key"],
+                task["batch_id"],
+                int(task["project_id"]),
+                int(task["question_id"]),
+                int(task["model_config_id"]),
+                int(task.get("repeat_index", 1)),
+                task.get("status", "queued"),
+                int(task.get("attempt_count", 0)),
+                task.get("rq_job_id", ""),
+                task.get("lease_owner", ""),
+                task.get("lease_expires_at"),
+                task.get("heartbeat_at"),
+                task.get("chat_id", ""),
+                task.get("artifact_dir", ""),
+                task.get("error_code", ""),
+                task.get("error_message", ""),
+                task.get("created_at", utc_now()),
+                task.get("started_at"),
+                task.get("finished_at"),
+                task.get("updated_at", utc_now()),
+            ),
+        )
+        if getattr(cur, "rowcount", 0) > 0:
+            created += 1
+    return created
+
+
+def get_sampling_task(conn, task_id: str) -> dict[str, Any] | None:
+    return row_to_dict(
+        conn.execute(
+            """
+            SELECT t.*, q.question, q.target_brand, q.competitor_brands,
+                   m.provider, m.model, m.model_version, m.label AS model_label,
+                   p.brand_name, p.website_domain, p.competitors AS project_competitors
+            FROM sampling_tasks t
+            JOIN questions q ON q.id = t.question_id
+            JOIN model_configs m ON m.id = t.model_config_id
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    )
+
+
+def list_sampling_tasks(conn, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT t.*, q.question, m.provider, m.model, m.label AS model_label
+        FROM sampling_tasks t
+        JOIN questions q ON q.id = t.question_id
+        JOIN model_configs m ON m.id = t.model_config_id
+        WHERE t.batch_id = ?
+        ORDER BY t.id ASC
+        LIMIT ?
+        """,
+        (batch_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_sampling_task(conn, task_id: str, updates: dict[str, Any]) -> None:
+    allowed = {
+        "status",
+        "attempt_count",
+        "rq_job_id",
+        "lease_owner",
+        "lease_expires_at",
+        "heartbeat_at",
+        "chat_id",
+        "artifact_dir",
+        "error_code",
+        "error_message",
+        "started_at",
+        "finished_at",
+        "updated_at",
+    }
+    fields = [field for field in updates if field in allowed]
+    if not fields:
+        return
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    conn.execute(
+        f"UPDATE sampling_tasks SET {assignments} WHERE task_id = ?",
+        (*[updates[field] for field in fields], task_id),
+    )
+
+
+def claim_sampling_task(conn, task_id: str, lease_owner: str, lease_seconds: int = 360) -> bool:
+    now = utc_now()
+    lease_until = (datetime.now(timezone.utc) + timedelta(seconds=max(60, lease_seconds))).isoformat()
+    cur = conn.execute(
+        """
+        UPDATE sampling_tasks
+        SET status = 'running', attempt_count = attempt_count + 1,
+            lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?,
+            started_at = COALESCE(started_at, ?), updated_at = ?,
+            error_code = '', error_message = ''
+        WHERE task_id = ?
+          AND (
+              status = 'queued'
+              OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+          )
+        """,
+        (lease_owner, lease_until, now, now, now, task_id, now),
+    )
+    return getattr(cur, "rowcount", 0) == 1
+
+
+def sampling_task_counts(conn, batch_id: str) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS count FROM sampling_tasks WHERE batch_id = ? GROUP BY status",
+        (batch_id,),
+    ).fetchall()
+    counts = {str(row["status"]): int(row["count"]) for row in rows}
+    total = sum(counts.values())
+    success = counts.get("success", 0)
+    failed = counts.get("failed", 0)
+    blocked = counts.get("blocked", 0)
+    return {
+        "total": total,
+        "queued": counts.get("queued", 0),
+        "running": counts.get("running", 0),
+        "success": success,
+        "failed": failed,
+        "blocked": blocked,
+        "completed": success + failed + blocked,
+    }
+
+
+def next_queued_sampling_task(conn, batch_id: str) -> dict[str, Any] | None:
+    now = utc_now()
+    return row_to_dict(
+        conn.execute(
+            """
+            SELECT * FROM sampling_tasks
+            WHERE batch_id = ?
+              AND (
+                  status = 'queued'
+                  OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+              )
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (batch_id, now),
+        ).fetchone()
+    )
+
+
+def reset_resumable_sampling_tasks(conn, batch_id: str) -> int:
+    now = utc_now()
+    cur = conn.execute(
+        """
+        UPDATE sampling_tasks
+        SET status = 'queued', rq_job_id = '', lease_owner = '', lease_expires_at = NULL,
+            heartbeat_at = NULL, updated_at = ?
+        WHERE batch_id = ?
+          AND (
+              status IN ('failed', 'blocked')
+              OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+          )
+        """,
+        (now, batch_id, now),
+    )
+    return max(0, int(getattr(cur, "rowcount", 0)))
+
+
+def reset_running_sampling_tasks(conn, batch_id: str) -> int:
+    cur = conn.execute(
+        """
+        UPDATE sampling_tasks
+        SET status = 'queued', rq_job_id = '', lease_owner = '', lease_expires_at = NULL,
+            heartbeat_at = NULL, updated_at = ?
+        WHERE batch_id = ? AND status = 'running'
+        """,
+        (utc_now(), batch_id),
+    )
+    return max(0, int(getattr(cur, "rowcount", 0)))
+
+
+def recent_sampling_task_error_codes(conn, batch_id: str, limit: int = 3) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT status, error_code FROM sampling_tasks
+        WHERE batch_id = ? AND status IN ('success', 'failed', 'blocked')
+        ORDER BY finished_at DESC, id DESC
+        LIMIT ?
+        """,
+        (batch_id, limit),
+    ).fetchall()
+    return [str(row["error_code"] or "") if row["status"] != "success" else "" for row in rows]
+
+
 def run_logical_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         row.get("question_id"),
@@ -1426,7 +1730,7 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             run["model"],
             run.get("model_version", ""),
             1 if run.get("search_enabled") else 0,
-            float(run.get("temperature", 0)),
+            None if run.get("temperature") is None else float(run.get("temperature", 0)),
             int(run.get("repeat_index", 1)),
             run["requested_at"],
             run.get("response_text", ""),

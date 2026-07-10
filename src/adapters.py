@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -11,7 +12,13 @@ import urllib.request
 from copy import deepcopy
 from typing import Any
 
-from src.runtime_env import provider_has_credentials, resolve_baidu_ak_sk, resolve_brave_search_api_key, resolve_provider_api_key
+from src.runtime_env import (
+    provider_has_credentials,
+    resolve_baidu_ak_sk,
+    resolve_brave_search_api_key,
+    resolve_provider_api_key,
+    resolve_tencent_search_credentials,
+)
 
 
 class AdapterError(RuntimeError):
@@ -55,17 +62,23 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
         "reasoning_effort": "",
         "defaults_note": "DeepSeek 标准 API 无原生联网搜索；联网口径使用 Brave Search 外部检索增强。",
     },
-    "qwen": {
-        "temperature": 0.1,
-        "reasoning_effort": "",
-        "search_strategy": "turbo",
-        "defaults_note": "通义千问：事实问答推荐 temperature=0.1；联网搜索 search_strategy 预填 turbo。",
-    },
-    "hunyuan": {
+    "deepseek_web": {
         "temperature": 0,
         "reasoning_effort": "",
+        "search_mode": "official_web",
+        "defaults_note": "DeepSeek 官网联网搜索；每题使用独立网页会话，DOM 为最终答案真相源。",
+    },
+    "qwen": {
+        "temperature": 0.7,
+        "reasoning_effort": "",
+        "search_strategy": "turbo",
+        "defaults_note": "通义千问：按 Qwen3 非思考模型官方默认 temperature=0.7；联网搜索 search_strategy 预填 turbo。",
+    },
+    "hunyuan": {
+        "temperature": None,
+        "reasoning_effort": "",
         "search_mode": "force",
-        "defaults_note": "腾讯元宝：确定性审计默认 temperature=0；联网搜索默认强制启用搜索增强并返回 search_info/citation。",
+        "defaults_note": "腾讯元宝/混元：不传 temperature，使用腾讯官方模型推荐默认值；联网搜索使用腾讯官方 WSA SearchPro，再把搜索结果作为引用材料交给 hy3 生成。",
     },
     "kimi": {
         "temperature": 0.6,
@@ -73,14 +86,14 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
         "defaults_note": "Kimi K2.5 当前 API 仅接受 temperature=0.6；联网搜索需关闭深度思考。",
     },
     "ernie": {
-        "temperature": 0.1,
+        "temperature": None,
         "reasoning_effort": "",
-        "defaults_note": "文心/千帆：事实问答默认 temperature=0.1；思考默认关闭。",
+        "defaults_note": "文心/千帆：不传 temperature，使用千帆模型默认参数；思考默认关闭。",
     },
     "minimax": {
-        "temperature": 0.1,
+        "temperature": None,
         "reasoning_effort": "",
-        "defaults_note": "MiniMax：事实问答默认 temperature=0.1；思考默认关闭。",
+        "defaults_note": "MiniMax：不传 temperature，使用模型默认参数；思考默认关闭。",
     },
     "openrouter_gpt": {
         "temperature": 1,
@@ -201,7 +214,7 @@ PROVIDER_PRESETS = {
         "label": "DeepSeek",
         "provider": "deepseek",
         "api_family": "DeepSeek API",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://api.deepseek.com/v1",
@@ -219,6 +232,29 @@ PROVIDER_PRESETS = {
         "supports_user_location": False,
         "supports_tool_calling": True,
         "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+    },
+    "deepseek_web": {
+        "label": "DeepSeek 官网联网搜索",
+        "provider": "deepseek_web",
+        "api_family": "DeepSeek Web UI",
+        "model": "deepseek-web-search",
+        "model_version": "",
+        "model_type": "browser",
+        "api_base": "https://chat.deepseek.com",
+        "supports_pure": False,
+        "supports_search": True,
+        "web_search_mode": "DeepSeek 官网联网搜索",
+        "web_search_param_path": "Playwright UI + passive response capture",
+        "supports_reasoning": False,
+        "reasoning_param_path": "",
+        "reasoning_levels": "",
+        "supports_citation": True,
+        "citation_param_path": "rendered answer links / passive network metadata",
+        "supports_site_filter": False,
+        "supports_time_filter": False,
+        "supports_user_location": False,
+        "supports_tool_calling": False,
+        "notes": "通过官方 chat.deepseek.com 网页执行；每题独立会话，仅支持联网搜索批次。",
     },
     "openrouter_gpt": {
         "label": "OpenRouter-GPT",
@@ -270,7 +306,7 @@ PROVIDER_PRESETS = {
         "label": "通义千问",
         "provider": "qwen",
         "api_family": "阿里云百炼 / DashScope",
-        "model": "qwen-plus",
+        "model": "qwen3.7-plus",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -299,18 +335,18 @@ PROVIDER_PRESETS = {
         "api_base": "https://api.hunyuan.cloud.tencent.com/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "搜索增强 / 强制搜索增强",
-        "web_search_param_path": "enable_enhancement=true; force_search_enhancement=true; search_info=true; citation=true",
+        "web_search_mode": "腾讯云联网搜索 API SearchPro + hy3 生成",
+        "web_search_param_path": "wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY",
         "supports_reasoning": True,
         "reasoning_param_path": "按模型能力控制，当前预置仅记录能力",
         "reasoning_levels": "按模型能力",
         "supports_citation": True,
-        "citation_param_path": "citation / search_info",
+        "citation_param_path": "SearchPro Response.Pages[].url/title/passage/site",
         "supports_site_filter": True,
         "supports_time_filter": True,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "腾讯元宝数据源基于腾讯混元 OpenAI 兼容接口；联网默认强制启用搜索增强，并要求返回 search_info 与 citation。",
+        "notes": "腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。",
     },
     "kimi": {
         "label": "Kimi",
@@ -339,7 +375,7 @@ PROVIDER_PRESETS = {
         "label": "文心一言",
         "provider": "ernie",
         "api_family": "百度千帆 / ERNIE API",
-        "model": "ernie-4.5-turbo-32k",
+        "model": "ernie-5.1",
         "model_version": "",
         "model_type": "chat",
         "api_base": "https://qianfan.baidubce.com/v2",
@@ -580,6 +616,142 @@ def extract_brave_results(data: dict[str, Any], limit: int = 5) -> list[dict[str
 def brave_citations(results: list[dict[str, str]]) -> list[dict[str, str]]:
     return dedupe_citations(
         [{"url": item.get("url", ""), "title": item.get("title", "")} for item in results if item.get("url")]
+    )
+
+
+def tc3_hmac_sha256(key: bytes, message: str) -> bytes:
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def tencent_search_authorization(secret_id: str, secret_key: str, payload_json: str, timestamp: int) -> str:
+    service = "wsa"
+    host = "wsa.tencentcloudapi.com"
+    action = "SearchPro"
+    date = time.strftime("%Y-%m-%d", time.gmtime(timestamp))
+    algorithm = "TC3-HMAC-SHA256"
+    canonical_headers = f"content-type:application/json; charset=utf-8\nhost:{host}\nx-tc-action:{action.lower()}\n"
+    signed_headers = "content-type;host;x-tc-action"
+    hashed_request_payload = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    canonical_request = "\n".join(
+        [
+            "POST",
+            "/",
+            "",
+            canonical_headers,
+            signed_headers,
+            hashed_request_payload,
+        ]
+    )
+    credential_scope = f"{date}/{service}/tc3_request"
+    hashed_canonical_request = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+    string_to_sign = "\n".join([algorithm, str(timestamp), credential_scope, hashed_canonical_request])
+    secret_date = tc3_hmac_sha256(("TC3" + secret_key).encode("utf-8"), date)
+    secret_service = tc3_hmac_sha256(secret_date, service)
+    secret_signing = tc3_hmac_sha256(secret_service, "tc3_request")
+    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return (
+        f"{algorithm} Credential={secret_id}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+
+def normalize_tencent_freshness(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"[dmy](\d+)?", text):
+        return text
+    if text.isdigit():
+        return f"d{text}"
+    return text
+
+
+def tencent_search_request(question: str, options: dict[str, Any]) -> dict[str, Any]:
+    _appid, secret_id, secret_key = resolve_tencent_search_credentials()
+    if not secret_id or not secret_key:
+        raise AdapterError("腾讯官方联网搜索需要 TENCENT_SEARCH_SECRET_ID 和 TENCENT_SEARCH_SECRET_KEY。")
+    payload: dict[str, Any] = {"Query": question}
+    if options.get("search_site_filter"):
+        first_site = str(options["search_site_filter"]).split(",", 1)[0].strip()
+        if first_site:
+            payload["Site"] = first_site
+    freshness = normalize_tencent_freshness(options.get("search_freshness", ""))
+    if freshness:
+        payload["Freshness"] = freshness
+    if options.get("search_limit") in {10, 20, 30, 40, 50}:
+        payload["Cnt"] = int(options["search_limit"])
+    if options.get("search_mode") == "force":
+        payload["Mode"] = 0
+    payload_json = json.dumps(payload)
+    timestamp = int(time.time())
+    headers = {
+        "Authorization": tencent_search_authorization(secret_id, secret_key, payload_json, timestamp),
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": "wsa.tencentcloudapi.com",
+        "X-TC-Action": "SearchPro",
+        "X-TC-Timestamp": str(timestamp),
+        "X-TC-Version": "2025-05-08",
+    }
+    data = post_json("https://wsa.tencentcloudapi.com", headers, payload)
+    response = data.get("Response") or {}
+    if response.get("Error"):
+        error = response["Error"]
+        raise AdapterError(f"腾讯官方联网搜索失败：{error.get('Code', '')} {error.get('Message', '')}".strip())
+    results = extract_tencent_search_results(response)
+    if not results:
+        raise AdapterError("腾讯官方联网搜索未返回可用网页结果。")
+    return {"raw_response": data, "results": results}
+
+
+def extract_tencent_search_results(response: dict[str, Any]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for page in response.get("Pages") or []:
+        try:
+            parsed = json.loads(page) if isinstance(page, str) else page
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        url = str(parsed.get("url") or "").strip()
+        title = str(parsed.get("title") or "").strip()
+        description = str(parsed.get("passage") or parsed.get("content") or "").strip()
+        site = str(parsed.get("site") or "").strip()
+        date = str(parsed.get("date") or "").strip()
+        if url or title or description:
+            items.append({"url": url, "title": title, "description": description, "site": site, "date": date})
+    return items
+
+
+def tencent_search_citations(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    return dedupe_citations(
+        [{"url": item.get("url", ""), "title": item.get("title", "")} for item in results if item.get("url")]
+    )
+
+
+def build_tencent_augmented_question(question: str, results: list[dict[str, str]]) -> str:
+    source_blocks = []
+    for idx, item in enumerate(results, start=1):
+        parts = [
+            f"[{idx}] 标题: {item.get('title') or '-'}",
+            f"URL: {item.get('url') or '-'}",
+        ]
+        if item.get("site"):
+            parts.append(f"站点: {item['site']}")
+        if item.get("date"):
+            parts.append(f"日期: {item['date']}")
+        parts.append(f"摘要: {item.get('description') or '-'}")
+        source_blocks.append("\n".join(parts))
+    return (
+        "你是制造业品牌 GEO 审计助手。\n"
+        "以下是腾讯云联网搜索 API SearchPro 返回的公开网页检索结果。请只基于这些资料回答用户问题。\n"
+        "如果资料不足，请明确说明“检索结果不足以判断”。\n\n"
+        "要求：\n"
+        "1. 客观回答，不要编造未出现在资料中的事实。\n"
+        "2. 涉及品牌、厂家、产品能力时尽量引用来源编号，例如 [1]。\n"
+        "3. 不要声称你自己进行了联网搜索；信息来源是下方腾讯云 SearchPro 结果。\n\n"
+        f"用户问题：\n{question}\n\n"
+        "腾讯云 SearchPro 结果：\n"
+        + "\n\n".join(source_blocks)
     )
 
 
@@ -843,15 +1015,27 @@ def openai_model_supports_reasoning(model: str) -> bool:
     return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
-def build_openai_chat_payload(model: str, question: str, temperature: float) -> dict[str, Any]:
-    return {
+def build_openai_chat_payload(model: str, question: str, temperature: float | None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。"},
             {"role": "user", "content": question},
         ],
-        "temperature": temperature,
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    return payload
+
+
+def build_user_only_chat_payload(model: str, question: str, temperature: float | None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": question}],
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    return payload
 
 
 def brave_country(value: str) -> str:
@@ -956,10 +1140,10 @@ def build_deepseek_chat_payload(
 def build_qwen_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = build_openai_chat_payload(model, question, temperature)
+    payload = build_user_only_chat_payload(model, question, temperature)
     if options["search_enabled"]:
         payload["enable_search"] = True
         search_options: dict[str, Any] = {
@@ -1001,29 +1185,32 @@ def build_qwen_chat_payload(
 def build_qwen_generation_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     chat_payload = build_qwen_chat_payload(model, question, temperature, options)
+    parameters: dict[str, Any] = {
+        "enable_search": True,
+        "search_options": chat_payload.get("search_options", {"enable_source": True, "enable_citation": True}),
+        "result_format": "message",
+    }
+    if temperature is not None:
+        parameters["temperature"] = temperature
     return {
         "model": model,
         "input": {"messages": chat_payload["messages"]},
-        "parameters": {
-            "enable_search": True,
-            "search_options": chat_payload.get("search_options", {"enable_source": True, "enable_citation": True}),
-            "result_format": "message",
-            "temperature": temperature,
-        },
+        "parameters": parameters,
     }
 
 
 def build_kimi_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = build_openai_chat_payload(model, question, normalize_kimi_temperature(model, temperature))
+    normalized_temperature = normalize_kimi_temperature(model, temperature if temperature is not None else 0.6)
+    payload = build_openai_chat_payload(model, question, normalized_temperature)
     if options["search_enabled"] and options["thinking_type"] != "disabled":
         raise AdapterError("Kimi 官方联网搜索要求关闭深度思考，请在采样页关闭深度思考后再试。")
     if options["thinking_type"] in {"enabled", "disabled"}:
@@ -1034,22 +1221,16 @@ def build_kimi_chat_payload(
 def build_hunyuan_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = build_openai_chat_payload(model, question, temperature)
-    if options["search_enabled"]:
-        payload["enable_enhancement"] = True
-        payload["search_info"] = True
-        payload["citation"] = True
-        payload["force_search_enhancement"] = options["search_mode"] == "force"
-    return payload
+    return build_openai_chat_payload(model, question, temperature)
 
 
 def build_ernie_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
@@ -1076,7 +1257,7 @@ def build_ernie_chat_payload(
 def build_minimax_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     return build_openai_chat_payload(model, question, temperature)
@@ -1085,7 +1266,7 @@ def build_minimax_chat_payload(
 def build_openrouter_chat_payload(
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     payload = build_openai_chat_payload(model, question, temperature)
@@ -1112,7 +1293,7 @@ def build_openai_compatible_payload(
     provider: str,
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     search_enabled = options["search_enabled"]
@@ -1142,11 +1323,12 @@ def openai_compatible_request(
     api_key: str,
     model: str,
     question: str,
-    temperature: float,
+    temperature: float | None,
     provider: str,
     options: dict[str, Any],
 ) -> dict[str, Any]:
     brave_payload: dict[str, Any] | None = None
+    tencent_search_payload: dict[str, Any] | None = None
     external_citations: list[dict[str, str]] = []
     request_question = question
     if provider in BRAVE_AUGMENTED_PROVIDERS and options["search_enabled"]:
@@ -1158,20 +1340,20 @@ def openai_compatible_request(
         except AdapterError as exc:
             label = {"deepseek": "DeepSeek", "qwen": "通义千问", "ernie": "文心一言"}.get(provider, provider)
             raise AdapterError(f"{label} 联网口径依赖 Brave Search 失败：{exc}") from exc
-    if provider == "qwen" and options["search_enabled"]:
-        payload = build_qwen_generation_payload(model, request_question, temperature, options)
-        data = post_json(
-            dashscope_generation_url(base),
-            {"Authorization": f"Bearer {api_key}"},
-            payload,
-        )
-    else:
-        payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
-        data = post_json(
-            f"{normalize_base(base)}/chat/completions",
-            {"Authorization": f"Bearer {api_key}"},
-            payload,
-        )
+    if provider == "hunyuan" and options["search_enabled"]:
+        try:
+            tencent_search_payload = tencent_search_request(question, options)
+            tencent_results = tencent_search_payload["results"]
+            external_citations = tencent_search_citations(tencent_results)
+            request_question = build_tencent_augmented_question(question, tencent_results)
+        except AdapterError as exc:
+            raise AdapterError(f"腾讯元宝联网口径依赖腾讯云 SearchPro 失败：{exc}") from exc
+    payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
+    data = post_json(
+        f"{normalize_base(base)}/chat/completions",
+        {"Authorization": f"Bearer {api_key}"},
+        payload,
+    )
     citations = dedupe_citations(extract_generic_citations(data))
     if provider == "qwen":
         citations = extract_qwen_citations(data)
@@ -1188,6 +1370,12 @@ def openai_compatible_request(
             f"{provider}_response": data,
             "brave_search": brave_payload["raw_response"],
             "brave_results": brave_payload["results"],
+        }
+    if tencent_search_payload is not None:
+        raw_response = {
+            f"{provider}_response": data,
+            "tencent_search": tencent_search_payload["raw_response"],
+            "tencent_search_results": tencent_search_payload["results"],
         }
     response_text = normalize_choice_text(data)
     if provider in {"openrouter_gpt", "openrouter_gemini"}:
@@ -1549,6 +1737,15 @@ def call_configured_model(
 
 def test_model_config(model_config: dict[str, Any]) -> dict[str, Any]:
     provider = model_config.get("provider", "")
+    if provider == "deepseek_web":
+        from src.deepseek_web import DeepSeekWebBrowser
+
+        browser = DeepSeekWebBrowser()
+        try:
+            result = browser.preflight()
+        finally:
+            browser.close()
+        return {"ok": True, "provider": provider, "model": model_config.get("model", "deepseek-web-search"), **result}
     test_temperature = 1 if provider == "kimi" else 0
     result = call_configured_model(
         model_config,

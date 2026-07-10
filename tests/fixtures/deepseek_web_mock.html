@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8"><title>DeepSeek Web Mock</title></head>
+  <body>
+    <button id="search" aria-pressed="false">联网搜索</button>
+    <textarea id="composer"></textarea>
+    <main id="messages"></main>
+    <script>
+      const search = document.querySelector('#search');
+      const composer = document.querySelector('#composer');
+      const messages = document.querySelector('#messages');
+      search.addEventListener('click', () => search.setAttribute('aria-pressed', 'true'));
+      composer.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        history.pushState({}, '', '?chat_session_id=mock-session-001');
+        const prompt = document.createElement('div');
+        prompt.textContent = composer.value;
+        messages.appendChild(prompt);
+        const answer = document.createElement('div');
+        answer.className = 'ds-markdown';
+        answer.innerHTML = '模拟官方联网回答。<a href="https://example.com/source">示例来源</a>';
+        messages.appendChild(answer);
+        composer.value = '';
+      });
+    </script>
+  </body>
+</html>

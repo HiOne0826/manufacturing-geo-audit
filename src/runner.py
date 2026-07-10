@@ -227,7 +227,7 @@ def prepare_runtime_task(
     raw_temperature = provider_cfg.get("temperature", config.get("temperature"))
     if raw_temperature in (None, "", "null"):
         raw_temperature = sampling_defaults.get("temperature", 0)
-    model_temperature = float(raw_temperature or 0)
+    model_temperature = None if raw_temperature in (None, "", "null") else float(raw_temperature)
     raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
     model_thinking_budget = None
     if model_thinking_enabled and raw_budget not in (None, "", "null"):
