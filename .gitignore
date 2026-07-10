@@ -8,3 +8,5 @@ __pycache__/
 node_modules/
 frontend/node_modules/
 frontend/tsconfig.tsbuildinfo
+private/
+data/deepseek-web-artifacts/

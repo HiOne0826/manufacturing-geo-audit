@@ -141,6 +141,19 @@ python3 worker.py
 
 详情见：[docs/postgres-rq.md](docs/postgres-rq.md)。
 
+## DeepSeek 官网采样 worker
+
+DeepSeek 官网联网搜索使用独立 Playwright worker，每个问题创建独立网页会话，不与 API provider 混跑。
+
+```bash
+python3 -m pip install -r requirements-web-worker.txt
+python3 -m playwright install chromium
+python3 scripts/deepseek_web_auth.py login
+python3 deepseek_web_worker.py
+```
+
+详情见：[docs/deepseek-web-worker.md](docs/deepseek-web-worker.md)。
+
 ## 测试
 
 单元与集成测试：
@@ -222,6 +235,7 @@ python3 scripts/load_test_local.py --questions 2 --models 2 --workers 2
 - [docs/retry-export-rerun.md](docs/retry-export-rerun.md)：重试、失败重跑和导出。
 - [docs/postgres-rq.md](docs/postgres-rq.md)：PostgreSQL + Redis/RQ。
 - [docs/agent-mcp.md](docs/agent-mcp.md)：Agent API / MCP 映射。
+- [docs/deepseek-web-worker.md](docs/deepseek-web-worker.md)：DeepSeek 官网独立会话采样 worker。
 - [mcp/README.md](mcp/README.md)：MCP wrapper 使用说明。
 - [docs/model-api-capabilities-2026-06-06.md](docs/model-api-capabilities-2026-06-06.md)：模型 API 能力与参数依据。
 
@@ -239,5 +253,6 @@ python3 scripts/load_test_local.py --questions 2 --models 2 --workers 2
 
 - `deploy/server/manufacturing-geo-audit.service`
 - `deploy/server/manufacturing-geo-audit-worker.service`
+- `deploy/server/manufacturing-geo-audit-deepseek-web-worker.service`
 - `deploy/server/manufacturing-geo-audit.conf`
 - `deploy/postgres/schema.sql`

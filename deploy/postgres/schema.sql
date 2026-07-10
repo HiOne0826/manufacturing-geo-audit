@@ -114,6 +114,31 @@ CREATE TABLE IF NOT EXISTS model_runs (
     superseded_at TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS sampling_tasks (
+    id BIGSERIAL PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    task_key TEXT NOT NULL UNIQUE,
+    batch_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    model_config_id BIGINT NOT NULL,
+    repeat_index INTEGER DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempt_count INTEGER DEFAULT 0,
+    rq_job_id TEXT DEFAULT '',
+    lease_owner TEXT DEFAULT '',
+    lease_expires_at TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    chat_id TEXT DEFAULT '',
+    artifact_dir TEXT DEFAULT '',
+    error_code TEXT DEFAULT '',
+    error_message TEXT DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS answer_evaluations (
     id BIGSERIAL PRIMARY KEY,
     run_id TEXT NOT NULL UNIQUE REFERENCES model_runs(run_id) ON DELETE CASCADE,
@@ -134,3 +159,4 @@ CREATE TABLE IF NOT EXISTS answer_evaluations (
 CREATE INDEX IF NOT EXISTS idx_model_runs_batch_id ON model_runs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_model_runs_project_id ON model_runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_sampling_batches_project_id ON sampling_batches(project_id);
+CREATE INDEX IF NOT EXISTS idx_sampling_tasks_batch_status ON sampling_tasks(batch_id, status, id);

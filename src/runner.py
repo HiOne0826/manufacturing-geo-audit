@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import json
+import random
 import threading
+import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -24,13 +26,14 @@ from .evaluator import evaluate_answer
 
 PROVIDER_CONCURRENCY_GROUPS = {
     "openrouter_gpt": "openrouter",
-    "openrouter_gemini": "openrouter",
+    "openrouter_gemini": "openrouter_gemini",
 }
 
 DEFAULT_PROVIDER_CONCURRENCY_LIMITS = {
     "openai": 2,
     "gemini": 2,
     "openrouter": 4,
+    "openrouter_gemini": 2,
     "deepseek": 1,
     "doubao": 2,
     "qwen": 1,
@@ -123,6 +126,46 @@ def retry_count(config: dict[str, Any] | None = None) -> int:
     return env_int("SAMPLING_RETRY_COUNT", 1, minimum=0, maximum=5)
 
 
+def retry_delay_seconds(error: AdapterError, attempt: int) -> float:
+    try:
+        base = max(0.0, float(os.environ.get("SAMPLING_RETRY_BACKOFF_BASE_SECONDS", "1") or 1))
+    except (TypeError, ValueError):
+        base = 1.0
+    try:
+        maximum = max(base, float(os.environ.get("SAMPLING_RETRY_BACKOFF_MAX_SECONDS", "30") or 30))
+    except (TypeError, ValueError):
+        maximum = 30.0
+    exponential = min(maximum, base * (2 ** max(0, attempt)))
+    requested_delay = max(0.0, float(error.retry_after or 0))
+    delay = max(exponential, requested_delay)
+    jitter = random.uniform(0, min(max(base, delay * 0.25), 1.0))
+    return delay + jitter
+
+
+def call_model_with_retries(
+    task: dict[str, Any],
+    semaphore: threading.Semaphore,
+    max_retries: int,
+) -> dict[str, Any]:
+    last_error: AdapterError | None = None
+    for attempt in range(0, max_retries + 1):
+        try:
+            with semaphore:
+                return call_configured_model(
+                    task["model_config"],
+                    task["question"]["question"],
+                    task["search_enabled"],
+                    task["temperature"],
+                    task["run_options"],
+                )
+        except AdapterError as exc:
+            last_error = exc
+            if attempt >= max_retries or not exc.retryable:
+                raise
+            time.sleep(retry_delay_seconds(exc, attempt))
+    raise last_error or AdapterError("模型调用失败")
+
+
 def connection_db_target(conn) -> Path | None:
     if is_postgres_conn(conn):
         return None
@@ -184,7 +227,7 @@ def prepare_runtime_task(
     raw_temperature = provider_cfg.get("temperature", config.get("temperature"))
     if raw_temperature in (None, "", "null"):
         raw_temperature = sampling_defaults.get("temperature", 0)
-    model_temperature = float(raw_temperature or 0)
+    model_temperature = None if raw_temperature in (None, "", "null") else float(raw_temperature)
     raw_budget = provider_cfg.get("thinking_budget", config.get("thinking_budget"))
     model_thinking_budget = None
     if model_thinking_enabled and raw_budget not in (None, "", "null"):
@@ -247,26 +290,8 @@ def execute_sampling_task(
 ) -> dict[str, Any]:
     base = task["base"]
     question = task["question"]
-    last_error = None
-    result = None
     try:
-        for attempt in range(0, max_retries + 1):
-            try:
-                with semaphore:
-                    result = call_configured_model(
-                        task["model_config"],
-                        question["question"],
-                        task["search_enabled"],
-                        task["temperature"],
-                        task["run_options"],
-                    )
-                break
-            except AdapterError as exc:
-                last_error = exc
-                if attempt >= max_retries:
-                    raise
-        if result is None:
-            raise AdapterError(str(last_error or "模型调用失败"))
+        result = call_model_with_retries(task, semaphore, max_retries)
         run = {
             **base,
             "provider": result.get("provider", base["provider"]),
@@ -301,7 +326,7 @@ def execute_sampling_task(
                     "latency_ms": 0,
                     "status": "failed",
                     "error_message": str(exc),
-                    "raw_response": {},
+                    "raw_response": getattr(exc, "raw_response", {}),
                 },
             )
         return {**base, "status": "failed", "error_message": str(exc)}

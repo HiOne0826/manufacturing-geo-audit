@@ -4,6 +4,7 @@ from __future__ import annotations
 TEST_PLATFORM_NAMES = {
     "openai": "ChatGPT",
     "deepseek": "DeepSeek",
+    "deepseek_web": "DeepSeek 官网",
     "gemini": "Gemini",
     "doubao": "豆包",
     "qwen": "千问",

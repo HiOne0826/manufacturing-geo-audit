@@ -44,6 +44,8 @@ from src.db import (
     list_runs_by_batch,
     list_runs,
     list_sampling_batches,
+    list_sampling_tasks,
+    sampling_task_counts,
     seed_questions,
     update_sampling_batch,
     update_model_config,
@@ -63,6 +65,14 @@ from src.runtime_env import BRAVE_SEARCH_ENV_KEYS, load_dotenv_file, resolve_bra
 from src.runner import estimate_batch_total
 from src.db import utc_now
 from src.tasks import mark_batch_failed, mark_rq_job_failed, perform_batch, perform_rerun_failed, perform_resume_batch, request_batch_pause
+from src.deepseek_web import deepseek_web_status
+from src.deepseek_web_tasks import (
+    batch_is_web,
+    create_web_sampling_tasks,
+    enqueue_next_web_task,
+    resume_web_batch,
+    web_batch_mode,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -376,6 +386,26 @@ def progress_response_for_batch(conn, batch: dict, job: dict | None = None) -> d
     base = sampling_batch_to_progress(batch)
     if job:
         base.update(job)
+    if batch_is_web(batch):
+        counts = sampling_task_counts(conn, batch["batch_id"])
+        base.update(
+            {
+                "total": counts["total"],
+                "completed": counts["completed"],
+                "failed": counts["failed"] + counts["blocked"],
+                "success": counts["success"],
+                "running": counts["running"],
+                "queued": counts["queued"],
+                "blocked": counts["blocked"],
+                "status": batch.get("status", "queued"),
+            }
+        )
+        base["total_count"] = counts["total"]
+        base["completed_count"] = counts["completed"]
+        base["success_count"] = counts["success"]
+        base["failed_count"] = counts["failed"] + counts["blocked"]
+        base["source_statuses"] = source_statuses_for_batch(conn, batch, job)
+        return base
     rows = latest_logical_runs(list_runs_by_batch(conn, batch["batch_id"]))
     if rows and not job:
         latest_progress = latest_run_progress(rows, planned_batch_total(conn, batch))
@@ -707,6 +737,8 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 elif parsed.path == "/api/settings/brave-search":
                     self.json_response(brave_search_status())
+                elif parsed.path == "/api/settings/deepseek-web":
+                    self.json_response(deepseek_web_status())
                 elif parsed.path == "/api/questions":
                     project_raw = query.get("project_id", [None])[0]
                     project_id = int(project_raw) if project_raw and project_raw != "all" else None
@@ -748,6 +780,13 @@ class Handler(SimpleHTTPRequestHandler):
                         self.json_response({"error": "接口不存在"}, 404)
                         return
                     batch_id = parts[2]
+                    if len(parts) == 4 and parts[3] == "tasks":
+                        batch = get_sampling_batch(conn, batch_id)
+                        if not batch:
+                            self.json_response({"error": "批次不存在"}, 404)
+                            return
+                        self.json_response({"tasks": list_sampling_tasks(conn, batch_id)})
+                        return
                     if len(parts) == 4 and parts[3] == "runs":
                         include_history = str(query.get("history", [""])[0]).lower() in {"1", "true", "yes"}
                         rows = list_runs_by_batch(conn, batch_id, include_history=include_history)
@@ -902,7 +941,13 @@ class Handler(SimpleHTTPRequestHandler):
                     commit_json({"ok": True})
                 elif parsed.path == "/api/runs/start":
                     project_id = int(payload.get("project_id", 0))
-                    total = estimate_batch_total(conn, project_id, payload)
+                    try:
+                        mode = web_batch_mode(conn, payload)
+                    except ValueError as exc:
+                        self.json_response({"error": str(exc)}, 400)
+                        return
+                    run_payload = {**payload, "provider_mode": "deepseek_web"} if mode == "web" else payload
+                    total = estimate_batch_total(conn, project_id, run_payload)
                     existing_batch = active_project_batch(conn, project_id)
                     if existing_batch:
                         existing_job = get_sampling_job(existing_batch["batch_id"])
@@ -922,7 +967,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "success_count": 0,
                             "failed_count": 0,
                             "completed_count": 0,
-                            "config": payload,
+                            "config": run_payload,
                             "created_at": utc_now(),
                             "updated_at": utc_now(),
                         },
@@ -938,8 +983,13 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
+                    if mode == "web":
+                        create_web_sampling_tasks(conn, batch_id, project_id, run_payload)
                     conn.commit()
-                    job_id = dispatch_batch(batch_id, project_id, payload)
+                    if mode == "web":
+                        job_id = enqueue_next_web_task(batch_id, DEFAULT_DB_PATH)
+                    else:
+                        job_id = dispatch_batch(batch_id, project_id, run_payload)
                     result = {
                         "batch_id": batch_id,
                         "total": total,
@@ -964,6 +1014,13 @@ class Handler(SimpleHTTPRequestHandler):
                         "max_workers": (payload.get("options") or {}).get("max_workers", payload.get("max_workers")),
                         "retry_count": (payload.get("options") or {}).get("retry_count", payload.get("retry_count")),
                     }
+                    try:
+                        mode = web_batch_mode(conn, run_payload)
+                    except ValueError as exc:
+                        self.json_response({"error": str(exc)}, 400)
+                        return
+                    if mode == "web":
+                        run_payload["provider_mode"] = "deepseek_web"
                     total = estimate_batch_total(conn, project_id, run_payload)
                     batch_id = payload.get("batch_id") or f"batch-{uuid.uuid4().hex[:10]}"
                     create_sampling_batch(
@@ -989,8 +1046,13 @@ class Handler(SimpleHTTPRequestHandler):
                         created_at=utc_now(),
                         updated_at=utc_now(),
                     )
+                    if mode == "web":
+                        create_web_sampling_tasks(conn, batch_id, project_id, run_payload)
                     conn.commit()
-                    job_id = dispatch_batch(batch_id, project_id, run_payload)
+                    if mode == "web":
+                        job_id = enqueue_next_web_task(batch_id, DEFAULT_DB_PATH)
+                    else:
+                        job_id = dispatch_batch(batch_id, project_id, run_payload)
                     self.json_response(
                         {
                             "batch_id": batch_id,
@@ -1006,6 +1068,11 @@ class Handler(SimpleHTTPRequestHandler):
                         self.json_response({"error": "接口不存在"}, 404)
                         return
                     batch_id = parts[3]
+                    batch = get_sampling_batch(conn, batch_id)
+                    if batch_is_web(batch):
+                        result = resume_web_batch(batch_id, DEFAULT_DB_PATH)
+                        self.json_response(result)
+                        return
                     failed_runs = list_failed_runs_by_batch(conn, batch_id)
                     job_id = dispatch_rerun_failed(batch_id, payload)
                     self.json_response(
@@ -1026,6 +1093,11 @@ class Handler(SimpleHTTPRequestHandler):
                     batch = get_sampling_batch(conn, batch_id)
                     if not batch:
                         self.json_response({"error": "批次不存在"}, 404)
+                        return
+                    if batch_is_web(batch):
+                        result = resume_web_batch(batch_id, DEFAULT_DB_PATH)
+                        updated = get_sampling_batch(conn, batch_id) or batch
+                        self.json_response({**progress_response_for_batch(conn, updated), **result})
                         return
                     failed_runs = list_failed_runs_by_batch(conn, batch_id)
                     if not failed_runs:
@@ -1083,6 +1155,11 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     if batch.get("status") not in {"paused", "pause_requested", "failed", "queued"}:
                         self.json_response({"error": "当前批次状态不能继续执行"}, 409)
+                        return
+                    if batch_is_web(batch):
+                        result = resume_web_batch(batch_id, DEFAULT_DB_PATH)
+                        updated = get_sampling_batch(conn, batch_id) or batch
+                        self.json_response({**progress_response_for_batch(conn, updated), **result})
                         return
                     if batch.get("status") == "pause_requested":
                         update_sampling_batch(conn, batch_id, {"status": "running", "updated_at": utc_now()})

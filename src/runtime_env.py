@@ -24,6 +24,9 @@ PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
 BAIDU_AK_ENV_KEYS = ("BAIDU_QIANFAN_AK", "QIANFAN_AK", "BAIDU_AK", "ERNIE_AK")
 BAIDU_SK_ENV_KEYS = ("BAIDU_QIANFAN_SK", "QIANFAN_SK", "BAIDU_SK", "ERNIE_SK")
 BRAVE_SEARCH_ENV_KEYS = ("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY")
+TENCENT_SEARCH_APPID_ENV_KEYS = ("TENCENT_SEARCH_APPID", "TENCENT_APPID")
+TENCENT_SEARCH_SECRET_ID_ENV_KEYS = ("TENCENT_SEARCH_SECRET_ID", "TENCENT_SECRET_ID")
+TENCENT_SEARCH_SECRET_KEY_ENV_KEYS = ("TENCENT_SEARCH_SECRET_KEY", "TENCENT_SECRET_KEY")
 
 
 def load_dotenv_file(path: Path) -> None:
@@ -68,7 +71,18 @@ def resolve_brave_search_api_key() -> str:
     return first_env(*BRAVE_SEARCH_ENV_KEYS)
 
 
+def resolve_tencent_search_credentials() -> tuple[str, str, str]:
+    return (
+        first_env(*TENCENT_SEARCH_APPID_ENV_KEYS),
+        first_env(*TENCENT_SEARCH_SECRET_ID_ENV_KEYS),
+        first_env(*TENCENT_SEARCH_SECRET_KEY_ENV_KEYS),
+    )
+
+
 def provider_has_credentials(provider: str, current_value: str = "") -> bool:
+    if provider == "deepseek_web":
+        auth_path = Path(os.environ.get("DEEPSEEK_WEB_AUTH_STATE", "private/deepseek-web/storage-state.json"))
+        return auth_path.is_file()
     if resolve_provider_api_key(provider, current_value):
         return True
     if provider == "ernie":
