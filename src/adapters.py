@@ -15,7 +15,20 @@ from src.runtime_env import provider_has_credentials, resolve_baidu_ak_sk, resol
 
 
 class AdapterError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        raw_response: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.raw_response = raw_response or {}
 
 
 OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
@@ -384,7 +397,19 @@ def post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dic
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise AdapterError(f"HTTP {exc.code}: {body[:1200]}") from exc
+        retry_after = None
+        try:
+            retry_after = float(exc.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            pass
+        raise AdapterError(
+            f"HTTP {exc.code}: {body[:1200]}",
+            retryable=exc.code in {408, 409, 425, 429, 500, 502, 503, 504},
+            status_code=exc.code,
+            retry_after=retry_after,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise AdapterError(str(exc), retryable=True) from exc
     except Exception as exc:
         raise AdapterError(str(exc)) from exc
 
@@ -459,9 +484,30 @@ def first_choice_finish_reason(data: dict[str, Any]) -> tuple[str, str]:
 def ensure_openrouter_complete_response(data: dict[str, Any], response_text: str) -> None:
     finish_reason, native_finish_reason = first_choice_finish_reason(data)
     if finish_reason == "length" or native_finish_reason == "max_output_tokens":
-        raise AdapterError("OpenRouter 返回被 max_tokens 截断，未产出完整回答")
+        raise AdapterError("OpenRouter 返回被 max_tokens 截断，未产出完整回答", raw_response=data)
+    choices = data.get("choices") or (data.get("output") or {}).get("choices") or []
+    choice = (choices[0] or {}) if choices else {}
+    choice_error = choice.get("error") or {}
+    if finish_reason == "error" or choice_error:
+        raw_code = choice_error.get("code")
+        try:
+            status_code = int(raw_code)
+        except (TypeError, ValueError):
+            status_code = None
+        metadata = choice_error.get("metadata") or {}
+        error_type = str(metadata.get("error_type") or "").strip()
+        detail = error_type or str(choice_error.get("message") or "上游生成异常").strip()
+        retryable = finish_reason == "error" and (
+            status_code is None or status_code == 429 or status_code >= 500
+        )
+        raise AdapterError(
+            f"OpenRouter 返回异常结束：{detail}，部分回答未作为成功结果保存",
+            retryable=retryable,
+            status_code=status_code,
+            raw_response=data,
+        )
     if not response_text.strip():
-        raise AdapterError("OpenRouter 返回成功但回答内容为空")
+        raise AdapterError("OpenRouter 返回成功但回答内容为空", retryable=True, raw_response=data)
 
 
 def normalize_responses_text(data: dict[str, Any]) -> str:

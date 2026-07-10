@@ -17,7 +17,7 @@ import app
 from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
-from src.runner import prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, run_batch
+from src.runner import call_model_with_retries, prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, retry_delay_seconds, run_batch
 from src.tasks import mark_batch_failed
 
 
@@ -677,6 +677,83 @@ class HarnessHttpTests(unittest.TestCase):
                     "openrouter_gpt",
                     options,
                 )
+
+    def test_openrouter_stream_error_with_partial_text_is_retryable_failure(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "search_mode": "force",
+                "search_strategy": "exa",
+                "thinking_type": "disabled",
+            }
+        )
+        response = {
+            "model": "google/gemini-2.5-flash",
+            "choices": [
+                {
+                    "finish_reason": "error",
+                    "error": {
+                        "code": 429,
+                        "message": "JSON error injected into SSE stream",
+                        "metadata": {"error_type": "rate_limit_exceeded"},
+                    },
+                    "message": {"role": "assistant", "content": "只生成了一半的回答"},
+                }
+            ],
+        }
+        with mock.patch("src.adapters.post_json", return_value=response):
+            with self.assertRaises(AdapterError) as raised:
+                openai_compatible_request(
+                    "https://openrouter.ai/api/v1",
+                    "openrouter-test-key",
+                    "google/gemini-2.5-flash",
+                    "测试问题",
+                    1,
+                    "openrouter_gemini",
+                    options,
+                )
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.raw_response, response)
+        self.assertIn("rate_limit_exceeded", str(raised.exception))
+
+    def test_retryable_adapter_error_uses_backoff_then_succeeds(self):
+        task = {
+            "model_config": {"provider": "openrouter_gemini"},
+            "question": {"question": "测试问题"},
+            "search_enabled": True,
+            "temperature": 1,
+            "run_options": {},
+        }
+        expected = {"response_text": "完整回答"}
+        error = AdapterError("HTTP 429", retryable=True, status_code=429)
+        with mock.patch("src.runner.call_configured_model", side_effect=[error, expected]) as call_model, \
+             mock.patch("src.runner.random.uniform", return_value=0.25), \
+             mock.patch("src.runner.time.sleep") as sleep:
+            result = call_model_with_retries(task, threading.Semaphore(1), 1)
+        self.assertEqual(result, expected)
+        self.assertEqual(call_model.call_count, 2)
+        sleep.assert_called_once_with(1.25)
+
+    def test_non_retryable_adapter_error_fails_without_retry(self):
+        task = {
+            "model_config": {"provider": "openrouter_gemini"},
+            "question": {"question": "测试问题"},
+            "search_enabled": True,
+            "temperature": 1,
+            "run_options": {},
+        }
+        with mock.patch("src.runner.call_configured_model", side_effect=AdapterError("HTTP 400", status_code=400)) as call_model, \
+             mock.patch("src.runner.time.sleep") as sleep:
+            with self.assertRaises(AdapterError):
+                call_model_with_retries(task, threading.Semaphore(1), 3)
+        self.assertEqual(call_model.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_retry_delay_honors_retry_after(self):
+        error = AdapterError("HTTP 429", retryable=True, status_code=429, retry_after=5)
+        with mock.patch("src.runner.random.uniform", return_value=0.5):
+            self.assertEqual(retry_delay_seconds(error, 0), 5.5)
 
     def test_hunyuan_search_payload_forces_search_and_url_metadata(self):
         options = normalize_run_options(
@@ -1504,14 +1581,14 @@ class HarnessDirectTests(unittest.TestCase):
         self.assertTrue(all(item["product_line"] == "FDS" for item in questions))
         self.assertIn("DeepSeek", raw)
 
-    def test_provider_concurrency_limits_use_shared_source_groups(self):
+    def test_provider_concurrency_limits_separate_openrouter_gemini(self):
         old_limits = os.environ.get("SAMPLING_PROVIDER_CONCURRENCY_LIMITS")
         try:
             os.environ.pop("SAMPLING_PROVIDER_CONCURRENCY_LIMITS", None)
             self.assertEqual(provider_concurrency_group("openrouter_gpt"), "openrouter")
-            self.assertEqual(provider_concurrency_group("openrouter_gemini"), "openrouter")
+            self.assertEqual(provider_concurrency_group("openrouter_gemini"), "openrouter_gemini")
             self.assertEqual(provider_concurrency_limit("openrouter_gpt"), 4)
-            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 4)
+            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 2)
             self.assertEqual(provider_concurrency_limit("deepseek"), 1)
             self.assertEqual(provider_concurrency_limit("doubao"), 2)
             self.assertEqual(provider_concurrency_limit("qwen"), 1)
@@ -1519,9 +1596,9 @@ class HarnessDirectTests(unittest.TestCase):
             self.assertEqual(provider_concurrency_limit("ernie"), 1)
             self.assertEqual(provider_concurrency_limit("mock"), 16)
 
-            os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = "openrouter=1,deepseek=2"
+            os.environ["SAMPLING_PROVIDER_CONCURRENCY_LIMITS"] = "openrouter=1,openrouter_gemini=2,deepseek=2"
             self.assertEqual(provider_concurrency_limit("openrouter_gpt"), 1)
-            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 1)
+            self.assertEqual(provider_concurrency_limit("openrouter_gemini"), 2)
             self.assertEqual(provider_concurrency_limit("deepseek"), 2)
         finally:
             if old_limits is None:
