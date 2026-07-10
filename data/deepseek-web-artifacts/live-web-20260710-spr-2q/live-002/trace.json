@@ -1,0 +1,33 @@
+[
+  {
+    "event": "started",
+    "at": 1783653406.3045208
+  },
+  {
+    "event": "page_opened",
+    "at": 1783653407.189504,
+    "url": "https://chat.deepseek.com/"
+  },
+  {
+    "event": "new_chat_ready",
+    "at": 1783653407.258841
+  },
+  {
+    "event": "search_enabled",
+    "at": 1783653407.77685
+  },
+  {
+    "event": "question_filled",
+    "at": 1783653407.78074,
+    "length": 30
+  },
+  {
+    "event": "question_submitted",
+    "at": 1783653407.817125
+  },
+  {
+    "event": "completed",
+    "at": 1783653437.778069,
+    "chat_id": "63171afe-355b-4159-b549-8466471a0c3b"
+  }
+]
