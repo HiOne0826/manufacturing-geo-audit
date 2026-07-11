@@ -1,14 +1,16 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8765";
+
 export default defineConfig(({ command }) => ({
   base: command === "build" ? "/manufacturing-geo-audit/" : "/",
   plugins: [react()],
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8765",
+      "/api": apiProxyTarget,
       "/manufacturing-geo-audit/api": {
-        target: "http://127.0.0.1:8765",
+        target: apiProxyTarget,
         rewrite: (path) => path.replace(/^\/manufacturing-geo-audit/, "")
       }
     }

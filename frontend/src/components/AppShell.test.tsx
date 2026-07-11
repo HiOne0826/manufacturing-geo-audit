@@ -36,7 +36,7 @@ describe("project context", () => {
     const user = userEvent.setup();
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/models?project_id=2"]}>
+        <MemoryRouter initialEntries={["/analysis?project_id=2"]}>
           <AppShell><LocationProbe /></AppShell>
         </MemoryRouter>
       </QueryClientProvider>,
@@ -48,6 +48,20 @@ describe("project context", () => {
 
     await user.selectOptions(select, "1");
     await waitFor(() => expect(useSelectionStore.getState().projectId).toBe(1));
-    expect(screen.getByLabelText("location")).toHaveTextContent("/models?project_id=1");
+    expect(screen.getByLabelText("location")).toHaveTextContent("/analysis?project_id=1");
+  });
+
+  it.each(["/models", "/settings"])("hides the project topbar on %s", async (path) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[path]}>
+          <AppShell><div>页面内容</div></AppShell>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(container.querySelector('select[aria-label="切换当前项目"]')).not.toBeInTheDocument();
+    expect(container.querySelector('button.task-center-trigger')).not.toBeInTheDocument();
   });
 });

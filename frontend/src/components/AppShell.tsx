@@ -21,6 +21,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const mobileNavRef = useRef<HTMLElement>(null);
   const location = useLocation();
   const projectId = useSelectionStore((state) => state.projectId);
+  const showProjectTopbar = !["/models", "/settings"].includes(location.pathname);
   useEffect(() => { setMobileNav(false); }, [location.pathname]);
   const logout = useMutation({ mutationFn: authApi.logout, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["auth"] }) });
   useDialogFocus(mobileNav, mobileNavRef, () => setMobileNav(false));
@@ -34,10 +35,10 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="sidebar-foot"><span>V2 · 内部交付环境</span><button className="ghost" onClick={() => logout.mutate()} disabled={logout.isPending}>退出</button></div>
       </aside>
       <section className="workspace">
-        <header className="topbar">
+        {showProjectTopbar ? <header className="topbar">
           <ProjectContextBar />
           <button className="task-center-trigger ghost" onClick={() => setTaskCenter(true)}><PanelLeftClose size={17} />任务中心</button>
-        </header>
+        </header> : null}
         <div className="route-stage" key={projectId || "no-project"}>{children}</div>
       </section>
       <TaskCenter open={taskCenter} onClose={() => setTaskCenter(false)} />

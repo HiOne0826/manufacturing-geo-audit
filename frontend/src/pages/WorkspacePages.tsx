@@ -448,6 +448,7 @@ export function ModelsPage() {
   const [bochaKey, setBochaKey] = useState("");
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editing, setEditing] = useState<ModelConfig | null>(null);
+  const modelGroups = useMemo(() => splitModelsForManagement(models.data?.models || []), [models.data?.models]);
   const create = useMutation({
     mutationFn: modelsApi.create,
     onSuccess: () => {
@@ -498,7 +499,18 @@ export function ModelsPage() {
         onApiKeyChange={setBochaKey}
         onSubmit={() => updateBochaSearch.mutate({ api_key: bochaKey })}
       />
-      <AsyncBoundary loading={models.isLoading} refreshing={models.isFetching && !models.isLoading} stale={models.isError && Boolean(models.data)} error={models.data ? null : models.error} empty={!models.data?.models.length} emptyLabel="暂无模型配置" onRetry={() => models.refetch()}><div className="model-grid">{models.data?.models.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div></AsyncBoundary>
+      <AsyncBoundary loading={models.isLoading} refreshing={models.isFetching && !models.isLoading} stale={models.isError && Boolean(models.data)} error={models.data ? null : models.error} empty={!models.data?.models.length} emptyLabel="暂无模型配置" onRetry={() => models.refetch()}>
+        <div className="model-sections">
+          {modelGroups.current.length ? <div className="model-grid">{modelGroups.current.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div> : null}
+          {modelGroups.archived.length ? (
+            <details className="archived-models">
+              <summary><span>归档模型</span><span>{modelGroups.archived.length} 个历史模型</span></summary>
+              <p>GPT、Gemini、DeepSeek 官网联网搜索和 MiniMax 默认收起；展开后仍可编辑或测试。</p>
+              <div className="model-grid">{modelGroups.archived.map((model) => <ModelCard key={model.id} model={model} onEdit={() => setEditing(model)} onTest={() => test.mutate({ id: model.id })} />)}</div>
+            </details>
+          ) : null}
+        </div>
+      </AsyncBoundary>
       {test.data ? <pre className="result-box">{JSON.stringify(test.data, null, 2)}</pre> : null}
       {test.error ? <div className="error-box">{test.error.message.includes("真实模型调用默认关闭") ? "真实模型测试当前被后端安全开关拦截。需要本地验收真实调用时，用 ALLOW_LIVE_MODEL_CALLS=1 重启 python3 app.py。" : test.error.message}</div> : null}
     </main>
@@ -610,7 +622,21 @@ function ModelForm({ value, onChange, onSubmit, onCancel, submitLabel, isEdit = 
 
 function ModelCard({ model, onTest, onEdit }: { model: ModelConfig; onTest: () => void; onEdit: () => void }) {
   const defaults = model.sampling_defaults || {};
-  return <article className="model-card"><header><div><strong>{model.label}</strong><span>{model.provider} / {model.model}</span></div><span className={model.has_key ? "key-ok" : "key-missing"}><KeyRound size={14} />{model.has_key ? model.api_key_masked || "已配置" : "未配置"}</span></header><div className="tag-row">{model.supports_search ? <span>联网</span> : null}{model.supports_reasoning ? <span>思考</span> : null}{model.supports_citation ? <span>引用</span> : null}{model.active ? <span>启用</span> : <span>停用</span>}</div><dl><dt>temperature</dt><dd>{String(defaults.temperature ?? "模型默认")}</dd><dt>reasoning</dt><dd>{String(defaults.reasoning_effort ?? "模型默认")}</dd><dt>api_base</dt><dd>{model.api_base || "-"}</dd><dt>note</dt><dd>{String(defaults.defaults_note ?? "-")}</dd></dl><div className="inline-actions"><button className="ghost" onClick={onEdit}>编辑设置</button><button className="ghost" onClick={onTest}>测试</button></div></article>;
+  return <article className="model-card"><header><div><strong>{model.label}</strong><span>{model.provider} / {model.model}</span></div><span className={model.has_key ? "key-ok" : "key-missing"}><KeyRound size={14} />{model.has_key ? model.api_key_masked || "已配置" : "未配置"}</span></header><div className="tag-row">{model.supports_search ? <span>联网</span> : null}{model.supports_reasoning ? <span>思考</span> : null}{model.supports_citation ? <span>引用</span> : null}{model.active ? <span>启用</span> : <span>停用</span>}</div><dl className="model-card-details"><dt>temperature</dt><dd>{String(defaults.temperature ?? "模型默认")}</dd><dt>reasoning</dt><dd>{String(defaults.reasoning_effort ?? "模型默认")}</dd><dt>api_base</dt><dd>{model.api_base || "-"}</dd><dt>note</dt><dd>{String(defaults.defaults_note ?? "-")}</dd></dl><div className="inline-actions"><button className="ghost" onClick={onEdit}>编辑设置</button><button className="ghost" onClick={onTest}>测试</button></div></article>;
+}
+
+const ARCHIVED_MODEL_PROVIDERS = new Set(["deepseek_web", "gemini", "minimax"]);
+
+export function splitModelsForManagement(models: ModelConfig[]) {
+  const archived: ModelConfig[] = [];
+  const current: ModelConfig[] = [];
+  for (const model of models) {
+    const identity = `${model.label} ${model.model}`.toLowerCase();
+    const isOpenRouterModel = model.provider === "openrouter_gpt" || model.provider === "openrouter_gemini";
+    const shouldArchive = ARCHIVED_MODEL_PROVIDERS.has(model.provider) || (!isOpenRouterModel && /\bgpt\b|gemini/.test(identity));
+    (shouldArchive ? archived : current).push(model);
+  }
+  return { current, archived };
 }
 
 export function SamplingPage() {

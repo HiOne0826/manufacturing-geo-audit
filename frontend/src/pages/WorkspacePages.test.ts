@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeQuestionImport } from "./WorkspacePages";
+import { analyzeQuestionImport, splitModelsForManagement } from "./WorkspacePages";
 
 describe("question paste import", () => {
   it("recognizes Windows, Unix and classic macOS line endings", () => {
@@ -20,5 +20,40 @@ describe("question paste import", () => {
     expect(result.valid).toBe(0);
     expect(result.invalid).toBe(1);
     expect(result.reasons).toContain("缺少“问题内容”列");
+  });
+});
+
+describe("model management grouping", () => {
+  it("collects GPT, Gemini, DeepSeek official search and MiniMax in the collapsed archive section", () => {
+    const groups = splitModelsForManagement([
+      { id: 1, provider: "openai", label: "GPT", model: "gpt-5.5" },
+      { id: 2, provider: "gemini", label: "Gemini", model: "gemini-2.5-flash" },
+      { id: 3, provider: "deepseek_web", label: "DeepSeek 官网联网搜索", model: "DeepSeek Web" },
+      { id: 4, provider: "minimax", label: "MiniMax", model: "MiniMax-M1" },
+      { id: 5, provider: "qwen", label: "通义千问", model: "qwen3.5-plus" }
+    ]);
+
+    expect(groups.archived.map((model) => model.id)).toEqual([1, 2, 3, 4]);
+    expect(groups.current.map((model) => model.id)).toEqual([5]);
+  });
+
+  it("keeps OpenRouter GPT and Gemini in the main model area", () => {
+    const groups = splitModelsForManagement([
+      { id: 1, provider: "openrouter_gpt", label: "OpenRouter-GPT", model: "openai/gpt-5.2" },
+      { id: 2, provider: "openrouter_gemini", label: "OpenRouter-Gemini", model: "google/gemini-2.5-flash" }
+    ]);
+
+    expect(groups.archived).toEqual([]);
+    expect(groups.current.map((model) => model.id)).toEqual([1, 2]);
+  });
+
+  it("archives manually named GPT and Gemini configurations as well", () => {
+    const groups = splitModelsForManagement([
+      { id: 1, provider: "custom", label: "企业 GPT", model: "chat-model" },
+      { id: 2, provider: "custom", label: "Google 模型", model: "gemini-custom" }
+    ]);
+
+    expect(groups.current).toEqual([]);
+    expect(groups.archived).toHaveLength(2);
   });
 });
