@@ -78,13 +78,14 @@ def is_postgres_conn(conn) -> bool:
 
 
 def json_db_value(conn, value: Any) -> Any:
+    serializable = json.loads(json.dumps(value, ensure_ascii=False, default=str))
     if is_postgres_conn(conn):
         try:
             from psycopg.types.json import Jsonb
         except ImportError as exc:
             raise RuntimeError("缺少 PostgreSQL JSON 依赖，请先安装：python3 -m pip install -r requirements-worker.txt") from exc
-        return Jsonb(value)
-    return json.dumps(value, ensure_ascii=False)
+        return Jsonb(serializable)
+    return json.dumps(serializable, ensure_ascii=False)
 
 
 def parse_json_field(value: Any, fallback: Any) -> Any:
@@ -189,19 +190,19 @@ DEFAULT_MODEL_CONFIGS = [
         "daily_limit": 0,
         "supports_pure": 1,
         "supports_search": 1,
-        "web_search_mode": "Brave Search 外部检索增强",
-        "web_search_param_path": "BRAVE_SEARCH_API_KEY; /res/v1/web/search; q/count/country/search_lang/freshness/safesearch",
+        "web_search_mode": "博查 Web Search API 外部检索增强",
+        "web_search_param_path": "BOCHA_API_KEY; POST https://api.bochaai.com/v1/web-search; query/count/freshness/summary/include",
         "supports_reasoning": 1,
         "reasoning_param_path": "thinking.type / reasoning_effort",
         "reasoning_levels": "disabled;enabled + low/medium/high",
         "supports_citation": 1,
-        "citation_param_path": "Brave Search web.results[].url/title/description",
+        "citation_param_path": "博查 data.webPages.value[].url/name/snippet/summary",
         "supports_site_filter": 0,
         "supports_time_filter": 0,
         "supports_user_location": 0,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+        "notes": "DeepSeek OpenAI 兼容接口；联网搜索统一使用博查 Web Search API 结果作为上下文，再由 DeepSeek 生成。",
     },
     {
         "provider": "deepseek_web",
@@ -457,6 +458,9 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
         if is_postgres_conn(conn):
             conn.executescript(POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8"))
             seed_model_configs(conn)
+            conn.commit()
+            from .migrations import MigrationRunner
+            MigrationRunner(conn, "postgres").apply()
             return
         conn.executescript(
             """
@@ -470,7 +474,8 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 website_domain TEXT DEFAULT '',
                 competitors TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                archived_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS questions (
@@ -572,6 +577,15 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 failed_count INTEGER DEFAULT 0,
                 completed_count INTEGER DEFAULT 0,
                 config_json TEXT DEFAULT '{}',
+                batch_name TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                purpose TEXT DEFAULT '',
+                tags_json TEXT DEFAULT '[]',
+                config_snapshot_json TEXT DEFAULT '{}',
+                client_request_id TEXT DEFAULT '',
+                generation INTEGER DEFAULT 1,
+                lock_version INTEGER DEFAULT 0,
+                archived_at TEXT,
                 error_message TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 started_at TEXT,
@@ -599,6 +613,7 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
                 artifact_dir TEXT DEFAULT '',
                 error_code TEXT DEFAULT '',
                 error_message TEXT DEFAULT '',
+                task_snapshot_json TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
@@ -609,6 +624,86 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_sampling_tasks_batch_status
             ON sampling_tasks(batch_id, status, id);
+
+            CREATE TABLE IF NOT EXISTS execution_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id TEXT NOT NULL UNIQUE,
+                task_id TEXT DEFAULT '',
+                task_key TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                run_id TEXT DEFAULT '',
+                attempt_no INTEGER NOT NULL DEFAULT 1,
+                configured_provider TEXT DEFAULT '',
+                actual_provider TEXT DEFAULT '',
+                configured_model TEXT DEFAULT '',
+                actual_model TEXT DEFAULT '',
+                mode TEXT DEFAULT 'pure',
+                config_fingerprint TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                error_code TEXT DEFAULT '',
+                error_message TEXT DEFAULT '',
+                response_received INTEGER DEFAULT 0,
+                persistence_committed INTEGER DEFAULT 0,
+                latency_ms INTEGER DEFAULT 0,
+                usage_json TEXT DEFAULT '{}',
+                cost_estimate REAL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_execution_attempts_batch_task
+            ON execution_attempts(batch_id, task_key, attempt_no);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_attempts_sequence
+            ON execution_attempts(batch_id, task_key, attempt_no);
+
+            CREATE TABLE IF NOT EXISTS dispatch_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                payload_json TEXT DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER DEFAULT 0,
+                available_at TEXT NOT NULL,
+                delivered_at TEXT,
+                last_error TEXT DEFAULT '',
+                claim_token TEXT DEFAULT '',
+                claim_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dispatch_outbox_pending
+            ON dispatch_outbox(status, available_at, id);
+
+            CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                worker_id TEXT PRIMARY KEY,
+                queue_name TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                metadata_json TEXT DEFAULT '{}',
+                heartbeat_at TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_health (
+                health_key TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model TEXT DEFAULT '',
+                mode TEXT DEFAULT 'pure',
+                status TEXT NOT NULL DEFAULT 'unknown',
+                consecutive_failures INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                failure_count INTEGER DEFAULT 0,
+                last_error_code TEXT DEFAULT '',
+                last_error_message TEXT DEFAULT '',
+                circuit_open_until TEXT,
+                last_success_at TEXT,
+                last_failure_at TEXT,
+                checked_at TEXT,
+                updated_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS answer_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -632,9 +727,16 @@ def init_db(db_path: Path | str | None = DEFAULT_DB_PATH) -> None:
         migrate_questions_schema(conn)
         migrate_model_configs(conn)
         migrate_model_runs_schema(conn)
+        migrate_projects_schema(conn)
+        migrate_sampling_batches_schema(conn)
         migrate_legacy_default_models(conn)
         sync_default_model_capabilities(conn)
         seed_model_configs(conn)
+        conn.commit()
+        # Bootstrap and upgrade share one version ledger: fresh databases are
+        # immediately ready, while existing databases receive additive changes.
+        from .migrations import MigrationRunner
+        MigrationRunner(conn, "sqlite").apply()
 
 
 def migrate_model_configs(conn: sqlite3.Connection) -> None:
@@ -664,6 +766,71 @@ def migrate_model_configs(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
 
 
+def migrate_projects_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+    if "archived_at" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN archived_at TEXT")
+
+
+def migrate_sampling_batches_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sampling_batches)").fetchall()}
+    additions = {
+        "batch_name": "ALTER TABLE sampling_batches ADD COLUMN batch_name TEXT DEFAULT ''",
+        "description": "ALTER TABLE sampling_batches ADD COLUMN description TEXT DEFAULT ''",
+        "purpose": "ALTER TABLE sampling_batches ADD COLUMN purpose TEXT DEFAULT ''",
+        "tags_json": "ALTER TABLE sampling_batches ADD COLUMN tags_json TEXT DEFAULT '[]'",
+        "config_snapshot_json": "ALTER TABLE sampling_batches ADD COLUMN config_snapshot_json TEXT DEFAULT '{}'",
+        "client_request_id": "ALTER TABLE sampling_batches ADD COLUMN client_request_id TEXT DEFAULT ''",
+        "generation": "ALTER TABLE sampling_batches ADD COLUMN generation INTEGER DEFAULT 1",
+        "lock_version": "ALTER TABLE sampling_batches ADD COLUMN lock_version INTEGER DEFAULT 0",
+        "archived_at": "ALTER TABLE sampling_batches ADD COLUMN archived_at TEXT",
+    }
+    for name, sql in additions.items():
+        if name not in columns:
+            conn.execute(sql)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sampling_batches_client_request "
+        "ON sampling_batches(project_id, client_request_id) WHERE client_request_id <> ''"
+    )
+    # Legacy databases could contain multiple active batches for one project.
+    # Preserve every batch, but deterministically keep the most recently
+    # updated one active before installing the invariant-enforcing index.
+    conn.execute(
+        """
+        UPDATE sampling_batches AS stale
+        SET status = 'failed_system',
+            error_message = CASE
+                WHEN TRIM(COALESCE(stale.error_message, '')) = ''
+                    THEN 'V2 migration: superseded duplicate active batch'
+                ELSE stale.error_message || CHAR(10) || 'V2 migration: superseded duplicate active batch'
+            END,
+            finished_at = COALESCE(stale.finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE stale.status IN ('queued', 'running', 'pause_requested', 'paused')
+          AND stale.archived_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM sampling_batches AS newer
+              WHERE newer.project_id = stale.project_id
+                AND newer.status IN ('queued', 'running', 'pause_requested', 'paused')
+                AND newer.archived_at IS NULL
+                AND (
+                    COALESCE(newer.updated_at, '') > COALESCE(stale.updated_at, '')
+                    OR (
+                        COALESCE(newer.updated_at, '') = COALESCE(stale.updated_at, '')
+                        AND newer.id > stale.id
+                    )
+                )
+          )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sampling_batches_one_active_project "
+        "ON sampling_batches(project_id) "
+        "WHERE status IN ('queued', 'running', 'pause_requested', 'paused') AND archived_at IS NULL"
+    )
+
+
 def migrate_model_runs_schema(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(model_runs)").fetchall()}
     additions = {
@@ -678,6 +845,18 @@ def migrate_model_runs_schema(conn: sqlite3.Connection) -> None:
     for name, sql in additions.items():
         if name not in columns:
             conn.execute(sql)
+    # Rebuild the projection before enforcing the one-current-result invariant.
+    refresh_current_run_flags(conn)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_model_runs_one_current
+        ON model_runs (
+            batch_id, question_id, model_config_id, search_enabled,
+            COALESCE(search_mode, ''), COALESCE(thinking_type, ''),
+            COALESCE(reasoning_effort, ''), COALESCE(thinking_budget, -1), repeat_index
+        ) WHERE is_current = 1
+        """
+    )
 
 
 def migrate_questions_schema(conn: sqlite3.Connection) -> None:
@@ -805,8 +984,14 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE model_configs
-        SET model = 'deepseek-v4-flash'
-        WHERE provider = 'deepseek' AND model IN ('deepseek-chat', 'deepseek-v3', 'deepseek-v3.1')
+        SET model = CASE WHEN model IN ('deepseek-chat', 'deepseek-v3', 'deepseek-v3.1') THEN 'deepseek-v4-flash' ELSE model END,
+            supports_search = 1,
+            web_search_mode = '博查 Web Search API 外部检索增强',
+            web_search_param_path = 'BOCHA_API_KEY; POST https://api.bochaai.com/v1/web-search; query/count/freshness/summary/include',
+            supports_citation = 1,
+            citation_param_path = '博查 data.webPages.value[].url/name/snippet/summary',
+            notes = 'DeepSeek OpenAI 兼容接口；联网搜索统一使用博查 Web Search API 结果作为上下文，再由 DeepSeek 生成。'
+        WHERE provider = 'deepseek'
         """
     )
     conn.execute(
@@ -854,6 +1039,28 @@ def list_projects(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_project_impact(conn: sqlite3.Connection, project_id: int) -> dict[str, Any] | None:
+    project = get_project(conn, project_id)
+    if not project:
+        return None
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM questions WHERE project_id = ?) AS question_count,
+          (SELECT COUNT(*) FROM sampling_batches WHERE project_id = ?) AS batch_count,
+          (SELECT COUNT(*) FROM model_runs WHERE project_id = ?) AS run_count,
+          (SELECT COUNT(*) FROM answer_evaluations e
+             JOIN model_runs r ON r.run_id = e.run_id WHERE r.project_id = ?) AS evaluation_count
+        """,
+        (project_id, project_id, project_id, project_id),
+    ).fetchone()
+    return {
+        "project_id": project_id,
+        "project_name": project.get("brand_name") or project.get("client_name") or str(project_id),
+        **dict(row),
+    }
 
 
 def create_project(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
@@ -906,6 +1113,13 @@ def update_project(conn: sqlite3.Connection, payload: dict[str, Any]) -> None:
 
 def delete_project(conn: sqlite3.Connection, project_id: int) -> None:
     conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+
+def archive_project(conn: sqlite3.Connection, project_id: int, archived: bool = True) -> None:
+    conn.execute(
+        "UPDATE projects SET archived_at = ? WHERE id = ?",
+        (utc_now() if archived else None, project_id),
+    )
 
 
 def get_project(conn: sqlite3.Connection, project_id: int) -> dict[str, Any] | None:
@@ -1322,9 +1536,10 @@ def create_sampling_batch(conn: sqlite3.Connection, payload: dict[str, Any]) -> 
         """
         INSERT INTO sampling_batches (
             batch_id, project_id, status, total_count, success_count, failed_count,
-            completed_count, config_json, error_message, created_at, started_at,
-            finished_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            completed_count, config_json, batch_name, description, purpose, tags_json,
+            config_snapshot_json, client_request_id, generation, lock_version, archived_at,
+            error_message, created_at, started_at, finished_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["batch_id"],
@@ -1335,6 +1550,15 @@ def create_sampling_batch(conn: sqlite3.Connection, payload: dict[str, Any]) -> 
             int(payload.get("failed_count", 0) or 0),
             int(payload.get("completed_count", 0) or 0),
             json_db_value(conn, payload.get("config", {})),
+            str(payload.get("batch_name", "")).strip(),
+            str(payload.get("description", "")).strip(),
+            str(payload.get("purpose", "")).strip(),
+            json_db_value(conn, payload.get("tags", [])),
+            json_db_value(conn, payload.get("config_snapshot", payload.get("config", {}))),
+            str(payload.get("client_request_id", "")).strip(),
+            max(1, int(payload.get("generation", 1) or 1)),
+            int(payload.get("lock_version", 0) or 0),
+            payload.get("archived_at"),
             payload.get("error_message", ""),
             payload.get("created_at", now),
             payload.get("started_at"),
@@ -1355,6 +1579,12 @@ def update_sampling_batch(conn: sqlite3.Connection, batch_id: str, updates: dict
         "started_at",
         "finished_at",
         "updated_at",
+        "batch_name",
+        "description",
+        "purpose",
+        "archived_at",
+        "generation",
+        "lock_version",
     }
     fields = [field for field in updates if field in allowed]
     if not fields:
@@ -1367,11 +1597,40 @@ def update_sampling_batch(conn: sqlite3.Connection, batch_id: str, updates: dict
     )
 
 
+def update_sampling_batch_cas(
+    conn,
+    batch_id: str,
+    expected_statuses: set[str] | tuple[str, ...] | list[str],
+    updates: dict[str, Any],
+) -> bool:
+    allowed = {
+        "status", "total_count", "success_count", "failed_count", "completed_count",
+        "error_message", "started_at", "finished_at", "updated_at",
+    }
+    fields = [field for field in updates if field in allowed]
+    statuses = sorted(set(expected_statuses))
+    if not fields or not statuses:
+        return False
+    current = conn.execute("SELECT lock_version FROM sampling_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+    if not current:
+        return False
+    expected_version = int(current["lock_version"] or 0)
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    placeholders = ",".join("?" for _ in statuses)
+    cur = conn.execute(
+        f"UPDATE sampling_batches SET {assignments}, lock_version = lock_version + 1 WHERE batch_id = ? AND lock_version = ? AND status IN ({placeholders})",
+        (*[updates[field] for field in fields], batch_id, expected_version, *statuses),
+    )
+    return getattr(cur, "rowcount", 0) == 1
+
+
 def get_sampling_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any] | None:
     row = row_to_dict(conn.execute("SELECT * FROM sampling_batches WHERE batch_id = ?", (batch_id,)).fetchone())
     if not row:
         return None
     row["config"] = parse_json_field(row.pop("config_json"), {})
+    row["tags"] = parse_json_field(row.pop("tags_json", None), [])
+    row["config_snapshot"] = parse_json_field(row.pop("config_snapshot_json", None), row["config"])
     return row
 
 
@@ -1401,8 +1660,41 @@ def list_sampling_batches(conn: sqlite3.Connection, project_id: int | None = Non
     for row in rows:
         item = dict(row)
         item["config"] = parse_json_field(item.pop("config_json"), {})
+        item["tags"] = parse_json_field(item.pop("tags_json", None), [])
+        item["config_snapshot"] = parse_json_field(item.pop("config_snapshot_json", None), item["config"])
         result.append(item)
     return result
+
+
+def update_sampling_batch_metadata(conn, batch_id: str, payload: dict[str, Any]) -> None:
+    fields: list[str] = []
+    values: list[Any] = []
+    for key in ("batch_name", "description", "purpose"):
+        if key in payload:
+            fields.append(f"{key} = ?")
+            values.append(str(payload.get(key, "")).strip())
+    if "tags" in payload:
+        tags = payload.get("tags") or []
+        if not isinstance(tags, list):
+            raise ValueError("tags 必须是数组")
+        fields.append("tags_json = ?")
+        values.append(json_db_value(conn, [str(item).strip() for item in tags if str(item).strip()]))
+    if not fields:
+        return
+    fields.extend(["updated_at = ?", "lock_version = lock_version + 1"])
+    values.extend([utc_now(), batch_id])
+    conn.execute(f"UPDATE sampling_batches SET {', '.join(fields)} WHERE batch_id = ?", values)
+
+
+def get_sampling_batch_by_client_request(conn, project_id: int, client_request_id: str) -> dict[str, Any] | None:
+    value = str(client_request_id or "").strip()
+    if not value:
+        return None
+    row = conn.execute(
+        "SELECT batch_id FROM sampling_batches WHERE project_id = ? AND client_request_id = ?",
+        (project_id, value),
+    ).fetchone()
+    return get_sampling_batch(conn, row["batch_id"]) if row else None
 
 
 def create_sampling_tasks(conn, tasks: list[dict[str, Any]]) -> int:
@@ -1421,8 +1713,8 @@ def create_sampling_tasks(conn, tasks: list[dict[str, Any]]) -> int:
                 task_id, task_key, batch_id, project_id, question_id, model_config_id,
                 repeat_index, status, attempt_count, rq_job_id, lease_owner,
                 lease_expires_at, heartbeat_at, chat_id, artifact_dir, error_code,
-                error_message, created_at, started_at, finished_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error_message, task_snapshot_json, created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             {conflict_clause}
             """,
             (
@@ -1443,6 +1735,7 @@ def create_sampling_tasks(conn, tasks: list[dict[str, Any]]) -> int:
                 task.get("artifact_dir", ""),
                 task.get("error_code", ""),
                 task.get("error_message", ""),
+                json_db_value(conn, task.get("task_snapshot", {})),
                 task.get("created_at", utc_now()),
                 task.get("started_at"),
                 task.get("finished_at"),
@@ -1454,8 +1747,194 @@ def create_sampling_tasks(conn, tasks: list[dict[str, Any]]) -> int:
     return created
 
 
+def create_execution_attempt(conn, payload: dict[str, Any]) -> None:
+    now = payload.get("started_at") or utc_now()
+    if is_postgres_conn(conn):
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (f"{payload['batch_id']}:{payload['task_key']}",))
+    row = conn.execute(
+        "SELECT COALESCE(MAX(attempt_no), 0) AS value FROM execution_attempts WHERE batch_id = ? AND task_key = ?",
+        (payload["batch_id"], payload["task_key"]),
+    ).fetchone()
+    attempt_no = int((row["value"] if row else 0) or 0) + 1
+    conn.execute(
+        """
+        INSERT INTO execution_attempts (
+            attempt_id, task_id, task_key, batch_id, run_id, attempt_no,
+            configured_provider, actual_provider, configured_model, actual_model,
+            mode, config_fingerprint, status, error_code, error_message,
+            response_received, persistence_committed, latency_ms, usage_json,
+            cost_estimate, started_at, finished_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["attempt_id"], payload.get("task_id", ""), payload["task_key"], payload["batch_id"],
+            payload.get("run_id", ""), attempt_no, payload.get("configured_provider", ""),
+            payload.get("actual_provider", ""), payload.get("configured_model", ""),
+            payload.get("actual_model", ""), payload.get("mode", "pure"),
+            payload.get("config_fingerprint", ""), payload.get("status", "running"),
+            payload.get("error_code", ""), payload.get("error_message", ""),
+            int(bool(payload.get("response_received", False))), int(bool(payload.get("persistence_committed", False))),
+            int(payload.get("latency_ms", 0) or 0), json_db_value(conn, payload.get("usage", {})),
+            float(payload.get("cost_estimate", 0) or 0), now, payload.get("finished_at"), payload.get("updated_at", now),
+        ),
+    )
+
+
+def update_execution_attempt(conn, attempt_id: str, updates: dict[str, Any]) -> None:
+    allowed = {
+        "run_id", "actual_provider", "actual_model", "status", "error_code", "error_message",
+        "response_received", "persistence_committed", "latency_ms", "cost_estimate", "finished_at", "updated_at",
+    }
+    values: list[Any] = []
+    assignments: list[str] = []
+    for field in updates:
+        if field not in allowed:
+            continue
+        value = updates[field]
+        if field in {"response_received", "persistence_committed"}:
+            value = int(bool(value))
+        assignments.append(f"{field} = ?")
+        values.append(value)
+    if "usage" in updates:
+        assignments.append("usage_json = ?")
+        values.append(json_db_value(conn, updates.get("usage") or {}))
+    if not assignments:
+        return
+    values.append(attempt_id)
+    conn.execute(f"UPDATE execution_attempts SET {', '.join(assignments)} WHERE attempt_id = ?", values)
+
+
+def list_execution_attempts(conn, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM execution_attempts WHERE batch_id = ? ORDER BY id DESC LIMIT ?",
+        (batch_id, limit),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["usage"] = parse_json_field(item.pop("usage_json", None), {})
+        result.append(item)
+    return result
+
+
+def create_outbox_event(conn, event_id: str, event_type: str, aggregate_id: str, payload: dict[str, Any]) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO dispatch_outbox (
+            event_id, event_type, aggregate_id, payload_json, status, attempt_count,
+            available_at, delivered_at, last_error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, '', ?, ?)
+        """,
+        (event_id, event_type, aggregate_id, json_db_value(conn, payload), now, now, now),
+    )
+
+
+def ensure_sampling_task_dispatch_event(
+    conn, task_id: str, batch_id: str, attempt_count: int, dispatch_key: str = ""
+) -> bool:
+    """Create one durable dispatch event for a task attempt.
+
+    The attempt number is part of the idempotency key: replaying the same RQ
+    failure callback is harmless, while a later lease/attempt may be dispatched
+    again with a new key.
+    """
+    suffix = dispatch_key.strip() or str(max(0, int(attempt_count or 0)))
+    event_id = f"dispatch-task:{task_id}:{suffix}"
+    existing = conn.execute(
+        "SELECT status FROM dispatch_outbox WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if existing:
+        return False
+    try:
+        create_outbox_event(
+            conn,
+            event_id,
+            "dispatch_sampling_task",
+            task_id,
+            {"task_id": task_id, "batch_id": batch_id},
+        )
+    except Exception:
+        # Another reconciler may have inserted the same deterministic event.
+        if conn.execute("SELECT 1 FROM dispatch_outbox WHERE event_id = ?", (event_id,)).fetchone():
+            return False
+        raise
+    return True
+
+
+def mark_outbox_delivered(conn, event_id: str, claim_token: str = "") -> None:
+    now = utc_now()
+    predicate = " AND claim_token = ?" if claim_token else ""
+    params = (now, now, event_id, claim_token) if claim_token else (now, now, event_id)
+    conn.execute(
+        f"UPDATE dispatch_outbox SET status = 'delivered', attempt_count = attempt_count + 1, delivered_at = ?, claim_token = '', claim_expires_at = NULL, updated_at = ? WHERE event_id = ?{predicate}",
+        params,
+    )
+
+
+def mark_outbox_failed(conn, event_id: str, error: str, claim_token: str = "") -> None:
+    row = conn.execute("SELECT attempt_count FROM dispatch_outbox WHERE event_id = ?", (event_id,)).fetchone()
+    attempt = int((row["attempt_count"] if row else 0) or 0) + 1
+    delay = min(300, 2 ** min(attempt, 8))
+    available_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+    predicate = " AND claim_token = ?" if claim_token else ""
+    params = (str(error)[:1000], available_at, utc_now(), event_id, claim_token) if claim_token else (str(error)[:1000], available_at, utc_now(), event_id)
+    conn.execute(
+        f"UPDATE dispatch_outbox SET status = 'pending', attempt_count = attempt_count + 1, last_error = ?, available_at = ?, claim_token = '', claim_expires_at = NULL, updated_at = ? WHERE event_id = ?{predicate}",
+        params,
+    )
+
+
+def list_pending_outbox(conn, limit: int = 100) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM dispatch_outbox WHERE status = 'pending' AND available_at <= ? ORDER BY id ASC LIMIT ?",
+        (utc_now(), limit),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = parse_json_field(item.pop("payload_json", None), {})
+        result.append(item)
+    return result
+
+
+def claim_pending_outbox(conn, claimant: str, limit: int = 100, lease_seconds: int = 60) -> list[dict[str, Any]]:
+    """Atomically claim dispatch events so multiple reconcilers cannot enqueue the same event."""
+    now = utc_now()
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=max(10, lease_seconds))).isoformat()
+    candidates = conn.execute(
+        """
+        SELECT event_id FROM dispatch_outbox
+        WHERE (status = 'pending' AND available_at <= ?)
+           OR (status = 'processing' AND claim_expires_at IS NOT NULL AND claim_expires_at < ?)
+        ORDER BY id ASC LIMIT ?
+        """,
+        (now, now, limit),
+    ).fetchall()
+    claimed: list[dict[str, Any]] = []
+    for row in candidates:
+        event_id = str(row["event_id"])
+        cur = conn.execute(
+            """
+            UPDATE dispatch_outbox
+            SET status = 'processing', claim_token = ?, claim_expires_at = ?, updated_at = ?
+            WHERE event_id = ? AND ((status = 'pending' AND available_at <= ?)
+               OR (status = 'processing' AND claim_expires_at IS NOT NULL AND claim_expires_at < ?))
+            """,
+            (claimant, expires, now, event_id, now, now),
+        )
+        if getattr(cur, "rowcount", 0) != 1:
+            continue
+        item = row_to_dict(conn.execute("SELECT * FROM dispatch_outbox WHERE event_id = ?", (event_id,)).fetchone())
+        if item:
+            item["payload"] = parse_json_field(item.pop("payload_json", None), {})
+            claimed.append(item)
+    return claimed
+
+
 def get_sampling_task(conn, task_id: str) -> dict[str, Any] | None:
-    return row_to_dict(
+    item = row_to_dict(
         conn.execute(
             """
             SELECT t.*, q.question, q.target_brand, q.competitor_brands,
@@ -1470,6 +1949,9 @@ def get_sampling_task(conn, task_id: str) -> dict[str, Any] | None:
             (task_id,),
         ).fetchone()
     )
+    if item:
+        item["task_snapshot"] = parse_json_field(item.pop("task_snapshot_json", None), {})
+    return item
 
 
 def list_sampling_tasks(conn, batch_id: str, limit: int = 10000) -> list[dict[str, Any]]:
@@ -1485,7 +1967,12 @@ def list_sampling_tasks(conn, batch_id: str, limit: int = 10000) -> list[dict[st
         """,
         (batch_id, limit),
     ).fetchall()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        item.pop("task_snapshot_json", None)
+        result.append(item)
+    return result
 
 
 def update_sampling_task(conn, task_id: str, updates: dict[str, Any]) -> None:
@@ -1533,6 +2020,173 @@ def claim_sampling_task(conn, task_id: str, lease_owner: str, lease_seconds: int
         (lease_owner, lease_until, now, now, now, task_id, now),
     )
     return getattr(cur, "rowcount", 0) == 1
+
+
+def renew_sampling_task_lease(conn, task_id: str, lease_owner: str, lease_seconds: int = 360) -> bool:
+    """Extend a lease only while the same owner still owns the running task.
+
+    The owner predicate is the fencing guard: a delayed heartbeat from an old
+    worker can never revive or steal a task after the reconciler reassigns it.
+    """
+    now = utc_now()
+    lease_until = (datetime.now(timezone.utc) + timedelta(seconds=max(60, lease_seconds))).isoformat()
+    cur = conn.execute(
+        """
+        UPDATE sampling_tasks
+        SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+        WHERE task_id = ? AND status = 'running' AND lease_owner = ?
+        """,
+        (lease_until, now, now, task_id, lease_owner),
+    )
+    return getattr(cur, "rowcount", 0) == 1
+
+
+def finalize_sampling_task(
+    conn,
+    task_id: str,
+    lease_owner: str,
+    *,
+    status: str,
+    updates: dict[str, Any] | None = None,
+) -> bool:
+    """Commit a terminal task state only for the live fenced lease owner."""
+    if status not in {"success", "failed", "blocked"}:
+        raise ValueError(f"非法任务终态：{status}")
+    allowed = {"chat_id", "artifact_dir", "error_code", "error_message"}
+    payload = {key: value for key, value in (updates or {}).items() if key in allowed}
+    now = utc_now()
+    assignments = ["status = ?"]
+    values: list[Any] = [status]
+    for key, value in payload.items():
+        assignments.append(f"{key} = ?")
+        values.append(value)
+    assignments.extend(
+        [
+            "lease_owner = ''",
+            "lease_expires_at = NULL",
+            "heartbeat_at = ?",
+            "finished_at = ?",
+            "updated_at = ?",
+        ]
+    )
+    values.extend([now, now, now, task_id, lease_owner, now])
+    cur = conn.execute(
+        f"""
+        UPDATE sampling_tasks SET {', '.join(assignments)}
+        WHERE task_id = ? AND status = 'running' AND lease_owner = ?
+          AND lease_expires_at IS NOT NULL AND lease_expires_at >= ?
+        """,
+        values,
+    )
+    return getattr(cur, "rowcount", 0) == 1
+
+
+def upsert_worker_heartbeat(
+    conn,
+    worker_id: str,
+    queue_name: str,
+    *,
+    status: str = "running",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Persist a redacted process heartbeat, portable across SQLite/PostgreSQL."""
+    now = utc_now()
+    safe_metadata = {
+        str(key): value
+        for key, value in (metadata or {}).items()
+        if str(key) in {"kind", "pid", "hostname", "version"}
+        and isinstance(value, (str, int, float, bool, type(None)))
+    }
+    conn.execute(
+        """
+        INSERT INTO worker_heartbeats (
+            worker_id, queue_name, status, metadata_json, heartbeat_at,
+            started_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (worker_id) DO UPDATE SET
+            queue_name = excluded.queue_name,
+            status = excluded.status,
+            metadata_json = excluded.metadata_json,
+            heartbeat_at = excluded.heartbeat_at,
+            updated_at = excluded.updated_at
+        """,
+        (worker_id, queue_name, status, json_db_value(conn, safe_metadata), now, now, now),
+    )
+
+
+def list_worker_heartbeats(conn, *, stale_after_seconds: int = 60) -> list[dict[str, Any]]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_after_seconds))).isoformat()
+    rows = conn.execute(
+        "SELECT * FROM worker_heartbeats ORDER BY queue_name, worker_id"
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["metadata"] = parse_json_field(item.pop("metadata_json", None), {})
+        item["stale"] = str(item.get("heartbeat_at") or "") < cutoff
+        item["available"] = item.get("status") == "running" and not item["stale"]
+        result.append(item)
+    return result
+
+
+def reliability_status(conn, *, worker_stale_seconds: int = 60) -> dict[str, Any]:
+    """Return non-secret durability signals suitable for readiness and diagnostics."""
+    now = utc_now()
+    outbox = conn.execute(
+        """
+        SELECT COUNT(*) AS count, MIN(created_at) AS oldest_at,
+               COALESCE(MAX(attempt_count), 0) AS max_attempt_count
+        FROM dispatch_outbox WHERE status = 'pending'
+        """
+    ).fetchone()
+    tasks = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'running' AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at < ? THEN 1 ELSE 0 END) AS expired_leases,
+            SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_tasks,
+            SUM(CASE WHEN status = 'queued' AND COALESCE(rq_job_id, '') = ''
+                      THEN 1 ELSE 0 END) AS queued_without_job
+        FROM sampling_tasks
+        """,
+        (now,),
+    ).fetchone()
+    attempts = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'uncertain' THEN 1 ELSE 0 END) AS uncertain_attempts,
+            SUM(CASE WHEN persistence_committed = 0
+                      AND status IN ('running', 'response_received') THEN 1 ELSE 0 END) AS open_attempts
+        FROM execution_attempts
+        """
+    ).fetchone()
+    outbox_data = dict(outbox) if outbox else {}
+    task_data = dict(tasks) if tasks else {}
+    attempt_data = dict(attempts) if attempts else {}
+    workers = list_worker_heartbeats(conn, stale_after_seconds=worker_stale_seconds)
+    return {
+        "outbox": {
+            "pending": int(outbox_data.get("count") or 0),
+            "oldest_at": outbox_data.get("oldest_at"),
+            "max_attempt_count": int(outbox_data.get("max_attempt_count") or 0),
+        },
+        "tasks": {
+            "running": int(task_data.get("running_tasks") or 0),
+            "expired_leases": int(task_data.get("expired_leases") or 0),
+            "queued_without_job": int(task_data.get("queued_without_job") or 0),
+        },
+        "attempts": {
+            "uncertain": int(attempt_data.get("uncertain_attempts") or 0),
+            "open": int(attempt_data.get("open_attempts") or 0),
+        },
+        "workers": {
+            "total": len(workers),
+            "available": sum(1 for worker in workers if worker["available"]),
+            "stale": sum(1 for worker in workers if worker["stale"]),
+            "queues": sorted({str(worker.get("queue_name") or "") for worker in workers if worker["available"]}),
+            "items": workers,
+        },
+    }
 
 
 def sampling_task_counts(conn, batch_id: str) -> dict[str, int]:
@@ -1757,7 +2411,7 @@ def insert_run(conn: sqlite3.Connection, run: dict[str, Any]) -> None:
             run.get("error_message", ""),
             json_db_value(conn, run.get("raw_response", {})),
             1,
-            "",
+            None,
         ),
     )
 

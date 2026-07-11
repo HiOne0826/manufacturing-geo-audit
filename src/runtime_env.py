@@ -23,7 +23,7 @@ PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
 
 BAIDU_AK_ENV_KEYS = ("BAIDU_QIANFAN_AK", "QIANFAN_AK", "BAIDU_AK", "ERNIE_AK")
 BAIDU_SK_ENV_KEYS = ("BAIDU_QIANFAN_SK", "QIANFAN_SK", "BAIDU_SK", "ERNIE_SK")
-BRAVE_SEARCH_ENV_KEYS = ("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY")
+BOCHA_SEARCH_ENV_KEYS = ("BOCHA_API_KEY", "BOCHA_SEARCH_API_KEY")
 TENCENT_SEARCH_APPID_ENV_KEYS = ("TENCENT_SEARCH_APPID", "TENCENT_APPID")
 TENCENT_SEARCH_SECRET_ID_ENV_KEYS = ("TENCENT_SEARCH_SECRET_ID", "TENCENT_SECRET_ID")
 TENCENT_SEARCH_SECRET_KEY_ENV_KEYS = ("TENCENT_SEARCH_SECRET_KEY", "TENCENT_SECRET_KEY")
@@ -67,8 +67,8 @@ def resolve_baidu_ak_sk() -> tuple[str, str]:
     return first_env(*BAIDU_AK_ENV_KEYS), first_env(*BAIDU_SK_ENV_KEYS)
 
 
-def resolve_brave_search_api_key() -> str:
-    return first_env(*BRAVE_SEARCH_ENV_KEYS)
+def resolve_bocha_search_api_key() -> str:
+    return first_env(*BOCHA_SEARCH_ENV_KEYS)
 
 
 def resolve_tencent_search_credentials() -> tuple[str, str, str]:

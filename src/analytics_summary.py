@@ -259,6 +259,15 @@ def build_analytics_summary(conn, project_id: int, batch_id: str | None = None) 
     runs, batch = collect_runs(conn, project_id, batch_id)
     entities = project_question_entities(conn, project)
     target_aliases = entities["target"]["aliases"] or [project.get("brand_name", "")]
+    data_cutoff = max((str(row.get("requested_at") or "") for row in runs), default="")
+    latest_report = conn.execute(
+        "SELECT report_id, version_no, status FROM report_versions WHERE project_id = ? ORDER BY version_no DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    config_scope = batch.get("config_snapshot", {}) if batch else {
+        "mode": "mixed_project_batches",
+        "batch_count": len(list_sampling_batches(conn, project_id)),
+    }
     summary = {
         "meta": {
             "project_id": project_id,
@@ -267,6 +276,9 @@ def build_analytics_summary(conn, project_id: int, batch_id: str | None = None) 
             "batch_id": batch_id or "",
             "scope": "batch" if batch_id else "project",
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "data_cutoff": data_cutoff,
+            "configuration": config_scope,
+            "report_version": dict(latest_report) if latest_report else None,
         },
         "entities": entities,
         "sample_quality": sample_quality(conn, project_id, batch_id, batch, runs),

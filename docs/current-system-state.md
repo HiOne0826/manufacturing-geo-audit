@@ -1,12 +1,32 @@
 # 制造业 GEO 审计系统当前状态
 
-更新时间：2026-07-05
+更新时间：2026-07-11
 
 ## 定位
 
 本项目是一套制造业 GEO 效果检测 / 审计系统，用于批量采样多个模型对制造业问题的回答，并保存回答、引用、品牌出现情况、竞品共现、运行参数和评估结果。
 
 它不是内容生产系统。它的核心目标是为客户 GEO 现状报告提供可追溯的数据底稿。
+
+## V2 当前边界
+
+`codex/V2` 已以 `main` 为基线，V2 的目标是把现有轻量工作台升级为“可追溯、可恢复、可交付”的 GEO 审计工作台，而不是重写技术栈。
+
+截至 2026-07-11，V2 P0-P1 已进入合并验收阶段：
+
+- 项目上下文以 URL `project_id` 为优先来源，切换时清理旧项目查询并重挂页面状态；全局任务中心打开批次时同步所属项目。
+- 项目支持完整编辑、归档/恢复、影响预览和名称确认后的危险删除；归档项目不能启动批次。
+- 普通 API provider 与 DeepSeek Web 都使用 `sampling_tasks`、周期 lease heartbeat、owner fencing 和 append-only `execution_attempts`。
+- batch/task/outbox 同事务创建；RQ 按 task 派发，reconciler 恢复过期 lease、未提交 attempt、outbox 和计数漂移。
+- provider 健康按 provider/endpoint/model/mode/credential fingerprint/出口区域隔离，支持滑窗指标、主动探针、熔断和原子 half-open。
+- P1 已提供 run 质检、报告版本/冻结、批次对比、统一 JSON 导出和操作审计。
+- SQLite 保留本地/单机模式；PostgreSQL schema 与增量 migration 已同步，但正式多 worker 上线仍必须执行真实 Redis/PostgreSQL 故障演练。
+
+V2 产品、体验和可靠性契约分别见：
+
+- `docs/v2-product-requirements.md`
+- `docs/v2-ux-spec.md`
+- `docs/v2-reliability-architecture.md`
 
 ## 当前架构
 
@@ -17,8 +37,9 @@ Python http.server
   -> 静态前端
   -> 应用全局密码 / HttpOnly Cookie
   -> SQLite WAL
+  -> sampling_tasks / execution_attempts / lease
   -> ThreadPoolExecutor
-  -> model_runs / answer_evaluations / sampling_batches
+  -> model_runs / answer_evaluations / sampling_batches / report_versions
   -> source_statuses 平台级进度聚合
 ```
 
@@ -29,7 +50,8 @@ Nginx Basic Auth
   -> Python http.server
     -> 应用全局密码
     -> PostgreSQL
-    -> Redis + RQ Worker
+    -> Redis + RQ Worker（每个 sampling task 独立 job）
+    -> dispatch_outbox + reconciler + worker heartbeat
     -> Model Adapters
     -> Exporter
     -> Agent API
@@ -61,8 +83,16 @@ data/geo_audit.db
 - `questions`
 - `model_configs`
 - `sampling_batches`
+- `sampling_tasks`
+- `execution_attempts`
+- `dispatch_outbox`
+- `worker_heartbeats`
+- `provider_health` / `provider_health_events`
 - `model_runs`
 - `answer_evaluations`
+- `run_review_events`
+- `report_versions`
+- `operation_audit_log`
 
 正式 PostgreSQL 模式：
 
@@ -98,12 +128,12 @@ RQ_QUEUE_NAME=geo-audit
 
 流程：
 
-1. Web 创建 `sampling_batches`，状态为 `queued`。
-2. Web 将任务入队。
-3. Worker 执行 `src.tasks.perform_batch`。
-4. Worker 写入 `model_runs` 和 `answer_evaluations`。
-5. Worker 更新 `sampling_batches`。
-6. Web 从数据库恢复进度。
+1. Web 在同一事务创建 `sampling_batches`、不可变 task snapshot、`sampling_tasks` 和 `dispatch_outbox`。
+2. dispatcher 以稳定 task ID 将每个逻辑任务入队。
+3. Worker CAS 领取 task、写 execution attempt，并在外部调用期间续租。
+4. 提交前验证 lease owner；迟到 worker 只能把 attempt 标为 uncertain，不能覆盖 current。
+5. Worker 写入 run/evaluation、完成 task，并从 task 账本聚合 batch。
+6. reconciler 修复过期 lease、outbox、uncertain attempt 和计数漂移。
 
 ## 并发策略
 
@@ -121,7 +151,8 @@ SAMPLING_RETRY_COUNT=1
 
 - 每个采样任务独立数据库连接。
 - 每个 provider 有独立并发限制。
-- 同一个项目存在 queued/running 批次时，重复启动会复用现有批次，避免用户误点产生重复采样。
+- 同一项目已有活动批次时返回 `409 ACTIVE_BATCH_EXISTS`，不静默复用。
+- `client_request_id` 用于重复提交幂等。
 - 单任务失败不会中断整个 batch。
 - 失败任务会落库为 `status=failed`。
 - 支持按 batch 重跑当前最新仍失败的任务；重跑成功后平台状态按最新等价 run 汇总。
@@ -136,7 +167,7 @@ SAMPLING_RETRY_COUNT=1
 - `qwen` 展示为千问。
 - `hunyuan` 展示为元宝。
 - CSV 保留完整机器字段；Excel 面向客户精简为运行 ID、批次 ID、问题、问题类型、联网搜索、生成时间、状态、品牌命中、回答摘要、错误信息、测试平台。
-- DeepSeek 联网口径通过 Brave Search 外部检索增强，结果保留搜索来源 / 引用。
+- DeepSeek 联网口径统一通过博查 Web Search API 外部检索增强，结果保留搜索来源 / 引用。
 
 ## 运行状态监测
 
@@ -157,10 +188,10 @@ SAMPLING_RETRY_COUNT=1
 
 状态规则：
 
-1. 有失败优先显示 `failed`。
-2. 有运行中任务显示 `running`。
-3. 完成数达到计划数显示 `completed`。
-4. 其余显示 `queued`。
+1. `completed` 表示所有 task 进入终态，不代表全部成功。
+2. 采样失败通过 `outcome=partial_failure|failure` 表达。
+3. 调度、数据库或 worker 级故障使用 `failed_system`。
+4. 运行中暂停先进入 `pause_requested`，停止派发新任务并允许在途任务完成。
 
 inline 模式优先结合内存 job 和数据库结果；RQ 或无内存 job 时，从 `sampling_batches.config_json` 与 `model_runs` 推导平台状态。
 
@@ -243,12 +274,16 @@ AGENT_API_TOKEN=... python3 scripts/agent_client.py \
 python3 -m unittest discover -s tests
 ```
 
-最近结果：
+V2 P0-P1 最近一次完整环境结果：
 
 ```text
-Ran 25 tests
-OK
+Ran 130 tests
+OK (skipped=2)
 ```
+
+最终合并态已完成完整 HTTP 与直接调用回归；旧库冲突迁移、task snapshot、启动预检、XLSX 预检、操作审计、过期 lease 重派发和 RQ task failure callback 均已纳入测试。
+
+其中跳过项是需要显式启用的 DeepSeek Web browser contract 与 Redis worker 集成场景，两项均已单独启用并通过。前端 Playwright 已在允许 localhost/Chrome 的环境完成 35/35 验收。
 
 覆盖：
 
@@ -267,8 +302,13 @@ OK
 - Excel 客户版字段精简。
 - `/api/runs/progress` 平台状态聚合。
 - RQ 无内存 job 时的平台状态推导。
+- task lease heartbeat、owner fencing 和迟到 worker 丢弃。
+- outbox/reconciler、重复派发、过期 lease 和 current 唯一性。
+- provider 滑窗健康、熔断、half-open 与凭证脱敏。
+- 报告冻结后重试不改变旧快照。
+- run 质检、批次对比、统一导出和迁移漂移检测。
 
-### 2026-07-05 客户交付前回归
+### 2026-07-11 V2 基线回归
 
 命令：
 
@@ -278,12 +318,17 @@ cd frontend && npm run build
 python3 scripts/load_test_local.py --questions 2 --models 2 --workers 2
 ```
 
-结果：
+当前验证结果：
 
-- 单元 / 集成测试：25 tests OK。
-- 前端构建：通过，提示 Vite chunk 大于 500 kB。
-- 本地 mock 负载：4/4 success，CSV / XLS 均生成。
-- 内置浏览器截图验证：采样页、批次详情页、390px 移动宽度均可用，无页面级横向滚动。
+- 完整后端套件：130 tests OK，2 skipped；两个条件跳过项已分别启用真实 Redis/RQ 与 Python Playwright 环境单独通过。
+- 后端专项：migration、task snapshot、启动预检、provider health、worker reliability、故障不变量均通过。
+- 前端 Vitest + React Testing Library + MSW：12 tests OK。
+- 前端构建：入口 94.17 KB gzip，普通业务 chunk 20.93 KB gzip，分析图表独立 chunk 105.26 KB gzip，均低于预算。
+- Playwright：35/35 通过，覆盖 8 个关键页面 × 3 视口、6 个关键页面完整 axe 和关键旅程。
+- Lighthouse Accessibility：100。
+- 问题列表、批次列表，以及批次详情的失败任务、当前结果、Attempt History 均固定每页 10 条，支持具体页码与输入跳转，页码保存在 URL；问题粘贴兼容 `CRLF`、`LF`、`CR`。
+- 全局布局已通过两轮截图审查，修复 Grid 等高拉伸造成的异常空白、固定空态高度、设置页孤列和中间宽度适配。
+- PostgreSQL 16 + Redis 7 + 两 RQ worker 故障演练通过：kill 持租约 worker 后 6/6 收敛，无 duplicate current 和 expired lease；Redis/DB 短断可检测且恢复后转绿。
 
 任务系统检测：
 

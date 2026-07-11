@@ -15,10 +15,11 @@ from typing import Any
 from src.runtime_env import (
     provider_has_credentials,
     resolve_baidu_ak_sk,
-    resolve_brave_search_api_key,
+    resolve_bocha_search_api_key,
     resolve_provider_api_key,
     resolve_tencent_search_credentials,
 )
+from src.reliability import classify_error
 
 
 class AdapterError(RuntimeError):
@@ -36,10 +37,11 @@ class AdapterError(RuntimeError):
         self.status_code = status_code
         self.retry_after = retry_after
         self.raw_response = raw_response or {}
+        self.error_code = classify_error(message, status_code, retryable).code.value
 
 
 OPENAI_REASONING_LEVELS = "none;minimal;low;medium;high;xhigh"
-BRAVE_AUGMENTED_PROVIDERS = {"deepseek"}
+BOCHA_TOOL_NAME = "bocha_web_search"
 
 PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "openai": {
@@ -60,7 +62,7 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
     "deepseek": {
         "temperature": 1,
         "reasoning_effort": "",
-        "defaults_note": "DeepSeek 标准 API 无原生联网搜索；联网口径使用 Brave Search 外部检索增强。",
+        "defaults_note": "DeepSeek 联网口径使用原生 Function Calling，由模型调用博查 Web Search API。",
     },
     "deepseek_web": {
         "temperature": 0,
@@ -220,18 +222,18 @@ PROVIDER_PRESETS = {
         "api_base": "https://api.deepseek.com/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "Brave Search 外部检索增强",
-        "web_search_param_path": "BRAVE_SEARCH_API_KEY; /res/v1/web/search; q/count/country/search_lang/freshness/safesearch",
+        "web_search_mode": "DeepSeek Function Calling + 博查 Web Search API",
+        "web_search_param_path": "tools[].function.name=bocha_web_search; assistant.tool_calls -> role=tool",
         "supports_reasoning": True,
         "reasoning_param_path": "thinking.type / reasoning_effort",
         "reasoning_levels": "disabled;enabled + low/medium/high",
         "supports_citation": True,
-        "citation_param_path": "Brave Search web.results[].url/title/description",
+        "citation_param_path": "博查 data.webPages.value[].url/name/snippet/summary",
         "supports_site_filter": False,
         "supports_time_filter": False,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "DeepSeek OpenAI 兼容接口；标准 API 不提供原生联网搜索，本系统联网口径为 Brave Search 外部检索结果 + DeepSeek 生成。",
+        "notes": "DeepSeek OpenAI 兼容接口；不注入 system prompt，由模型生成博查检索参数，应用执行后以 role=tool 回传。",
     },
     "deepseek_web": {
         "label": "DeepSeek 官网联网搜索",
@@ -458,7 +460,19 @@ def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise AdapterError(f"HTTP {exc.code}: {body[:1200]}") from exc
+        retry_after = None
+        try:
+            retry_after = float(exc.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            pass
+        raise AdapterError(
+            f"HTTP {exc.code}: {body[:1200]}",
+            retryable=exc.code in {408, 409, 425, 429, 500, 502, 503, 504},
+            status_code=exc.code,
+            retry_after=retry_after,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise AdapterError(str(exc), retryable=True) from exc
     except Exception as exc:
         raise AdapterError(str(exc)) from exc
 
@@ -590,30 +604,31 @@ def extract_generic_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     return citations
 
 
-def extract_brave_results(data: dict[str, Any], limit: int = 5) -> list[dict[str, str]]:
-    results = ((data.get("web") or {}).get("results") or [])[:limit]
+def extract_bocha_results(data: dict[str, Any], limit: int = 5) -> list[dict[str, str]]:
+    results = (((data.get("data") or {}).get("webPages") or {}).get("value") or [])[:limit]
     items: list[dict[str, str]] = []
     for item in results:
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "").strip()
-        title = str(item.get("title") or "").strip()
-        description = str(item.get("description") or item.get("snippet") or "").strip()
-        extra = item.get("extra_snippets") or []
-        snippets = [description] if description else []
-        snippets.extend(str(value).strip() for value in extra if str(value).strip())
+        title = str(item.get("name") or item.get("title") or "").strip()
+        snippets = [
+            str(value).strip()
+            for value in (item.get("snippet"), item.get("summary"))
+            if str(value or "").strip()
+        ]
         if url or title or snippets:
             items.append(
                 {
                     "url": url,
                     "title": title,
-                    "description": "\n".join(snippets[:3]),
+                    "description": "\n".join(dict.fromkeys(snippets)),
                 }
             )
     return items
 
 
-def brave_citations(results: list[dict[str, str]]) -> list[dict[str, str]]:
+def bocha_citations(results: list[dict[str, str]]) -> list[dict[str, str]]:
     return dedupe_citations(
         [{"url": item.get("url", ""), "title": item.get("title", "")} for item in results if item.get("url")]
     )
@@ -922,26 +937,13 @@ def resolve_provider_runtime_config(provider: str, api_key: str, api_base: str, 
 
 
 def resolve_openrouter_direct_fallback(provider: str) -> tuple[str, str, str, str] | None:
-    if os.getenv("OPENROUTER_DIRECT_FALLBACK") != "1":
-        return None
-    if provider == "openrouter_gpt":
-        direct_key = resolve_provider_api_key("openai")
-        if direct_key:
-            return (
-                "openai",
-                direct_key,
-                os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-                os.getenv("OPENROUTER_GPT_FALLBACK_MODEL", os.getenv("OPENAI_CHATGPT_MODEL", "gpt-4.1-mini")),
-            )
-    if provider == "openrouter_gemini":
-        direct_key = resolve_provider_api_key("gemini")
-        if direct_key:
-            return (
-                "gemini",
-                direct_key,
-                os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
-                os.getenv("OPENROUTER_GEMINI_FALLBACK_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
-            )
+    # V2 never changes the measured source inside one logical task. A fallback
+    # must be configured as a separate source/generation so reports can label it.
+    if os.getenv("OPENROUTER_DIRECT_FALLBACK") == "1" or os.getenv("ALLOW_CROSS_PROVIDER_FALLBACK") == "1":
+        raise AdapterError(
+            f"已禁止 {provider} 跨 provider fallback；请创建独立信息源配置并启动新 generation。",
+            retryable=False,
+        )
     return None
 
 
@@ -1036,72 +1038,170 @@ def build_user_only_chat_payload(model: str, question: str, temperature: float |
     return payload
 
 
-def brave_country(value: str) -> str:
-    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
-    for part in parts:
-        if len(part) == 2 and part.isalpha():
-            return part.upper()
-    return "CN"
+def bocha_freshness(value: str) -> str:
+    normalized = str(value or "").strip()
+    aliases = {
+        "day": "oneDay", "week": "oneWeek", "month": "oneMonth", "year": "oneYear",
+        "one_day": "oneDay", "one_week": "oneWeek", "one_month": "oneMonth", "one_year": "oneYear",
+    }
+    return aliases.get(normalized, normalized or "noLimit")
 
 
-def brave_search_request(question: str, options: dict[str, Any]) -> dict[str, Any]:
-    api_key = resolve_brave_search_api_key()
+def bocha_search_request(question: str, options: dict[str, Any]) -> dict[str, Any]:
+    api_key = resolve_bocha_search_api_key()
     if not api_key:
-        raise AdapterError("DeepSeek 联网口径需要 BRAVE_SEARCH_API_KEY。")
+        raise AdapterError("DeepSeek 联网口径需要 BOCHA_API_KEY。")
     count = options.get("search_limit") or 5
     try:
         count = max(1, min(int(count), 10))
     except (TypeError, ValueError):
         count = 5
-    params = {
-        "q": question,
-        "count": str(count),
-        "country": brave_country(options.get("search_user_location", "")),
-        "search_lang": "zh-hans",
-        "ui_lang": "zh-CN",
-        "safesearch": "moderate",
-        "extra_snippets": "true",
+    payload: dict[str, Any] = {
+        "query": question,
+        "count": count,
+        "summary": True,
+        "freshness": bocha_freshness(options.get("search_freshness", "")),
     }
-    if options.get("search_freshness"):
-        params["freshness"] = str(options["search_freshness"])
-    url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params)
-    data = get_json(
-        url,
-        {
-            "Accept": "application/json",
-            "Accept-Encoding": "identity",
-            "X-Subscription-Token": api_key,
-        },
+    if options.get("search_site_filter"):
+        payload["include"] = str(options["search_site_filter"])
+    data = post_json(
+        "https://api.bochaai.com/v1/web-search",
+        {"Authorization": f"Bearer {api_key}"},
+        payload,
     )
-    results = extract_brave_results(data, limit=count)
+    results = extract_bocha_results(data, limit=count)
     if not results:
-        raise AdapterError("Brave Search 未返回可用网页结果，无法执行联网搜索口径。")
+        raise AdapterError("博查 Web Search API 未返回可用网页结果，无法执行联网搜索口径。")
     return {"raw_response": data, "results": results}
 
 
-def build_brave_augmented_question(question: str, results: list[dict[str, str]]) -> str:
-    source_blocks = []
-    for idx, item in enumerate(results, start=1):
-        source_blocks.append(
-            "\n".join(
-                [
-                    f"[{idx}] 标题: {item.get('title') or '-'}",
-                    f"URL: {item.get('url') or '-'}",
-                    f"摘要: {item.get('description') or '-'}",
-                ]
-            )
+def bocha_tool_definition() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": BOCHA_TOOL_NAME,
+            "description": "搜索公开网页以回答需要最新信息、事实核验、品牌或产品调研的问题。可以使用不同关键词多次搜索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "适合网页搜索的精确检索词"},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 10, "description": "返回结果数量"},
+                    "freshness": {"type": "string", "description": "时间范围，如 noLimit、oneDay、oneWeek、oneMonth、oneYear"},
+                    "include": {"type": "string", "description": "可选，限定搜索的网站域名"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def execute_bocha_tool(arguments: Any, options: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise AdapterError("DeepSeek 返回的博查工具参数不是 JSON 对象。", retryable=True)
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise AdapterError("DeepSeek 返回的博查工具参数缺少 query。", retryable=True)
+    tool_options = dict(options)
+    if arguments.get("count") is not None:
+        tool_options["search_limit"] = arguments["count"]
+    if arguments.get("freshness"):
+        tool_options["search_freshness"] = str(arguments["freshness"])
+    if arguments.get("include"):
+        tool_options["search_site_filter"] = str(arguments["include"])
+    return bocha_search_request(query, tool_options)
+
+
+def deepseek_bocha_tool_request(
+    base: str,
+    api_key: str,
+    model: str,
+    question: str,
+    temperature: float | None,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
+    deepseek_rounds: list[dict[str, Any]] = []
+    tool_audit: list[dict[str, Any]] = []
+    citations: list[dict[str, str]] = []
+    usage: dict[str, int] = {}
+    try:
+        max_rounds = max(1, min(int(os.environ.get("DEEPSEEK_BOCHA_MAX_TOOL_ROUNDS", "4")), 8))
+    except ValueError:
+        max_rounds = 4
+
+    for round_index in range(max_rounds):
+        payload = build_deepseek_chat_payload(model, question, temperature, options)
+        payload["messages"] = deepcopy(messages)
+        payload["tools"] = [bocha_tool_definition()]
+        payload["tool_choice"] = "required" if round_index == 0 else "none"
+        data = post_json(
+            f"{normalize_base(base)}/chat/completions",
+            {"Authorization": f"Bearer {api_key}"},
+            payload,
         )
-    return (
-        "你是制造业品牌 GEO 审计助手。\n"
-        "以下是 Brave Search 返回的公开网页检索结果。请只基于这些资料回答用户问题。\n"
-        "如果资料不足，请明确说明“检索结果不足以判断”。\n\n"
-        "要求：\n"
-        "1. 客观回答，不要编造未出现在资料中的事实。\n"
-        "2. 涉及品牌、厂家、产品能力时尽量引用来源编号，例如 [1]。\n"
-        "3. 不要声称你自己进行了联网搜索；信息来源是下方 Brave Search 结果。\n\n"
-        f"用户问题：\n{question}\n\n"
-        "Brave Search 结果：\n"
-        + "\n\n".join(source_blocks)
+        deepseek_rounds.append(data)
+        for key, value in (data.get("usage") or {}).items():
+            if isinstance(value, int):
+                usage[key] = usage.get(key, 0) + value
+        choices = data.get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            response_text = normalize_choice_text(data)
+            if not response_text.strip():
+                raise AdapterError("DeepSeek 工具调用结束后未返回最终回答。", retryable=True, raw_response=data)
+            return {
+                "response_text": response_text,
+                "citations": dedupe_citations(citations),
+                "usage": usage,
+                "raw_response": {
+                    "tool_mode": "deepseek_function_calling",
+                    "deepseek_rounds": deepseek_rounds,
+                    "bocha_tool_calls": tool_audit,
+                    "messages": messages + [{key: value for key, value in message.items() if key in {"role", "content"}}],
+                },
+                "returned_model": data.get("model", model),
+            }
+
+        assistant_message = {
+            key: deepcopy(value)
+            for key, value in message.items()
+            if key in {"role", "content", "tool_calls", "reasoning_content"}
+        }
+        assistant_message.setdefault("role", "assistant")
+        messages.append(assistant_message)
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            if function.get("name") != BOCHA_TOOL_NAME:
+                raise AdapterError(f"DeepSeek 请求了不受支持的工具：{function.get('name') or '-'}", retryable=True)
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise AdapterError("DeepSeek 返回的博查工具参数不是有效 JSON。", retryable=True) from exc
+            try:
+                bocha_payload = execute_bocha_tool(arguments, options)
+            except AdapterError as exc:
+                raise AdapterError(f"DeepSeek 调用博查 Web Search API 失败：{exc}", retryable=exc.retryable) from exc
+            results = bocha_payload["results"]
+            citations.extend(bocha_citations(results))
+            tool_call_id = str(tool_call.get("id") or "").strip()
+            if not tool_call_id:
+                raise AdapterError("DeepSeek 工具调用缺少 tool_call_id。", retryable=True)
+            tool_content = json.dumps({"query": arguments.get("query"), "results": results}, ensure_ascii=False)
+            messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": tool_content})
+            tool_audit.append({
+                "tool_call_id": tool_call_id,
+                "name": BOCHA_TOOL_NAME,
+                "arguments": arguments,
+                "results": results,
+                "raw_response": bocha_payload["raw_response"],
+            })
+
+    raise AdapterError(
+        f"DeepSeek 连续 {max_rounds} 轮仍未结束博查工具调用。",
+        retryable=True,
+        raw_response={"deepseek_rounds": deepseek_rounds, "bocha_tool_calls": tool_audit},
     )
 
 
@@ -1125,7 +1225,7 @@ def build_deepseek_chat_payload(
     temperature: float,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = build_openai_chat_payload(model, question, temperature)
+    payload = build_user_only_chat_payload(model, question, temperature)
     if options["thinking_type"] == "enabled":
         payload["thinking"] = {"type": "enabled"}
     elif options["thinking_type"] == "disabled":
@@ -1344,19 +1444,11 @@ def openai_compatible_request(
     provider: str,
     options: dict[str, Any],
 ) -> dict[str, Any]:
-    brave_payload: dict[str, Any] | None = None
+    if provider == "deepseek" and options["search_enabled"]:
+        return deepseek_bocha_tool_request(base, api_key, model, question, temperature, options)
     tencent_search_payload: dict[str, Any] | None = None
     external_citations: list[dict[str, str]] = []
     request_question = question
-    if provider in BRAVE_AUGMENTED_PROVIDERS and options["search_enabled"]:
-        try:
-            brave_payload = brave_search_request(question, options)
-            brave_results = brave_payload["results"]
-            external_citations = brave_citations(brave_results)
-            request_question = build_brave_augmented_question(question, brave_results)
-        except AdapterError as exc:
-            label = {"deepseek": "DeepSeek", "qwen": "通义千问", "ernie": "文心一言"}.get(provider, provider)
-            raise AdapterError(f"{label} 联网口径依赖 Brave Search 失败：{exc}") from exc
     if provider == "hunyuan" and options["search_enabled"]:
         try:
             tencent_search_payload = tencent_search_request(question, options)
@@ -1382,12 +1474,6 @@ def openai_compatible_request(
         citations = extract_openrouter_citations(data)
     citations = dedupe_citations(external_citations + citations)
     raw_response: dict[str, Any] = data
-    if brave_payload is not None:
-        raw_response = {
-            f"{provider}_response": data,
-            "brave_search": brave_payload["raw_response"],
-            "brave_results": brave_payload["results"],
-        }
     if tencent_search_payload is not None:
         raw_response = {
             f"{provider}_response": data,
@@ -1767,6 +1853,8 @@ def call_configured_model(
         raise AdapterError(f"暂不支持的模型服务商：{runtime_provider}")
     return {
         "provider": provider,
+        "actual_provider": runtime_provider,
+        "fallback_used": runtime_provider != provider,
         "model": result.get("returned_model", runtime_model),
         "configured_model": model_name,
         "model_version": model_config.get("model_version", ""),

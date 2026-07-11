@@ -263,11 +263,19 @@ class DeepSeekWebBrowser:
     @staticmethod
     def _blocked_page(page) -> str:
         text = page.locator("body").inner_text(timeout=5000).lower()
+        if any(marker in text for marker in ("账号已被禁言", "账号已被封禁", "account has been suspended", "account suspended")):
+            return "account_restricted"
         if any(marker in text for marker in ("captcha", "验证码", "安全验证", "verify you are human", "访问受限")):
             return "captcha"
         if any(marker in text for marker in ("登录", "log in", "sign in")) and page.locator("textarea, [contenteditable='true']").count() == 0:
             return "auth_expired"
         return ""
+
+    @staticmethod
+    def _blocked_message(code: str) -> str:
+        if code == "account_restricted":
+            return "DeepSeek 账号已被限制，请等待限制解除或更换合规账号后恢复批次"
+        return "DeepSeek 页面要求登录或安全验证"
 
     @staticmethod
     def _composer(page):
@@ -395,7 +403,7 @@ class DeepSeekWebBrowser:
         while time.monotonic() < deadline:
             blocked = self._blocked_page(page)
             if blocked:
-                raise DeepSeekWebError(blocked, "DeepSeek 页面要求登录或安全验证", retryable=False)
+                raise DeepSeekWebError(blocked, self._blocked_message(blocked), retryable=False)
             answer_locator = self._answer_locator(page)
             current = answer_locator.inner_text().strip() if answer_locator is not None else ""
             generating = self._is_generating(page)
@@ -500,7 +508,7 @@ class DeepSeekWebBrowser:
             trace.append({"event": "page_opened", "at": time.time(), "url": sanitize_url(page.url)})
             blocked = self._blocked_page(page)
             if blocked:
-                raise DeepSeekWebError(blocked, "DeepSeek 页面要求登录或安全验证", retryable=False)
+                raise DeepSeekWebError(blocked, self._blocked_message(blocked), retryable=False)
             self._open_new_chat(page, trace)
             composer = self._composer(page)
             self._enable_search(page, trace)
@@ -589,7 +597,7 @@ class DeepSeekWebBrowser:
             page.goto(self.config.chat_url, wait_until="domcontentloaded")
             blocked = self._blocked_page(page)
             if blocked:
-                raise DeepSeekWebError(blocked, "DeepSeek 页面要求登录或安全验证", retryable=False)
+                raise DeepSeekWebError(blocked, self._blocked_message(blocked), retryable=False)
             self._composer(page)
             toggle = self._search_toggle(page)
             return {"ok": True, "search_toggle_visible": toggle.is_visible(), "url": self.config.chat_url}

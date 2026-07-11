@@ -12,6 +12,7 @@ from src.db import (
     create_project,
     create_sampling_batch,
     get_conn,
+    get_sampling_task,
     init_db,
     list_model_configs,
     list_runs_by_batch,
@@ -41,6 +42,21 @@ from src.db import import_questions_text
 
 
 class DeepSeekWebHelpersTests(unittest.TestCase):
+    def test_account_restriction_is_detected_before_composer_lookup(self):
+        class FakeBody:
+            @staticmethod
+            def inner_text(timeout=5000):
+                return "由于违反用户使用规范，你的账号已被禁言至 2026 年 7 月 11 日 23:47"
+
+        class FakePage:
+            @staticmethod
+            def locator(selector):
+                self = FakeBody()
+                return self
+
+        self.assertEqual(DeepSeekWebBrowser._blocked_page(FakePage()), "account_restricted")
+        self.assertIn("账号已被限制", DeepSeekWebBrowser._blocked_message("account_restricted"))
+
     def test_sensitive_values_are_redacted_recursively(self):
         sanitized = sanitize_value(
             {
@@ -184,7 +200,14 @@ class DeepSeekWebTaskTests(unittest.TestCase):
                     },
                 )
                 create_web_sampling_tasks(conn, "batch-persist", self.project_id, payload)
-                task_id = list_sampling_tasks(conn, "batch-persist")[0]["task_id"]
+                original_task = list_sampling_tasks(conn, "batch-persist")[0]
+                task_id = original_task["task_id"]
+                original_question = original_task["question"]
+                original_model = self.web_model["model"]
+                self.assertEqual(get_sampling_task(conn, task_id)["task_snapshot"]["task"]["model"], original_model)
+                conn.execute("UPDATE questions SET question = '后来修改的网页问题' WHERE project_id = ?", (self.project_id,))
+                conn.execute("UPDATE projects SET brand_name = '后来修改的品牌' WHERE id = ?", (self.project_id,))
+                conn.execute("UPDATE model_configs SET model = 'later-web-model' WHERE id = ?", (self.web_model["id"],))
 
             fake_browser = mock.Mock()
             fake_browser.sample.return_value = result
@@ -205,6 +228,8 @@ class DeepSeekWebTaskTests(unittest.TestCase):
         self.assertEqual(task["chat_id"], result["chat_id"])
         self.assertEqual(task["artifact_dir"], result["artifact_dir"])
         self.assertEqual(len(runs), 1)
+        self.assertEqual(fake_browser.sample.call_args.kwargs["question"], original_question)
+        self.assertEqual(runs[0]["model"], original_model)
         self.assertEqual(runs[0]["response_text"], result["response_text"])
         self.assertEqual(json.loads(runs[0]["citations_json"]), result["citations"])
         self.assertEqual(json.loads(runs[0]["raw_response_json"])["chat_id"], result["chat_id"])

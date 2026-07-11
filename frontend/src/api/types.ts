@@ -9,6 +9,9 @@ export type Project = {
   competitors?: string;
   notes?: string;
   created_at?: string;
+  archived_at?: string | null;
+  question_count?: number;
+  run_count?: number;
 };
 
 export type Question = {
@@ -62,7 +65,7 @@ export type ModelConfig = {
   notes?: string;
 };
 
-export type BraveSearchConfig = {
+export type BochaSearchConfig = {
   configured: boolean;
   api_key_masked?: string;
   env_keys: string[];
@@ -70,9 +73,33 @@ export type BraveSearchConfig = {
   used_by: string[];
 };
 
+export type SourceHealth = {
+  source: string;
+  model_config_id: number;
+  label: string;
+  active: boolean;
+  configured: boolean;
+  modes: {
+    pure: { ready: boolean };
+    search: { ready: boolean; dependency_ready?: boolean };
+  };
+};
+
+export type ReadinessStatus = {
+  ok: boolean;
+  task_queue_backend: string;
+  checks: Record<string, { ok: boolean; skipped?: boolean; reason?: string; error?: string; count?: number }>;
+};
+
 export type SamplingBatch = {
   batch_id: string;
   project_id: number;
+  batch_name?: string;
+  description?: string;
+  purpose?: string;
+  tags?: string[];
+  outcome?: "clean" | "partial_failure" | "failure" | "pending";
+  config_snapshot?: Record<string, unknown>;
   status: string;
   total_count?: number;
   completed_count?: number;
@@ -86,6 +113,7 @@ export type SamplingBatch = {
   created_at?: string;
   started_at?: string;
   finished_at?: string;
+  archived_at?: string | null;
   updated_at?: string;
   task_queue_backend?: string;
   job_id?: string;
@@ -109,8 +137,10 @@ export type SourceRunStatus = {
 
 export type ModelRun = {
   id: number;
+  task_id?: string;
   run_id?: string;
   batch_id?: string;
+  project_id?: number;
   source_question_id?: string;
   provider?: string;
   model?: string;
@@ -137,6 +167,65 @@ export type ModelRun = {
   citations_json?: string;
   response_text?: string;
   error_message?: string;
+  error_category?: string;
+  error_code?: string;
+  attempt_id?: string;
+  attempt_index?: number;
+  attempt_no?: number;
+  task_key?: string;
+  configured_provider?: string;
+  actual_provider?: string;
+  configured_model?: string;
+  actual_model?: string;
+  mode?: string;
+  is_current?: boolean;
+  started_at?: string;
+  finished_at?: string;
+  cost_estimate?: number;
+};
+
+export type QualityDecision = "valid" | "excluded" | "needs_review";
+
+export type QualityReview = {
+  id?: number;
+  review_id?: string;
+  run_id: string;
+  project_id?: number;
+  batch_id?: string;
+  decision: QualityDecision;
+  reason: string;
+  actor?: string;
+  reviewer?: string;
+  created_at?: string;
+  updated_at?: string;
+  history?: QualityReview[];
+};
+
+export type ReportStatus = "draft" | "reviewed" | "frozen" | "archived";
+
+export type ReportVersion = {
+  report_id: string;
+  project_id: number;
+  batch_id?: string;
+  title: string;
+  status: ReportStatus;
+  version_no: number;
+  summary_snapshot?: Record<string, unknown>;
+  run_ids?: string[];
+  created_at?: string;
+  updated_at?: string;
+  frozen_at?: string;
+};
+
+export type BatchComparison = {
+  baseline_batch_id: string;
+  candidate_batch_id: string;
+  comparable: boolean;
+  comparability_reasons: Array<{ code: string; message: string; baseline?: unknown; candidate?: unknown }>;
+  baseline_summary?: Record<string, number | string>;
+  candidate_summary?: Record<string, number | string>;
+  delta: Record<string, number>;
+  delta_is_directional_only?: boolean;
 };
 
 export type Analytics = {
@@ -156,6 +245,9 @@ export type AnalyticsSummary = {
     batch_id: string;
     scope: "project" | "batch";
     generated_at: string;
+    data_cutoff?: string;
+    configuration?: Record<string, unknown>;
+    report_version?: { report_id: string; version_no: number; status: string } | null;
   };
   entities: {
     target: { canonical_name: string; entity_type: string; aliases: string[] };

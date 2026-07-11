@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.db import init_db
 from src.runtime_env import load_dotenv_file
+from src.worker_health import worker_heartbeat
 
 
 def main() -> int:
@@ -20,7 +21,12 @@ def main() -> int:
     init_db()
     conn = Redis.from_url(redis_url)
     worker = Worker([queue_name], connection=conn)
-    worker.work()
+    heartbeat = worker_heartbeat(str(worker.name), queue_name, kind="rq")
+    try:
+        heartbeat.start()
+        worker.work()
+    finally:
+        heartbeat.stop()
     return 0
 
 

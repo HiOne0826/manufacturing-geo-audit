@@ -1,9 +1,13 @@
 export class ApiError extends Error {
   status: number;
+  code?: string;
+  details?: Record<string, unknown>;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    this.details = details;
+    this.code = typeof details?.code === "string" ? details.code : undefined;
   }
 }
 
@@ -22,7 +26,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   const apiError = typeof data === "object" && data && "error" in data && Boolean(data.error);
   if (!response.ok || apiError) {
     const message = apiError ? String((data as { error: unknown }).error) : "请求失败";
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, typeof data === "object" && data ? data as Record<string, unknown> : undefined);
   }
   return data as T;
 }

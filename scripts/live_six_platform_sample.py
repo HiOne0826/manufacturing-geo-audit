@@ -26,7 +26,7 @@ from src.db import (
 )
 from src.platforms import test_platform_name
 from src.runner import run_batch
-from src.runtime_env import load_dotenv_file, provider_has_credentials, resolve_brave_search_api_key
+from src.runtime_env import load_dotenv_file, provider_has_credentials, resolve_bocha_search_api_key
 
 
 TARGET_PROVIDERS = ["openrouter_gpt", "deepseek", "openrouter_gemini", "doubao", "qwen", "hunyuan"]
@@ -67,8 +67,8 @@ def main() -> int:
             for provider in TARGET_PROVIDERS
             if provider in selected and not provider_has_credentials(provider, selected[provider].get("api_key", ""))
         ]
-        if args.search and "deepseek" in selected and not resolve_brave_search_api_key():
-            missing_keys.append("deepseek:brave")
+        if args.search and "deepseek" in selected and not resolve_bocha_search_api_key():
+            missing_keys.append("deepseek:bocha")
         if missing_configs or missing_keys:
             print(
                 json.dumps(
@@ -76,7 +76,7 @@ def main() -> int:
                         "ok": False,
                         "missing_configs": [test_platform_name(provider) for provider in missing_configs],
                         "missing_keys": [
-                            "DeepSeek Brave Search" if provider == "deepseek:brave" else test_platform_name(provider)
+                            "DeepSeek 博查搜索" if provider == "deepseek:bocha" else test_platform_name(provider)
                             for provider in missing_keys
                         ],
                     },

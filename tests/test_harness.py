@@ -15,7 +15,7 @@ from pathlib import Path
 
 import app
 from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request, qwen_responses_request
-from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
+from src.db import create_model_config, create_project, create_sampling_batch, get_conn, get_sampling_batch, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import call_model_with_retries, prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, retry_delay_seconds, run_batch
 from src.tasks import mark_batch_failed
@@ -296,6 +296,188 @@ class HarnessHttpTests(unittest.TestCase):
         data = self.request_json("GET", "/api/health")
         self.assertTrue(data["ok"])
 
+        live = self.request_json("GET", "/api/health/live")
+        self.assertTrue(live["ok"])
+        ready = self.request_json("GET", "/api/health/ready")
+        self.assertTrue(ready["ok"])
+        self.assertTrue(ready["checks"]["database"]["ok"])
+
+    def test_v2_batch_metadata_conflict_and_active_tasks_contract(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        start_payload = {
+            "project_id": project_id,
+            "models": [{"model_config_id": model_id, "search_enabled": False}],
+            "batch_name": "七月基线",
+            "description": "客户交付前检查",
+            "purpose": "baseline",
+            "tags": ["客户版", "基线"],
+            "client_request_id": "request-v2-001",
+        }
+        with mock.patch("app.dispatch_batch", return_value="job-v2"):
+            started = self.request_json("POST", "/api/runs/start", start_payload)
+        self.assertEqual(started["batch_name"], "七月基线")
+        batch_id = started["batch_id"]
+        batch = self.request_json("GET", f"/api/batches/{batch_id}")["batch"]
+        self.assertEqual(batch["tags"], ["客户版", "基线"])
+        self.assertEqual(batch["outcome"], "pending")
+
+        updated = self.request_json(
+            "POST",
+            f"/api/batches/{batch_id}/metadata",
+            {"batch_name": "七月基线（修订）", "tags": ["已复核"]},
+        )["batch"]
+        self.assertEqual(updated["batch_name"], "七月基线（修订）")
+        self.assertEqual(updated["tags"], ["已复核"])
+        self.assertEqual(updated["lock_version"], 1)
+
+        active = self.request_json("GET", "/api/tasks/active")["batches"]
+        self.assertTrue(any(item["batch_id"] == batch_id for item in active))
+
+        with mock.patch("app.dispatch_batch", return_value="job-never"):
+            replay = self.request_json("POST", "/api/runs/start", start_payload)
+        self.assertTrue(replay["idempotent_replay"])
+        changed_replay = {**start_payload, "repeat_count": 2}
+        changed_request = urllib.request.Request(
+            f"{self.base_url}/api/runs/start",
+            data=json.dumps(changed_replay).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as changed_raised:
+            urllib.request.urlopen(changed_request, timeout=10)
+        self.assertEqual(changed_raised.exception.code, 409)
+        changed_error = json.loads(changed_raised.exception.read().decode("utf-8"))
+        self.assertEqual(changed_error["code"], "IDEMPOTENCY_KEY_CONFLICT")
+        conflict_payload = {**start_payload, "client_request_id": "request-v2-002"}
+        request = urllib.request.Request(
+            f"{self.base_url}/api/runs/start",
+            data=json.dumps(conflict_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(raised.exception.code, 409)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "ACTIVE_BATCH_EXISTS")
+        self.assertEqual(error["batch_id"], batch_id)
+
+    def test_project_impact_archive_and_safe_delete(self):
+        project_id, _ = self.create_mock_project(question_count=1)
+        impact = self.request_json("GET", f"/api/projects/{project_id}/impact")["impact"]
+        self.assertEqual(impact["question_count"], 1)
+        self.assertEqual(impact["project_name"], "测试品牌")
+        archived = self.request_json("POST", "/api/projects/archive", {"id": project_id, "archived": True})
+        self.assertTrue(archived["archived"])
+
+        request = urllib.request.Request(
+            f"{self.base_url}/api/projects/delete",
+            data=json.dumps({"id": project_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(raised.exception.code, 409)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "PROJECT_DELETE_CONFIRMATION_REQUIRED")
+        deleted = self.request_json("POST", "/api/projects/delete", {"id": project_id, "confirm_name": "测试品牌"})
+        self.assertTrue(deleted["ok"])
+
+    def test_source_health_never_exposes_api_key(self):
+        self.create_mock_project(question_count=0)
+        health = self.request_json("GET", "/api/sources/health")
+        raw = json.dumps(health, ensure_ascii=False)
+        self.assertNotIn("SECRET-KEY-SHOULD-NOT-LEAK", raw)
+        self.assertIn("sources", health)
+
+    def test_active_probe_is_scoped_and_does_not_create_runs(self):
+        project_id, model_id = self.create_mock_project(question_count=0)
+        result = self.request_json(
+            "POST",
+            "/api/sources/mock/probe",
+            {"probe_type": "active", "kind": "pure", "model_config_id": model_id},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["probe_type"], "active")
+        self.assertEqual(result["mode"], "pure")
+        self.assertNotIn("response_text", result)
+        with get_conn(self.db_path) as conn:
+            self.assertEqual(list_runs(conn, project_id), [])
+
+    def test_attempt_history_preserves_superseded_runs_and_error_category(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        batch_id = "attempt-history-v2"
+        with get_conn(self.db_path) as conn:
+            question = list_questions(conn, project_id)[0]
+            create_sampling_batch(conn, {"batch_id": batch_id, "project_id": project_id, "status": "completed", "total_count": 1, "config": {}})
+            common = {
+                "batch_id": batch_id,
+                "project_id": project_id,
+                "question_id": question["id"],
+                "model_config_id": model_id,
+                "provider": "mock",
+                "model": "mock-model",
+                "requested_at": utc_now(),
+                "repeat_index": 1,
+            }
+            insert_run(conn, {**common, "run_id": "attempt-failed", "status": "failed", "error_message": "429 rate limit"})
+            insert_run(conn, {**common, "run_id": "attempt-success", "status": "success", "response_text": "ok"})
+        attempts = self.request_json("GET", f"/api/batches/{batch_id}/attempts")["attempts"]
+        self.assertEqual(len(attempts), 2)
+        failed = next(item for item in attempts if item["run_id"] == "attempt-failed")
+        current = next(item for item in attempts if item["run_id"] == "attempt-success")
+        self.assertEqual(failed["error_category"], "rate_limit")
+        self.assertFalse(failed["is_current"])
+        self.assertTrue(current["is_current"])
+        self.assertEqual(current["attempt_index"], 2)
+
+    def test_retry_claim_is_persistent_and_rejects_duplicate_dispatch(self):
+        project_id, model_id = self.create_mock_project(question_count=1)
+        batch_id = "retry-idempotency-v2"
+        with get_conn(self.db_path) as conn:
+            question = list_questions(conn, project_id)[0]
+            create_sampling_batch(
+                conn,
+                {"batch_id": batch_id, "project_id": project_id, "status": "completed", "total_count": 1, "config": {}},
+            )
+            insert_run(
+                conn,
+                {
+                    "run_id": "retry-failed-run",
+                    "batch_id": batch_id,
+                    "project_id": project_id,
+                    "question_id": question["id"],
+                    "model_config_id": model_id,
+                    "provider": "mock",
+                    "model": "mock-model",
+                    "status": "failed",
+                    "error_message": "timeout",
+                    "requested_at": utc_now(),
+                    "repeat_index": 1,
+                },
+            )
+
+        with mock.patch("app.dispatch_rerun_failed", return_value="retry-job-1") as dispatch:
+            first = self.request_json("POST", f"/api/batches/{batch_id}/retry", {"scope": "all"})
+            self.assertEqual(first["job_id"], "retry-job-1")
+
+            duplicate = urllib.request.Request(
+                f"{self.base_url}/api/batches/{batch_id}/retry",
+                data=json.dumps({"scope": "all"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(duplicate, timeout=10)
+
+        self.assertEqual(raised.exception.code, 409)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(error["code"], "RETRY_IN_PROGRESS")
+        dispatch.assert_called_once()
+        with get_conn(self.db_path) as conn:
+            self.assertEqual(get_sampling_batch(conn, batch_id)["status"], "running")
+
     def test_models_do_not_return_plain_api_key(self):
         self.create_mock_project()
         raw = json.dumps(self.request_json("GET", "/api/models"), ensure_ascii=False)
@@ -326,7 +508,7 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(deepseek["sampling_defaults"]["temperature"], 1)
         self.assertEqual(deepseek["model"], "deepseek-v4-flash")
         self.assertTrue(deepseek["supports_search"])
-        self.assertIn("Brave Search", deepseek["web_search_mode"])
+        self.assertIn("博查", deepseek["web_search_mode"])
         self.assertEqual(ernie["model"], "ernie-5.1")
         self.assertIsNone(ernie["sampling_defaults"]["temperature"])
         self.assertEqual(openrouter_gpt["label"], "OpenRouter-GPT")
@@ -394,13 +576,21 @@ class HarnessHttpTests(unittest.TestCase):
                 "Q002,新能源电池 PACK 装配有哪些 FDS 热熔螺接设备品牌值得推荐？,品牌推荐,FDS,DeepSeek,这段回答也不应导入,,,,,,,,,",
             ]
         )
+        encoded = base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii")
+        preview = self.request_json(
+            "POST",
+            "/api/questions/preview_file",
+            {"project_id": project_id, "file_name": "questions.csv", "file_base64": encoded},
+        )
+        self.assertEqual(preview["valid"], 2)
+        self.assertEqual(self.request_json("GET", f"/api/questions?project_id={project_id}")["questions"], [])
         imported = self.request_json(
             "POST",
             "/api/questions/import_file",
             {
                 "project_id": project_id,
                 "file_name": "questions.csv",
-                "file_base64": base64.b64encode(csv_text.encode("utf-8-sig")).decode("ascii"),
+                "file_base64": encoded,
             },
         )
         self.assertEqual(imported["count"], 2)
@@ -474,7 +664,7 @@ class HarnessHttpTests(unittest.TestCase):
         payload = post_json.call_args.args[2]
         self.assertNotIn("reasoning", payload)
 
-    def test_deepseek_search_uses_brave_external_context(self):
+    def test_deepseek_search_uses_real_bocha_tool_calls(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
@@ -484,24 +674,44 @@ class HarnessHttpTests(unittest.TestCase):
                 "thinking_type": "disabled",
             }
         )
-        with mock.patch("src.adapters.resolve_brave_search_api_key", return_value="brave-test-key"), \
-             mock.patch("src.adapters.get_json") as get_json, \
+        with mock.patch("src.adapters.resolve_bocha_search_api_key", return_value="bocha-test-key"), \
              mock.patch("src.adapters.post_json") as post_json:
-            get_json.return_value = {
-                "web": {
-                    "results": [
+            post_json.side_effect = [
+                {
+                    "model": "deepseek-v4-flash",
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bocha_web_search",
+                                    "arguments": '{"query":"国内 自动化涂装设备 品牌","count":5}',
+                                },
+                            }],
+                        },
+                    }],
+                },
+                {
+                    "data": {"webPages": {"value": [
                         {
-                            "title": "英歌瑞自动化涂装设备",
+                            "name": "英歌瑞自动化涂装设备",
                             "url": "https://example.com/ingreen",
-                            "description": "英歌瑞提供自动化涂装和涂胶控制系统。",
+                            "snippet": "英歌瑞提供自动化涂装和涂胶控制系统。",
+                            "summary": "面向制造业自动化涂装场景。",
                         }
-                    ]
-                }
-            }
-            post_json.return_value = {
-                "model": "deepseek-v4-flash",
-                "choices": [{"message": {"content": "基于资料，英歌瑞可作为参考品牌。[1]"}}],
-            }
+                    ]}}
+                },
+                {
+                    "model": "deepseek-v4-flash",
+                    "usage": {"prompt_tokens": 40, "completion_tokens": 15},
+                    "choices": [{"message": {"role": "assistant", "content": "英歌瑞可作为参考品牌。[1]"}}],
+                },
+            ]
             result = openai_compatible_request(
                 "https://api.deepseek.com/v1",
                 "deepseek-test-key",
@@ -512,18 +722,30 @@ class HarnessHttpTests(unittest.TestCase):
                 options,
             )
 
-        brave_url = get_json.call_args.args[0]
-        self.assertIn("https://api.search.brave.com/res/v1/web/search?", brave_url)
-        self.assertIn("country=CN", brave_url)
-        self.assertEqual(get_json.call_args.args[1]["X-Subscription-Token"], "brave-test-key")
-        payload = post_json.call_args.args[2]
-        user_content = payload["messages"][1]["content"]
-        self.assertIn("Brave Search 返回的公开网页检索结果", user_content)
-        self.assertIn("https://example.com/ingreen", user_content)
+        first_model_call = post_json.call_args_list[0]
+        self.assertEqual(first_model_call.args[0], "https://api.deepseek.com/v1/chat/completions")
+        first_payload = first_model_call.args[2]
+        self.assertEqual(first_payload["messages"], [{"role": "user", "content": "国内自动化涂装设备有哪些品牌？"}])
+        self.assertEqual(first_payload["tool_choice"], "required")
+        self.assertEqual(first_payload["tools"][0]["function"]["name"], "bocha_web_search")
+        self.assertFalse(any(message["role"] == "system" for message in first_payload["messages"]))
+        search_call = post_json.call_args_list[1]
+        self.assertEqual(search_call.args[0], "https://api.bochaai.com/v1/web-search")
+        self.assertEqual(search_call.args[1]["Authorization"], "Bearer bocha-test-key")
+        self.assertEqual(search_call.args[2]["query"], "国内 自动化涂装设备 品牌")
+        self.assertTrue(search_call.args[2]["summary"])
+        final_payload = post_json.call_args_list[2].args[2]
+        self.assertEqual(final_payload["tool_choice"], "none")
+        self.assertEqual(final_payload["messages"][1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(final_payload["messages"][2]["role"], "tool")
+        self.assertEqual(final_payload["messages"][2]["tool_call_id"], "call_1")
+        self.assertIn("https://example.com/ingreen", final_payload["messages"][2]["content"])
         self.assertEqual(result["citations"], [{"url": "https://example.com/ingreen", "title": "英歌瑞自动化涂装设备"}])
-        self.assertIn("brave_results", result["raw_response"])
+        self.assertEqual(result["raw_response"]["tool_mode"], "deepseek_function_calling")
+        self.assertEqual(result["raw_response"]["bocha_tool_calls"][0]["arguments"]["query"], "国内 自动化涂装设备 品牌")
+        self.assertEqual(result["usage"], {"prompt_tokens": 60, "completion_tokens": 23})
 
-    def test_deepseek_search_reports_brave_failure_without_fallback(self):
+    def test_deepseek_search_reports_bocha_failure_without_fallback(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
@@ -531,8 +753,15 @@ class HarnessHttpTests(unittest.TestCase):
                 "thinking_type": "disabled",
             }
         )
-        with mock.patch("src.adapters.brave_search_request", side_effect=AdapterError("<urlopen error [Errno 101] Network is unreachable>")), \
-             mock.patch("src.adapters.post_json") as post_json:
+        tool_call_response = {
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function", "function": {
+                    "name": "bocha_web_search", "arguments": '{"query":"问题"}'
+                }
+            }]}}]
+        }
+        with mock.patch("src.adapters.resolve_bocha_search_api_key", return_value="bocha-test-key"), \
+             mock.patch("src.adapters.post_json", side_effect=[tool_call_response, AdapterError("<urlopen error [Errno 101] Network is unreachable>")]):
             with self.assertRaises(AdapterError) as ctx:
                 openai_compatible_request(
                     "https://api.deepseek.com/v1",
@@ -544,9 +773,18 @@ class HarnessHttpTests(unittest.TestCase):
                     options,
                 )
 
-        self.assertIn("DeepSeek 联网口径依赖 Brave Search 失败", str(ctx.exception))
+        self.assertIn("DeepSeek 调用博查 Web Search API 失败", str(ctx.exception))
         self.assertIn("Network is unreachable", str(ctx.exception))
-        post_json.assert_not_called()
+
+    def test_deepseek_pure_request_has_no_system_prompt(self):
+        options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {"model": "deepseek-v4-flash", "choices": [{"message": {"content": "回答"}}]}
+            openai_compatible_request(
+                "https://api.deepseek.com/v1", "deepseek-test-key", "deepseek-v4-flash",
+                "原始问题", 1, "deepseek", options,
+            )
+        self.assertEqual(post_json.call_args.args[2]["messages"], [{"role": "user", "content": "原始问题"}])
 
     def test_qwen_search_uses_responses_api_without_system_prompt(self):
         options = normalize_run_options(
@@ -597,9 +835,9 @@ class HarnessHttpTests(unittest.TestCase):
             result["citations"],
             [{"url": "https://help.aliyun.com/zh/model-studio/web-search/", "title": "阿里云联网搜索"}],
         )
-        self.assertNotIn("brave_results", result["raw_response"])
+        self.assertNotIn("bocha_results", result["raw_response"])
 
-    def test_ernie_search_uses_native_enable_search_without_brave(self):
+    def test_ernie_search_uses_native_enable_search_without_bocha(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
@@ -607,8 +845,7 @@ class HarnessHttpTests(unittest.TestCase):
                 "thinking_type": "disabled",
             }
         )
-        with mock.patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test-key"}), \
-             mock.patch("src.adapters.get_json") as get_json, \
+        with mock.patch("src.adapters.get_json") as get_json, \
              mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {
                 "model": "ernie-5.1",
@@ -653,7 +890,7 @@ class HarnessHttpTests(unittest.TestCase):
             result["citations"],
             [{"url": "https://cloud.baidu.com/doc/qianfan-docs/s/Wm8r4sw29", "title": "百度智能云联网搜索"}],
         )
-        self.assertNotIn("brave_results", result["raw_response"])
+        self.assertNotIn("bocha_results", result["raw_response"])
 
     def test_openrouter_online_payload_uses_web_plugin_and_citations(self):
         options = normalize_run_options(
@@ -890,34 +1127,33 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["function"]["name"], "$web_search")
         self.assertEqual(payload["thinking"], {"type": "disabled"})
 
-    def test_openrouter_gpt_wrapper_uses_direct_openai_fallback_when_key_exists(self):
+    def test_openrouter_gpt_wrapper_rejects_cross_provider_fallback(self):
         with mock.patch.dict(
             os.environ,
             {
                 "ALLOW_LIVE_MODEL_CALLS": "1",
+                "ALLOW_CROSS_PROVIDER_FALLBACK": "1",
                 "OPENROUTER_DIRECT_FALLBACK": "1",
                 "OPENAI_API_KEY": "openai-direct-key",
                 "OPENROUTER_GPT_FALLBACK_MODEL": "gpt-4.1-mini",
             },
         ), mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {"output_text": "ok", "output": []}
-            result = call_configured_model(
-                {
-                    "provider": "openrouter_gpt",
-                    "api_base": "https://openrouter.ai/api/v1",
-                    "model": "openai/gpt-5.2",
-                },
-                "测试问题",
-                True,
-                1,
-                {"search_mode": "auto", "thinking_type": "disabled"},
-            )
+            with self.assertRaises(AdapterError) as raised:
+                call_configured_model(
+                    {
+                        "provider": "openrouter_gpt",
+                        "api_base": "https://openrouter.ai/api/v1",
+                        "model": "openai/gpt-5.2",
+                    },
+                    "测试问题",
+                    True,
+                    1,
+                    {"search_mode": "auto", "thinking_type": "disabled"},
+                )
 
-        self.assertEqual(post_json.call_args.args[0], "https://api.openai.com/v1/responses")
-        self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openai-direct-key")
-        self.assertEqual(post_json.call_args.args[2]["model"], "gpt-4.1-mini")
-        self.assertEqual(result["provider"], "openrouter_gpt")
-        self.assertEqual(result["model"], "gpt-4.1-mini")
+        self.assertIn("跨 provider fallback", str(raised.exception))
+        post_json.assert_not_called()
 
     def test_openrouter_wrapper_prefers_openrouter_key_by_default(self):
         with mock.patch.dict(
@@ -947,33 +1183,33 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(post_json.call_args.args[1]["Authorization"], "Bearer openrouter-key")
         self.assertEqual(result["provider"], "openrouter_gpt")
 
-    def test_openrouter_gemini_wrapper_uses_direct_gemini_fallback_when_key_exists(self):
+    def test_openrouter_gemini_wrapper_rejects_cross_provider_fallback(self):
         with mock.patch.dict(
             os.environ,
             {
                 "ALLOW_LIVE_MODEL_CALLS": "1",
+                "ALLOW_CROSS_PROVIDER_FALLBACK": "1",
                 "OPENROUTER_DIRECT_FALLBACK": "1",
                 "GEMINI_API_KEY": "gemini-direct-key",
                 "OPENROUTER_GEMINI_FALLBACK_MODEL": "gemini-2.5-flash",
             },
         ), mock.patch("src.adapters.post_json") as post_json:
             post_json.return_value = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "modelVersion": "gemini-2.5-flash"}
-            result = call_configured_model(
-                {
-                    "provider": "openrouter_gemini",
-                    "api_base": "https://openrouter.ai/api/v1",
-                    "model": "google/gemini-2.5-flash",
-                },
-                "测试问题",
-                True,
-                1,
-                {"search_mode": "auto", "thinking_type": "disabled"},
-            )
+            with self.assertRaises(AdapterError) as raised:
+                call_configured_model(
+                    {
+                        "provider": "openrouter_gemini",
+                        "api_base": "https://openrouter.ai/api/v1",
+                        "model": "google/gemini-2.5-flash",
+                    },
+                    "测试问题",
+                    True,
+                    1,
+                    {"search_mode": "auto", "thinking_type": "disabled"},
+                )
 
-        self.assertEqual(post_json.call_args.args[0], "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent")
-        self.assertEqual(post_json.call_args.args[1]["x-goog-api-key"], "gemini-direct-key")
-        self.assertEqual(result["provider"], "openrouter_gemini")
-        self.assertEqual(result["model"], "gemini-2.5-flash")
+        self.assertIn("跨 provider fallback", str(raised.exception))
+        post_json.assert_not_called()
 
     def test_customer_excel_export_uses_template_columns_and_suffixes_internal_columns(self):
         body = runs_to_excel_html(
@@ -1142,33 +1378,33 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertIn("<td>文心一言</td><td>回答内容</td>", body)
         self.assertIn("<td>batch-ernie</td><td>文心一言</td><td>ernie-5.1</td>", body)
 
-    def test_brave_search_status_masks_key_and_env_file_update_preserves_aliases(self):
-        old_brave = os.environ.get("BRAVE_SEARCH_API_KEY")
-        old_alias = os.environ.get("BRAVE_API_KEY")
+    def test_bocha_search_status_masks_key_and_env_file_update_preserves_aliases(self):
+        old_bocha = os.environ.get("BOCHA_API_KEY")
+        old_alias = os.environ.get("BOCHA_SEARCH_API_KEY")
         try:
-            os.environ["BRAVE_SEARCH_API_KEY"] = "brave-secret-value"
-            os.environ.pop("BRAVE_API_KEY", None)
-            status = app.brave_search_status()
+            os.environ["BOCHA_API_KEY"] = "bocha-secret-value"
+            os.environ.pop("BOCHA_SEARCH_API_KEY", None)
+            status = app.bocha_search_status()
             raw = json.dumps(status, ensure_ascii=False)
             self.assertTrue(status["configured"])
-            self.assertNotIn("brave-secret-value", raw)
+            self.assertNotIn("bocha-secret-value", raw)
             with tempfile.TemporaryDirectory() as temp_dir:
                 env_path = Path(temp_dir) / ".env"
-                env_path.write_text("APP_PASSWORD=test\nBRAVE_SEARCH_API_KEY=old\n", encoding="utf-8")
-                app.update_env_file_values(env_path, {"BRAVE_SEARCH_API_KEY": "new-key", "BRAVE_API_KEY": "new-key"})
+                env_path.write_text("APP_PASSWORD=test\nBOCHA_API_KEY=old\n", encoding="utf-8")
+                app.update_env_file_values(env_path, {"BOCHA_API_KEY": "new-key", "BOCHA_SEARCH_API_KEY": "new-key"})
                 text = env_path.read_text(encoding="utf-8")
             self.assertIn("APP_PASSWORD=test", text)
-            self.assertIn("BRAVE_SEARCH_API_KEY=new-key", text)
-            self.assertIn("BRAVE_API_KEY=new-key", text)
+            self.assertIn("BOCHA_API_KEY=new-key", text)
+            self.assertIn("BOCHA_SEARCH_API_KEY=new-key", text)
         finally:
-            if old_brave is None:
-                os.environ.pop("BRAVE_SEARCH_API_KEY", None)
+            if old_bocha is None:
+                os.environ.pop("BOCHA_API_KEY", None)
             else:
-                os.environ["BRAVE_SEARCH_API_KEY"] = old_brave
+                os.environ["BOCHA_API_KEY"] = old_bocha
             if old_alias is None:
-                os.environ.pop("BRAVE_API_KEY", None)
+                os.environ.pop("BOCHA_SEARCH_API_KEY", None)
             else:
-                os.environ["BRAVE_API_KEY"] = old_alias
+                os.environ["BOCHA_SEARCH_API_KEY"] = old_alias
 
     def test_mock_sampling_and_exports(self):
         project_id, model_id = self.create_mock_project()
@@ -1606,7 +1842,7 @@ class HarnessDirectTests(unittest.TestCase):
             mark_batch_failed("failed-progress-batch", "RQ job timed out", db_target=db_path)
             with get_conn(db_path) as conn:
                 batch = conn.execute("SELECT status, total_count, completed_count, success_count, failed_count, error_message FROM sampling_batches WHERE batch_id = ?", ("failed-progress-batch",)).fetchone()
-        self.assertEqual(batch["status"], "failed")
+        self.assertEqual(batch["status"], "failed_system")
         self.assertEqual(batch["total_count"], 2)
         self.assertEqual(batch["completed_count"], 1)
         self.assertEqual(batch["success_count"], 1)
@@ -1973,9 +2209,10 @@ class HarnessDirectTests(unittest.TestCase):
                 rerun_result = rerun_failed_runs(conn, "rerun-failed-batch", failed_runs, {"max_workers": 2, "retry_count": 0})
                 runs = list_runs(conn, project_id, limit=10, include_history=True)
             self.assertEqual(rerun_result["total"], 2)
-            self.assertEqual(rerun_result["success"], 2)
-            self.assertEqual(rerun_result["failed"], 0)
+            self.assertEqual(rerun_result["success"], 0)
+            self.assertEqual(rerun_result["failed"], 2)
             self.assertEqual(len(runs), 4)
+            self.assertTrue(all(row["model"] == "mock-fail" for row in runs), "重试必须保持创建时模型快照")
 
 
 if __name__ == "__main__":

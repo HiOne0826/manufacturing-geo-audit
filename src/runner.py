@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import random
 import threading
 import time
@@ -15,13 +16,24 @@ from .db import (
     get_conn,
     get_model_config,
     get_project,
+    get_sampling_task,
     insert_evaluation,
     insert_run,
+    create_execution_attempt,
+    create_sampling_tasks,
+    claim_sampling_task,
+    finalize_sampling_task,
+    update_execution_attempt,
+    update_sampling_task,
     is_postgres_conn,
     list_questions,
     utc_now,
 )
 from .evaluator import evaluate_answer
+from .reliability import classify_error, stable_config_fingerprint
+from .provider_health import assert_circuit_closed, distributed_provider_slot, record_provider_failure, record_provider_success
+from .runtime_env import resolve_provider_api_key
+from .worker_health import task_lease_heartbeat
 
 
 PROVIDER_CONCURRENCY_GROUPS = {
@@ -270,7 +282,7 @@ def prepare_runtime_task(
         "search_enable_citation": provider_cfg.get("search_enable_citation", False),
         "search_citation_format": provider_cfg.get("search_citation_format", ""),
     }
-    return {
+    task = {
         "base": base,
         "model_config": runtime_model_config,
         "question": question,
@@ -278,6 +290,52 @@ def prepare_runtime_task(
         "temperature": model_temperature,
         "search_enabled": search_enabled,
     }
+    fingerprint = stable_config_fingerprint(
+        {"model_config": runtime_model_config, "run_options": run_options, "temperature": model_temperature, "search_enabled": search_enabled}
+    )
+    logical = ":".join(
+        str(value) for value in (
+            "api", batch_id, question["id"], base["model_config_id"], int(search_enabled),
+            base["search_mode"], base["thinking_type"], base["reasoning_effort"],
+            base.get("thinking_budget"), repeat_index, fingerprint,
+        )
+    )
+    task["task_key"] = logical
+    task["task_id"] = f"task-{hashlib.sha256(logical.encode('utf-8')).hexdigest()[:24]}"
+    task["config_fingerprint"] = fingerprint
+    return task
+
+
+def immutable_task_snapshot(task: dict[str, Any], project: dict[str, Any]) -> dict[str, Any]:
+    model_config = {
+        key: value for key, value in task["model_config"].items()
+        if not any(token in str(key).lower() for token in ("api_key", "secret", "token", "password", "cookie", "authorization"))
+    }
+    safe_task = {
+        **task,
+        "base": {key: value for key, value in task["base"].items() if key not in {"run_id", "requested_at"}},
+        "model_config": model_config,
+        "question": dict(task["question"]),
+    }
+    project_fields = ("id", "client_name", "brand_name", "company_name", "product_category", "target_region", "website_domain", "competitors")
+    return {"schema_version": 1, "task": safe_task, "project": {key: project.get(key) for key in project_fields}}
+
+
+def restore_task_snapshot(conn, ledger: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    snapshot = ledger.get("task_snapshot") or {}
+    if snapshot.get("schema_version") != 1 or not snapshot.get("task"):
+        return None
+    task = json.loads(json.dumps(snapshot["task"], ensure_ascii=False))
+    task["base"] = {**task["base"], "run_id": f"run-{uuid.uuid4().hex}", "requested_at": utc_now()}
+    current_model = get_model_config(conn, int(ledger["model_config_id"])) or {}
+    task["model_config"] = {**task["model_config"], "api_key": current_model.get("api_key", "")}
+    project = dict(snapshot.get("project") or {})
+    if not project:
+        current_project = get_project(conn, int(ledger["project_id"]))
+        if not current_project:
+            return None
+        project = current_project
+    return task, project
 
 
 def execute_sampling_task(
@@ -287,11 +345,68 @@ def execute_sampling_task(
     project: dict[str, Any],
     semaphore: threading.Semaphore,
     max_retries: int,
+    global_limit: int = 1,
 ) -> dict[str, Any]:
     base = task["base"]
     question = task["question"]
+    ledger_task_id = str(task.get("task_id") or "")
+    lease_owner = f"runner-{os.getpid()}-{threading.get_ident()}"
+    if ledger_task_id:
+        with get_conn(db_target) as conn:
+            if not claim_sampling_task(conn, ledger_task_id, lease_owner, lease_seconds=max(120, int(os.environ.get("SAMPLING_REQUEST_TIMEOUT", "90")) * 3)):
+                return {**base, "status": "skipped", "task_id": ledger_task_id}
+    attempt_id = f"attempt-{uuid.uuid4().hex}"
+    fingerprint = task.get("config_fingerprint") or stable_config_fingerprint(
+        {
+            "model_config": task["model_config"],
+            "run_options": task["run_options"],
+            "temperature": task["temperature"],
+            "search_enabled": task["search_enabled"],
+        }
+    )
+    task_key = task.get("task_key") or ":".join(
+        str(value)
+        for value in (
+            base["batch_id"], base["question_id"], base["model_config_id"],
+            int(bool(base["search_enabled"])), base["search_mode"], base["thinking_type"],
+            base["reasoning_effort"], base.get("thinking_budget"), base["repeat_index"], fingerprint,
+        )
+    )
+    with get_conn(db_target) as conn:
+        create_execution_attempt(
+            conn,
+            {
+                "attempt_id": attempt_id,
+                "task_id": ledger_task_id,
+                "task_key": task_key,
+                "batch_id": base["batch_id"],
+                "run_id": base["run_id"],
+                "configured_provider": base["provider"],
+                "configured_model": base["model"],
+                "mode": "search" if base["search_enabled"] else "pure",
+                "config_fingerprint": fingerprint,
+            },
+        )
+    lease_seconds = max(120, int(os.environ.get("SAMPLING_REQUEST_TIMEOUT", "90")) * 3)
+    heartbeat = task_lease_heartbeat(
+        db_target,
+        ledger_task_id,
+        lease_owner,
+        lease_seconds=lease_seconds,
+    ).start() if ledger_task_id else None
+    model_config = task["model_config"]
+    provider_scope = {
+        "endpoint": str(model_config.get("api_base") or ""),
+        "credential": resolve_provider_api_key(base["provider"], str(model_config.get("api_key") or "")),
+        "exit_region": str(model_config.get("exit_region") or ""),
+    }
+    call_started = time.monotonic()
     try:
-        result = call_model_with_retries(task, semaphore, max_retries)
+        mode = "search" if base["search_enabled"] else "pure"
+        with get_conn(db_target) as conn:
+            assert_circuit_closed(conn, base["provider"], base["model"], mode, **provider_scope)
+        with distributed_provider_slot(provider_concurrency_group(base["provider"]), global_limit):
+            result = call_model_with_retries(task, semaphore, max_retries)
         run = {
             **base,
             "provider": result.get("provider", base["provider"]),
@@ -312,11 +427,71 @@ def execute_sampling_task(
             citations=run.get("citations", []),
         )
         with get_conn(db_target) as conn:
+            update_execution_attempt(
+                conn,
+                attempt_id,
+                {
+                    "actual_provider": result.get("actual_provider", result.get("provider", base["provider"])),
+                    "actual_model": result.get("model", base["model"]),
+                    "status": "response_received",
+                    "response_received": True,
+                    "latency_ms": result.get("latency_ms", 0),
+                    "usage": result.get("usage", {}),
+                    "updated_at": utc_now(),
+                },
+            )
+            if ledger_task_id and not finalize_sampling_task(conn, ledger_task_id, lease_owner, status="success"):
+                update_execution_attempt(
+                    conn,
+                    attempt_id,
+                    {
+                        "status": "uncertain",
+                        "error_code": "lease_lost",
+                        "error_message": "任务租约已失效，丢弃迟到响应",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                )
+                return {**base, "status": "skipped", "task_id": ledger_task_id, "reason": "lease_lost"}
             insert_run(conn, run)
             insert_evaluation(conn, evaluation)
+            update_execution_attempt(
+                conn,
+                attempt_id,
+                {
+                    "status": "succeeded",
+                    "persistence_committed": True,
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+            record_provider_success(
+                conn, base["provider"], base["model"], mode,
+                latency_ms=int(result.get("latency_ms", 0) or 0), **provider_scope,
+            )
         return {**base, "status": "success"}
     except Exception as exc:
+        classified = classify_error(str(exc), getattr(exc, "status_code", None), getattr(exc, "retryable", None))
         with get_conn(db_target) as conn:
+            if ledger_task_id and not finalize_sampling_task(
+                conn,
+                ledger_task_id,
+                lease_owner,
+                status="failed",
+                updates={"error_code": classified.code.value, "error_message": str(exc)},
+            ):
+                update_execution_attempt(
+                    conn,
+                    attempt_id,
+                    {
+                        "status": "uncertain",
+                        "error_code": "lease_lost",
+                        "error_message": "任务租约已失效，丢弃迟到错误",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                )
+                return {**base, "status": "skipped", "task_id": ledger_task_id, "reason": "lease_lost"}
             insert_run(
                 conn,
                 {
@@ -329,7 +504,26 @@ def execute_sampling_task(
                     "raw_response": getattr(exc, "raw_response", {}),
                 },
             )
-        return {**base, "status": "failed", "error_message": str(exc)}
+            update_execution_attempt(
+                conn,
+                attempt_id,
+                {
+                    "status": "failed",
+                    "error_code": classified.code.value,
+                    "error_message": str(exc),
+                    "persistence_committed": True,
+                    "finished_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+            record_provider_failure(
+                conn, base["provider"], base["model"], "search" if base["search_enabled"] else "pure",
+                classified, str(exc), latency_ms=int((time.monotonic() - call_started) * 1000), **provider_scope,
+            )
+        return {**base, "status": "failed", "error_message": str(exc), "error_code": classified.code.value}
+    finally:
+        if heartbeat:
+            heartbeat.stop()
 
 
 def build_tasks(
@@ -358,6 +552,34 @@ def build_tasks(
                         repeat_index=repeat_index,
                     )
                 )
+    return tasks
+
+
+def prepare_batch_ledger(conn, batch_id: str, project_id: int, config: dict[str, Any]) -> list[dict[str, Any]]:
+    questions = list_questions(conn, project_id)
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
+    model_configs: dict[int, dict[str, Any]] = {}
+    for provider_cfg in config.get("models") or []:
+        model_config_id = int(provider_cfg.get("model_config_id", 0) or 0)
+        model_config = get_model_config(conn, model_config_id)
+        if not model_config:
+            raise ValueError("模型配置不存在")
+        model_configs[model_config_id] = model_config
+    tasks = build_tasks(batch_id=batch_id, project_id=project_id, config=config, questions=questions, model_configs=model_configs)
+    create_sampling_tasks(
+        conn,
+        [
+            {
+                "task_id": task["task_id"], "task_key": task["task_key"], "batch_id": batch_id,
+                "project_id": project_id, "question_id": task["base"]["question_id"],
+                "model_config_id": task["base"]["model_config_id"], "repeat_index": task["base"]["repeat_index"],
+                "task_snapshot": immutable_task_snapshot(task, project),
+            }
+            for task in tasks
+        ],
+    )
     return tasks
 
 
@@ -399,6 +621,20 @@ def run_prepared_tasks(
     should_pause=None,
 ) -> dict[str, Any]:
     total_expected = len(tasks)
+    if tasks:
+        with get_conn(db_target) as ledger_conn:
+            create_sampling_tasks(
+                ledger_conn,
+                [
+                    {
+                        "task_id": task["task_id"], "task_key": task["task_key"], "batch_id": batch_id,
+                        "project_id": task["base"]["project_id"], "question_id": task["base"]["question_id"],
+                        "model_config_id": task["base"]["model_config_id"], "repeat_index": task["base"]["repeat_index"],
+                        "task_snapshot": immutable_task_snapshot(task, project),
+                    }
+                    for task in tasks if task.get("task_id") and task.get("task_key")
+                ],
+            )
     completed = 0
     failed = 0
     limits = provider_concurrency_limits(config)
@@ -420,6 +656,7 @@ def run_prepared_tasks(
             project=project,
             semaphore=semaphores[provider_concurrency_group(task["base"]["provider"] or "unknown")],
             max_retries=max_retries,
+            global_limit=limits.get(provider_concurrency_group(task["base"]["provider"] or "unknown"), provider_max_workers()),
         )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -439,6 +676,8 @@ def run_prepared_tasks(
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 outcome = future.result()
+                if outcome["status"] == "skipped":
+                    continue
                 completed += 1
                 if outcome["status"] == "failed":
                     failed += 1
@@ -562,6 +801,33 @@ def rerun_failed_runs(conn, batch_id: str, failed_runs: list[dict[str, Any]], co
     tasks = []
     rerun_config = {"repeat_count": 1, **(config or {})}
     for run in failed_runs:
+        attempt = conn.execute(
+            "SELECT task_id FROM execution_attempts WHERE run_id = ? AND task_id <> '' ORDER BY id DESC LIMIT 1",
+            (run.get("run_id", ""),),
+        ).fetchone()
+        if attempt:
+            ledger = get_sampling_task(conn, str(attempt["task_id"]))
+            restored = restore_task_snapshot(conn, ledger or {})
+            if restored:
+                update_sampling_task(
+                    conn,
+                    str(attempt["task_id"]),
+                    {
+                        "status": "queued",
+                        "rq_job_id": "",
+                        "lease_owner": "",
+                        "lease_expires_at": None,
+                        "heartbeat_at": None,
+                        "error_code": "",
+                        "error_message": "",
+                        "finished_at": None,
+                        "updated_at": utc_now(),
+                    },
+                )
+                task, snapshot_project = restored
+                project = snapshot_project
+                tasks.append(task)
+                continue
         model_config_id = int(run.get("model_config_id", 0) or 0)
         if not model_config_id:
             continue

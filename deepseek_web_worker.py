@@ -6,6 +6,7 @@ from pathlib import Path
 from src.db import init_db
 from src.runtime_env import load_dotenv_file
 from src.deepseek_web_tasks import recover_web_batches
+from src.worker_health import worker_heartbeat
 
 
 def main() -> int:
@@ -22,7 +23,12 @@ def main() -> int:
     queue_name = os.environ.get("RQ_WEB_QUEUE_NAME", "geo-audit-web")
     recover_web_batches()
     worker = SimpleWorker([queue_name], connection=Redis.from_url(redis_url))
-    worker.work()
+    heartbeat = worker_heartbeat(str(worker.name), queue_name, kind="deepseek_web")
+    try:
+        heartbeat.start()
+        worker.work()
+    finally:
+        heartbeat.stop()
     return 0
 
 

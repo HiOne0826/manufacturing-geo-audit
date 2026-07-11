@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS projects (
     website_domain TEXT DEFAULT '',
     competitors TEXT DEFAULT '',
     notes TEXT DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    archived_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -78,6 +79,15 @@ CREATE TABLE IF NOT EXISTS sampling_batches (
     failed_count INTEGER DEFAULT 0,
     completed_count INTEGER DEFAULT 0,
     config_json JSONB DEFAULT '{}'::jsonb,
+    batch_name TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    purpose TEXT DEFAULT '',
+    tags_json JSONB DEFAULT '[]'::jsonb,
+    config_snapshot_json JSONB DEFAULT '{}'::jsonb,
+    client_request_id TEXT DEFAULT '',
+    generation INTEGER DEFAULT 1,
+    lock_version INTEGER DEFAULT 0,
+    archived_at TIMESTAMPTZ,
     error_message TEXT DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
@@ -133,6 +143,7 @@ CREATE TABLE IF NOT EXISTS sampling_tasks (
     artifact_dir TEXT DEFAULT '',
     error_code TEXT DEFAULT '',
     error_message TEXT DEFAULT '',
+    task_snapshot_json JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
@@ -156,7 +167,158 @@ CREATE TABLE IF NOT EXISTS answer_evaluations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    task_id TEXT DEFAULT '',
+    task_key TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    run_id TEXT DEFAULT '',
+    attempt_no INTEGER NOT NULL DEFAULT 1,
+    configured_provider TEXT DEFAULT '',
+    actual_provider TEXT DEFAULT '',
+    configured_model TEXT DEFAULT '',
+    actual_model TEXT DEFAULT '',
+    mode TEXT DEFAULT 'pure',
+    config_fingerprint TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',
+    error_code TEXT DEFAULT '',
+    error_message TEXT DEFAULT '',
+    response_received INTEGER DEFAULT 0,
+    persistence_committed INTEGER DEFAULT 0,
+    latency_ms INTEGER DEFAULT 0,
+    usage_json JSONB DEFAULT '{}'::jsonb,
+    cost_estimate DOUBLE PRECISION DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_attempts_sequence
+ON execution_attempts(batch_id, task_key, attempt_no);
+
+CREATE TABLE IF NOT EXISTS dispatch_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    payload_json JSONB DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at TIMESTAMPTZ,
+    last_error TEXT DEFAULT '',
+    claim_token TEXT DEFAULT '',
+    claim_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
+    queue_name TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',
+    metadata_json JSONB DEFAULT '{}'::jsonb,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_health (
+    health_key TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT DEFAULT '',
+    mode TEXT DEFAULT 'pure',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    consecutive_failures INTEGER DEFAULT 0,
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    last_error_code TEXT DEFAULT '',
+    last_error_message TEXT DEFAULT '',
+    circuit_open_until TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    last_failure_at TIMESTAMPTZ,
+    checked_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_health_scopes (
+    health_key TEXT PRIMARY KEY,
+    endpoint TEXT DEFAULT '',
+    credential_fingerprint TEXT DEFAULT 'unconfigured',
+    exit_region TEXT DEFAULT '',
+    scope_json JSONB DEFAULT '{}'::jsonb,
+    half_open_trial_until TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_health_events (
+    event_id TEXT PRIMARY KEY,
+    health_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT DEFAULT '',
+    mode TEXT DEFAULT 'pure',
+    ok INTEGER NOT NULL,
+    error_code TEXT DEFAULT '',
+    latency_ms INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'passive',
+    observed_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_model_runs_batch_id ON model_runs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_model_runs_project_id ON model_runs(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_runs_one_current
+ON model_runs (
+    batch_id, question_id, model_config_id, search_enabled,
+    COALESCE(search_mode, ''), COALESCE(thinking_type, ''),
+    COALESCE(reasoning_effort, ''), COALESCE(thinking_budget, -1), repeat_index
+) WHERE is_current = 1;
 CREATE INDEX IF NOT EXISTS idx_sampling_batches_project_id ON sampling_batches(project_id);
 CREATE INDEX IF NOT EXISTS idx_sampling_tasks_batch_status ON sampling_tasks(batch_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_execution_attempts_batch_task ON execution_attempts(batch_id, task_key, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_dispatch_outbox_pending ON dispatch_outbox(status, available_at, id);
+CREATE INDEX IF NOT EXISTS idx_provider_health_events_window ON provider_health_events(health_key, observed_at);
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS batch_name TEXT DEFAULT '';
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS purpose TEXT DEFAULT '';
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS tags_json JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS config_snapshot_json JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS client_request_id TEXT DEFAULT '';
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS generation INTEGER DEFAULT 1;
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS lock_version INTEGER DEFAULT 0;
+ALTER TABLE sampling_batches ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sampling_batches_client_request
+ON sampling_batches(project_id, client_request_id) WHERE client_request_id <> '';
+-- Existing V1 databases may contain multiple active batches per project.
+-- Keep the most recently updated batch active and retain older rows as
+-- failed_system history before enforcing the uniqueness invariant.
+UPDATE sampling_batches AS stale
+SET status = 'failed_system',
+    error_message = CASE
+        WHEN BTRIM(COALESCE(stale.error_message, '')) = ''
+            THEN 'V2 migration: superseded duplicate active batch'
+        ELSE stale.error_message || E'\n' || 'V2 migration: superseded duplicate active batch'
+    END,
+    finished_at = COALESCE(stale.finished_at, CURRENT_TIMESTAMP),
+    updated_at = CURRENT_TIMESTAMP
+WHERE stale.status IN ('queued', 'running', 'pause_requested', 'paused')
+  AND stale.archived_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM sampling_batches AS newer
+      WHERE newer.project_id = stale.project_id
+        AND newer.status IN ('queued', 'running', 'pause_requested', 'paused')
+        AND newer.archived_at IS NULL
+        AND (
+            COALESCE(newer.updated_at, '-infinity'::timestamptz)
+                > COALESCE(stale.updated_at, '-infinity'::timestamptz)
+            OR (
+                COALESCE(newer.updated_at, '-infinity'::timestamptz)
+                    = COALESCE(stale.updated_at, '-infinity'::timestamptz)
+                AND newer.id > stale.id
+            )
+        )
+  );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sampling_batches_one_active_project
+ON sampling_batches(project_id)
+WHERE status IN ('queued', 'running', 'pause_requested', 'paused') AND archived_at IS NULL;

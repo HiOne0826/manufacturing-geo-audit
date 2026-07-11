@@ -10,7 +10,9 @@ from typing import Any
 from .db import (
     DEFAULT_DB_PATH,
     claim_sampling_task,
+    create_execution_attempt,
     create_sampling_tasks,
+    finalize_sampling_task,
     get_conn,
     get_model_config,
     get_project,
@@ -26,14 +28,18 @@ from .db import (
     sampling_task_counts,
     update_sampling_batch,
     update_sampling_task,
+    update_execution_attempt,
     utc_now,
 )
-from .deepseek_web import DeepSeekWebError, get_deepseek_web_browser
+from .deepseek_web import DeepSeekWebConfig, DeepSeekWebError, get_deepseek_web_browser
 from .evaluator import evaluate_answer
+from .provider_health import CircuitOpenError, assert_circuit_closed, record_provider_failure, record_provider_success
+from .reliability import ClassifiedError, ErrorCode, classify_error
+from .worker_health import task_lease_heartbeat
 
 
 WEB_PROVIDER = "deepseek_web"
-BLOCKING_ERROR_CODES = {"auth_missing", "auth_expired", "captcha"}
+BLOCKING_ERROR_CODES = {"auth_missing", "auth_expired", "captcha", "account_restricted"}
 STRUCTURAL_ERROR_CODES = {
     "selector_composer",
     "selector_new_chat",
@@ -44,6 +50,29 @@ STRUCTURAL_ERROR_CODES = {
     "session_not_isolated",
     "capture_mismatch",
 }
+
+
+def deepseek_web_health_scope() -> dict[str, str]:
+    config = DeepSeekWebConfig.from_env()
+    fingerprint = "unconfigured"
+    if config.auth_state.is_file():
+        try:
+            fingerprint = hashlib.sha256(config.auth_state.read_bytes()).hexdigest()[:16]
+        except OSError:
+            fingerprint = "unreadable"
+    return {
+        "endpoint": config.chat_url,
+        "credential_fp": fingerprint,
+        "exit_region": os.environ.get("PROVIDER_EXIT_REGION", ""),
+    }
+
+
+def classify_web_health_error(error: DeepSeekWebError) -> ClassifiedError:
+    if error.code in BLOCKING_ERROR_CODES:
+        return ClassifiedError(ErrorCode.AUTH, retryable=False, terminal=True)
+    if error.code in STRUCTURAL_ERROR_CODES:
+        return ClassifiedError(ErrorCode.MALFORMED_RESPONSE, retryable=True)
+    return classify_error(str(error), retryable=error.retryable)
 
 
 def web_job_timeout() -> int:
@@ -80,12 +109,18 @@ def build_web_sampling_tasks(conn, batch_id: str, project_id: int, payload: dict
     if web_batch_mode(conn, payload) != "web":
         raise ValueError("当前批次不属于 DeepSeek 官网采样")
     questions = list_questions(conn, project_id)
+    project = get_project(conn, project_id)
+    if not project:
+        raise ValueError("项目不存在")
     repeat_count = max(1, min(int(payload.get("repeat_count", 1) or 1), 10))
     now = utc_now()
     tasks = []
     for question in questions:
         for model_item in payload.get("models") or []:
             model_config_id = int(model_item["model_config_id"])
+            model_config = get_model_config(conn, model_config_id)
+            if not model_config:
+                raise ValueError("模型配置不存在")
             for repeat_index in range(1, repeat_count + 1):
                 task_key = f"{batch_id}:{int(question['id'])}:{model_config_id}:{repeat_index}"
                 digest = hashlib.sha256(task_key.encode("utf-8")).hexdigest()[:20]
@@ -98,12 +133,31 @@ def build_web_sampling_tasks(conn, batch_id: str, project_id: int, payload: dict
                         "question_id": int(question["id"]),
                         "model_config_id": model_config_id,
                         "repeat_index": repeat_index,
+                        "task_snapshot": {
+                            "schema_version": 1,
+                            "task": {
+                                "question": question.get("question", ""),
+                                "target_brand": question.get("target_brand", ""),
+                                "competitor_brands": question.get("competitor_brands", ""),
+                                "brand_name": project.get("brand_name", ""),
+                                "project_competitors": project.get("competitors", ""),
+                                "website_domain": project.get("website_domain", ""),
+                                "model": model_config.get("model", "deepseek-web-search"),
+                                "model_version": model_config.get("model_version", ""),
+                            },
+                        },
                         "status": "queued",
                         "created_at": now,
                         "updated_at": now,
                     }
                 )
     return tasks
+
+
+def apply_web_task_snapshot(task: dict[str, Any]) -> dict[str, Any]:
+    snapshot = task.get("task_snapshot") or {}
+    values = snapshot.get("task") if snapshot.get("schema_version") == 1 else None
+    return {**task, **values} if isinstance(values, dict) else task
 
 
 def create_web_sampling_tasks(conn, batch_id: str, project_id: int, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -263,6 +317,7 @@ def perform_deepseek_web_task(task_id: str, db_target: Path | str | None = DEFAU
         task = get_sampling_task(conn, task_id)
         if not task:
             raise ValueError("网页采样任务不存在")
+        task = apply_web_task_snapshot(task)
         batch = get_sampling_batch(conn, task["batch_id"])
         if not batch or batch.get("status") in {"pause_requested", "paused", "completed"}:
             return {"task_id": task_id, "status": "skipped"}
@@ -270,12 +325,50 @@ def perform_deepseek_web_task(task_id: str, db_target: Path | str | None = DEFAU
             return {"task_id": task_id, "status": "duplicate"}
         update_sampling_batch(conn, task["batch_id"], {"status": "running", "updated_at": utc_now()})
         conn.commit()
-        task = get_sampling_task(conn, task_id) or task
+        task = apply_web_task_snapshot(get_sampling_task(conn, task_id) or task)
 
+    heartbeat = task_lease_heartbeat(
+        db_target,
+        task_id,
+        lease_owner,
+        lease_seconds=web_job_timeout() + 60,
+    ).start()
+    try:
+        return _perform_claimed_deepseek_web_task(task, task_id, db_target)
+    finally:
+        heartbeat.stop()
+
+
+def _perform_claimed_deepseek_web_task(
+    task: dict[str, Any],
+    task_id: str,
+    db_target: Path | str | None,
+) -> dict[str, Any]:
+    model = str(task.get("model") or "deepseek-web-search")
+    provider_scope = deepseek_web_health_scope()
+    with get_conn(db_target) as conn:
+        try:
+            assert_circuit_closed(conn, WEB_PROVIDER, model, "search", **provider_scope)
+        except CircuitOpenError as exc:
+            finalize_sampling_task(
+                conn,
+                task_id,
+                str(task.get("lease_owner") or ""),
+                status="blocked",
+                updates={"error_code": exc.error_code, "error_message": str(exc)},
+            )
+            update_sampling_batch(
+                conn,
+                task["batch_id"],
+                {"status": "paused", "error_message": str(exc), "updated_at": utc_now()},
+            )
+            _sync_web_batch(conn, task["batch_id"])
+            return {"task_id": task_id, "status": "blocked", "error_code": exc.error_code}
     result = None
     final_error: DeepSeekWebError | None = None
     max_attempts = 3
     initial_attempt = int(task.get("attempt_count") or 1)
+    final_attempt_id = ""
     for local_attempt in range(max_attempts):
         if local_attempt:
             with get_conn(db_target) as conn:
@@ -286,35 +379,97 @@ def perform_deepseek_web_task(task_id: str, db_target: Path | str | None = DEFAU
                     {"attempt_count": int(current.get("attempt_count") or 0) + 1, "heartbeat_at": utc_now(), "updated_at": utc_now()},
                 )
             time.sleep(2)
+        final_attempt_id = f"attempt-{uuid.uuid4().hex}"
+        with get_conn(db_target) as conn:
+            create_execution_attempt(
+                conn,
+                {
+                    "attempt_id": final_attempt_id,
+                    "task_id": task_id,
+                    "task_key": task["task_key"],
+                    "batch_id": task["batch_id"],
+                    "configured_provider": WEB_PROVIDER,
+                    "configured_model": task.get("model") or "deepseek-web-search",
+                    "mode": "search",
+                },
+            )
         try:
             result = get_deepseek_web_browser().sample(batch_id=task["batch_id"], task_id=task_id, question=task["question"])
+            with get_conn(db_target) as conn:
+                update_execution_attempt(
+                    conn,
+                    final_attempt_id,
+                    {
+                        "actual_provider": WEB_PROVIDER,
+                        "actual_model": task.get("model") or "deepseek-web-search",
+                        "status": "response_received",
+                        "response_received": True,
+                        "latency_ms": int(result.get("latency_ms") or 0),
+                        "updated_at": utc_now(),
+                    },
+                )
             final_error = None
             break
         except DeepSeekWebError as exc:
             final_error = exc
+            with get_conn(db_target) as conn:
+                update_execution_attempt(
+                    conn,
+                    final_attempt_id,
+                    {
+                        "actual_provider": WEB_PROVIDER,
+                        "actual_model": task.get("model") or "deepseek-web-search",
+                        "status": "failed",
+                        "error_code": exc.code,
+                        "error_message": str(exc),
+                        "persistence_committed": True,
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                )
             if not exc.retryable or local_attempt >= max_attempts - 1:
                 break
 
     with get_conn(db_target) as conn:
-        task = get_sampling_task(conn, task_id) or task
+        task = apply_web_task_snapshot(get_sampling_task(conn, task_id) or task)
         if final_error:
+            record_provider_failure(
+                conn,
+                WEB_PROVIDER,
+                model,
+                "search",
+                classify_web_health_error(final_error),
+                str(final_error),
+                **provider_scope,
+            )
             blocked = final_error.code in BLOCKING_ERROR_CODES
             status = "blocked" if blocked else "failed"
-            _persist_run(conn, task, result=None, error=final_error)
-            update_sampling_task(
+            if not finalize_sampling_task(
                 conn,
                 task_id,
-                {
-                    "status": status,
+                str(task.get("lease_owner") or ""),
+                status=status,
+                updates={
                     "artifact_dir": getattr(final_error, "artifact_dir", ""),
                     "error_code": final_error.code,
                     "error_message": str(final_error)[:1000],
-                    "lease_owner": "",
-                    "lease_expires_at": None,
-                    "heartbeat_at": utc_now(),
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
                 },
+            ):
+                update_execution_attempt(
+                    conn,
+                    final_attempt_id,
+                    {
+                        "status": "uncertain", "error_code": "lease_lost",
+                        "error_message": "任务租约已失效，丢弃迟到错误",
+                        "persistence_committed": False, "finished_at": utc_now(), "updated_at": utc_now(),
+                    },
+                )
+                return {"task_id": task_id, "status": "duplicate", "reason": "lease_lost"}
+            run_id = _persist_run(conn, task, result=None, error=final_error)
+            update_execution_attempt(
+                conn,
+                final_attempt_id,
+                {"run_id": run_id, "status": "failed", "persistence_committed": True, "finished_at": utc_now(), "updated_at": utc_now()},
             )
             codes = recent_sampling_task_error_codes(conn, task["batch_id"], 3)
             circuit_open = len(codes) == 3 and len(set(codes)) == 1 and codes[0] in STRUCTURAL_ERROR_CODES
@@ -331,20 +486,36 @@ def perform_deepseek_web_task(task_id: str, db_target: Path | str | None = DEFAU
             counts = _sync_web_batch(conn, task["batch_id"])
             outcome = {"task_id": task_id, "status": status, "error_code": final_error.code, "attempt": initial_attempt + local_attempt}
         else:
-            _persist_run(conn, task, result=result, error=None)
-            update_sampling_task(
+            if not finalize_sampling_task(
                 conn,
                 task_id,
-                {
-                    "status": "success",
-                    "chat_id": result.get("chat_id", ""),
-                    "artifact_dir": result.get("artifact_dir", ""),
-                    "lease_owner": "",
-                    "lease_expires_at": None,
-                    "heartbeat_at": utc_now(),
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
+                str(task.get("lease_owner") or ""),
+                status="success",
+                updates={"chat_id": result.get("chat_id", ""), "artifact_dir": result.get("artifact_dir", "")},
+            ):
+                update_execution_attempt(
+                    conn,
+                    final_attempt_id,
+                    {
+                        "status": "uncertain", "error_code": "lease_lost",
+                        "error_message": "任务租约已失效，丢弃迟到响应",
+                        "persistence_committed": False, "finished_at": utc_now(), "updated_at": utc_now(),
+                    },
+                )
+                return {"task_id": task_id, "status": "duplicate", "reason": "lease_lost"}
+            run_id = _persist_run(conn, task, result=result, error=None)
+            update_execution_attempt(
+                conn,
+                final_attempt_id,
+                {"run_id": run_id, "status": "succeeded", "persistence_committed": True, "finished_at": utc_now(), "updated_at": utc_now()},
+            )
+            record_provider_success(
+                conn,
+                WEB_PROVIDER,
+                model,
+                "search",
+                latency_ms=int(result.get("latency_ms") or 0),
+                **provider_scope,
             )
             counts = _sync_web_batch(conn, task["batch_id"])
             outcome = {"task_id": task_id, "status": "success", "chat_id": result.get("chat_id", ""), "attempt": initial_attempt + local_attempt}
