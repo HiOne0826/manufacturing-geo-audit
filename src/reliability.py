@@ -4,8 +4,15 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Any
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 production compatibility.
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return str(self.value)
 
 
 class ErrorCode(StrEnum):
