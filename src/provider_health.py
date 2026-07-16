@@ -13,13 +13,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
-from .db import json_db_value, parse_json_field, utc_now
+from .db import _as_utc_datetime, is_postgres_conn, json_db_value, parse_json_field, utc_now
 from .reliability import ClassifiedError, ErrorCode
 
 
 class CircuitOpenError(RuntimeError):
     retryable = True
     error_code = "circuit_open"
+
+
+class ProviderSlotUnavailable(TimeoutError):
+    """Transient local backpressure, not an upstream provider failure."""
+
+    retryable = True
+    error_code = "provider_slot_busy"
 
 
 _SECRET_PATTERN = re.compile(
@@ -102,21 +109,24 @@ def health_key(
 
 def ensure_provider_health_schema(conn) -> None:
     """Create additive V2 health tables without coupling probes to app startup."""
+    json_type = "JSONB" if is_postgres_conn(conn) else "TEXT"
+    timestamp_type = "TIMESTAMPTZ" if is_postgres_conn(conn) else "TEXT"
+    json_default = "'{}'::jsonb" if is_postgres_conn(conn) else "'{}'"
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS provider_health_scopes (
             health_key TEXT PRIMARY KEY,
             endpoint TEXT DEFAULT '',
             credential_fingerprint TEXT DEFAULT 'unconfigured',
             exit_region TEXT DEFAULT '',
-            scope_json JSON DEFAULT '{}',
-            half_open_trial_until TEXT,
-            updated_at TEXT NOT NULL
+            scope_json {json_type} DEFAULT {json_default},
+            half_open_trial_until {timestamp_type},
+            updated_at {timestamp_type} NOT NULL
         )
         """
     )
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS provider_health_events (
             event_id TEXT PRIMARY KEY,
             health_key TEXT NOT NULL,
@@ -127,13 +137,34 @@ def ensure_provider_health_schema(conn) -> None:
             error_code TEXT DEFAULT '',
             latency_ms INTEGER DEFAULT 0,
             source TEXT DEFAULT 'passive',
-            observed_at TEXT NOT NULL
+            observed_at {timestamp_type} NOT NULL
         )
         """
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_provider_health_events_window ON provider_health_events(health_key, observed_at)"
     )
+
+
+def _run_health_write(conn, operation, *, max_attempts: int = 3) -> None:
+    """Retry PostgreSQL deadlocks without rolling back the caller's transaction."""
+    if not is_postgres_conn(conn):
+        operation()
+        return
+    savepoint = "provider_health_write"
+    for attempt in range(max(1, max_attempts)):
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            operation()
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
+        except Exception as exc:
+            sqlstate = str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", ""))
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if sqlstate != "40P01" or attempt + 1 >= max_attempts:
+                raise
+            time.sleep(0.05 * (2**attempt))
 
 
 def _scope_key(provider: str, model: str, mode: str, scope: dict[str, Any]) -> str:
@@ -217,7 +248,6 @@ def _record_event(
 
 
 def get_health(conn, provider: str, model: str, mode: str, **scope_kwargs: Any) -> dict[str, Any] | None:
-    ensure_provider_health_schema(conn)
     key = health_key(provider, model, mode, **scope_kwargs)
     row = conn.execute(
         """
@@ -230,6 +260,19 @@ def get_health(conn, provider: str, model: str, mode: str, **scope_kwargs: Any) 
         (key,),
     ).fetchone()
     return dict(row) if row else None
+
+
+def circuit_blocks_start(row: dict[str, Any], *, now: datetime | None = None) -> bool:
+    """Return whether a persisted circuit state is still inside its blocking window."""
+    status = str(row.get("status") or "unknown")
+    if status not in {"open", "half_open"}:
+        return False
+    current = now or datetime.now(timezone.utc)
+    deadline = _as_utc_datetime(
+        row.get("half_open_trial_until") if status == "half_open" else row.get("circuit_open_until")
+    )
+    # A legacy/incomplete open row without a deadline remains conservative.
+    return deadline is None or deadline > current
 
 
 def assert_circuit_closed(
@@ -249,7 +292,6 @@ def assert_circuit_closed(
         provider, model, mode, endpoint=endpoint, credential=credential,
         credential_fp=credential_fp, exit_region=exit_region,
     )
-    ensure_provider_health_schema(conn)
     key = _scope_key(provider, model, mode, scope)
     row = get_health(
         conn, provider, model, mode, endpoint=endpoint, credential=credential,
@@ -257,10 +299,10 @@ def assert_circuit_closed(
     )
     if not row:
         return
-    now = utc_now()
+    now = datetime.now(timezone.utc)
     status = str(row.get("status") or "unknown")
-    open_until = str(row.get("circuit_open_until") or "")
-    trial_until = str(row.get("half_open_trial_until") or "")
+    open_until = _as_utc_datetime(row.get("circuit_open_until"))
+    trial_until = _as_utc_datetime(row.get("half_open_trial_until"))
     if status == "open" and open_until and open_until > now:
         raise CircuitOpenError(f"信息源熔断中：{provider}/{model}/{mode}，预计恢复时间 {open_until}")
     if status == "half_open" and trial_until and trial_until > now:
@@ -269,7 +311,7 @@ def assert_circuit_closed(
         return
 
     # Atomic state claim: concurrent workers cannot both become the trial request.
-    next_trial = (datetime.now(timezone.utc) + timedelta(seconds=max(5, half_open_seconds))).isoformat()
+    next_trial = (now + timedelta(seconds=max(5, half_open_seconds))).isoformat()
     cursor = conn.execute(
         """
         UPDATE provider_health
@@ -277,7 +319,7 @@ def assert_circuit_closed(
         WHERE health_key = ? AND status IN ('open', 'half_open')
           AND (circuit_open_until IS NULL OR circuit_open_until <= ?)
         """,
-        (next_trial, now, key, now),
+        (next_trial, now.isoformat(), key, now.isoformat()),
     )
     if getattr(cursor, "rowcount", 0) != 1:
         raise CircuitOpenError(f"信息源正在半开试探：{provider}/{model}/{mode}")
@@ -298,35 +340,37 @@ def record_provider_success(
     exit_region: str = "",
     source: str = "passive",
 ) -> None:
-    ensure_provider_health_schema(conn)
     scope = health_scope(
         provider, model, mode, endpoint=endpoint, credential=credential,
         credential_fp=credential_fp, exit_region=exit_region,
     )
     key = _scope_key(provider, model, mode, scope)
     now = utc_now()
-    conn.execute(
-        """
-        INSERT INTO provider_health (
-            health_key, provider, model, mode, status, consecutive_failures,
-            success_count, failure_count, last_error_code, last_error_message,
-            circuit_open_until, last_success_at, last_failure_at, checked_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'healthy', 0, 1, 0, '', '', NULL, ?, NULL, ?, ?)
-        ON CONFLICT (health_key) DO UPDATE SET
-            status = 'healthy', consecutive_failures = 0,
-            success_count = provider_health.success_count + 1,
-            last_error_code = '', last_error_message = '', circuit_open_until = NULL,
-            last_success_at = excluded.last_success_at,
-            checked_at = COALESCE(excluded.checked_at, provider_health.checked_at), updated_at = excluded.updated_at
-        """,
-        (key, provider, model, mode, now, now if checked else None, now),
-    )
-    _persist_scope(conn, key, scope, half_open_trial_until=None)
-    conn.execute("UPDATE provider_health_scopes SET half_open_trial_until = NULL WHERE health_key = ?", (key,))
-    _record_event(
-        conn, key, provider, model, mode, ok=True, latency_ms=latency_ms,
-        source="active" if checked else source,
-    )
+    def write() -> None:
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+                health_key, provider, model, mode, status, consecutive_failures,
+                success_count, failure_count, last_error_code, last_error_message,
+                circuit_open_until, last_success_at, last_failure_at, checked_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'healthy', 0, 1, 0, '', '', NULL, ?, NULL, ?, ?)
+            ON CONFLICT (health_key) DO UPDATE SET
+                status = 'healthy', consecutive_failures = 0,
+                success_count = provider_health.success_count + 1,
+                last_error_code = '', last_error_message = '', circuit_open_until = NULL,
+                last_success_at = excluded.last_success_at,
+                checked_at = COALESCE(excluded.checked_at, provider_health.checked_at), updated_at = excluded.updated_at
+            """,
+            (key, provider, model, mode, now, now if checked else None, now),
+        )
+        _persist_scope(conn, key, scope, half_open_trial_until=None)
+        conn.execute("UPDATE provider_health_scopes SET half_open_trial_until = NULL WHERE health_key = ?", (key,))
+        _record_event(
+            conn, key, provider, model, mode, ok=True, latency_ms=latency_ms,
+            source="active" if checked else source,
+        )
+
+    _run_health_write(conn, write)
 
 
 def record_provider_failure(
@@ -345,49 +389,52 @@ def record_provider_failure(
     exit_region: str = "",
     source: str = "passive",
 ) -> None:
-    ensure_provider_health_schema(conn)
     scope = health_scope(
         provider, model, mode, endpoint=endpoint, credential=credential,
         credential_fp=credential_fp, exit_region=exit_region,
     )
-    current = get_health(
-        conn, provider, model, mode, endpoint=endpoint, credential=credential,
-        credential_fp=credential_fp, exit_region=exit_region,
-    ) or {}
-    failures = int(current.get("consecutive_failures", 0) or 0) + 1
-    # Authentication/region/model errors isolate immediately. A failed half-open trial reopens.
-    immediate = classified.terminal or current.get("status") == "half_open"
-    open_seconds = 3600 if classified.terminal else 120 if immediate or failures >= 5 else 0
-    open_until = (datetime.now(timezone.utc) + timedelta(seconds=open_seconds)).isoformat() if open_seconds else None
-    status = "open" if open_until else "degraded"
     key = _scope_key(provider, model, mode, scope)
-    now = utc_now()
     safe_message = redact_health_message(message, (credential,))
-    conn.execute(
-        """
-        INSERT INTO provider_health (
-            health_key, provider, model, mode, status, consecutive_failures,
-            success_count, failure_count, last_error_code, last_error_message,
-            circuit_open_until, last_success_at, last_failure_at, checked_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, NULL, ?, ?, ?)
-        ON CONFLICT (health_key) DO UPDATE SET
-            status = excluded.status, consecutive_failures = excluded.consecutive_failures,
-            failure_count = provider_health.failure_count + 1,
-            last_error_code = excluded.last_error_code, last_error_message = excluded.last_error_message,
-            circuit_open_until = excluded.circuit_open_until, last_failure_at = excluded.last_failure_at,
-            checked_at = COALESCE(excluded.checked_at, provider_health.checked_at), updated_at = excluded.updated_at
-        """,
-        (
-            key, provider, model, mode, status, failures, classified.code.value,
-            safe_message, open_until, now, now if checked else None, now,
-        ),
-    )
-    _persist_scope(conn, key, scope, half_open_trial_until=None)
-    conn.execute("UPDATE provider_health_scopes SET half_open_trial_until = NULL WHERE health_key = ?", (key,))
-    _record_event(
-        conn, key, provider, model, mode, ok=False, error_code=classified.code.value,
-        latency_ms=latency_ms, source="active" if checked else source,
-    )
+
+    def write() -> None:
+        current = get_health(
+            conn, provider, model, mode, endpoint=endpoint, credential=credential,
+            credential_fp=credential_fp, exit_region=exit_region,
+        ) or {}
+        failures = int(current.get("consecutive_failures", 0) or 0) + 1
+        # Authentication/region/model errors isolate immediately. A failed half-open trial reopens.
+        immediate = classified.terminal or current.get("status") == "half_open"
+        open_seconds = 3600 if classified.terminal else 120 if immediate or failures >= 5 else 0
+        open_until = (datetime.now(timezone.utc) + timedelta(seconds=open_seconds)).isoformat() if open_seconds else None
+        status = "open" if open_until else "degraded"
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+                health_key, provider, model, mode, status, consecutive_failures,
+                success_count, failure_count, last_error_code, last_error_message,
+                circuit_open_until, last_success_at, last_failure_at, checked_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, NULL, ?, ?, ?)
+            ON CONFLICT (health_key) DO UPDATE SET
+                status = excluded.status, consecutive_failures = excluded.consecutive_failures,
+                failure_count = provider_health.failure_count + 1,
+                last_error_code = excluded.last_error_code, last_error_message = excluded.last_error_message,
+                circuit_open_until = excluded.circuit_open_until, last_failure_at = excluded.last_failure_at,
+                checked_at = COALESCE(excluded.checked_at, provider_health.checked_at), updated_at = excluded.updated_at
+            """,
+            (
+                key, provider, model, mode, status, failures, classified.code.value,
+                safe_message, open_until, now, now if checked else None, now,
+            ),
+        )
+        _persist_scope(conn, key, scope, half_open_trial_until=None)
+        conn.execute("UPDATE provider_health_scopes SET half_open_trial_until = NULL WHERE health_key = ?", (key,))
+        _record_event(
+            conn, key, provider, model, mode, ok=False, error_code=classified.code.value,
+            latency_ms=latency_ms, source="active" if checked else source,
+        )
+
+    _run_health_write(conn, write)
 
 
 def _percentile95(values: list[int]) -> int:
@@ -399,7 +446,6 @@ def _percentile95(values: list[int]) -> int:
 
 def list_provider_health(conn, *, window_minutes: int = 60, window_size: int = 100) -> list[dict[str, Any]]:
     """Return secret-safe scoped health plus bounded passive sliding-window metrics."""
-    ensure_provider_health_schema(conn)
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, window_minutes))).isoformat()
     rows = conn.execute(
         """
@@ -452,7 +498,11 @@ def distributed_provider_slot(provider: str, limit: int, ttl_seconds: int = 180)
     redis = Redis.from_url(os.environ["REDIS_URL"], socket_connect_timeout=1, socket_timeout=2)
     key = f"geo-audit:provider-slots:{provider}"
     owner = hashlib.sha256(f"{os.getpid()}:{time.time_ns()}".encode()).hexdigest()
-    deadline = time.monotonic() + 30
+    try:
+        wait_seconds = max(0.1, float(os.environ.get("GLOBAL_PROVIDER_SLOT_WAIT_SECONDS", "30") or 30))
+    except (TypeError, ValueError):
+        wait_seconds = 30.0
+    deadline = time.monotonic() + wait_seconds
     acquired = False
     stop_renewal = threading.Event()
     renewal: threading.Thread | None = None
@@ -485,7 +535,7 @@ def distributed_provider_slot(provider: str, limit: int, ttl_seconds: int = 180)
                 break
             time.sleep(0.1)
         if not acquired:
-            raise TimeoutError(f"等待信息源全局并发槽超时：{provider}")
+            raise ProviderSlotUnavailable(f"等待信息源全局并发槽超时：{provider}")
 
         def renew() -> None:
             while not stop_renewal.wait(max(1.0, ttl_seconds / 3)):

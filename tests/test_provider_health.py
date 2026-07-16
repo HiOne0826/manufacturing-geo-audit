@@ -13,6 +13,8 @@ from unittest.mock import patch
 from src.db import get_conn, init_db
 from src.provider_health import (
     CircuitOpenError,
+    ProviderSlotUnavailable,
+    _run_health_write,
     assert_circuit_closed,
     credential_fingerprint,
     distributed_provider_slot,
@@ -202,6 +204,57 @@ class ProviderHealthTests(unittest.TestCase):
             with distributed_provider_slot("openai", 2):
                 self.assertTrue(any(call[0] == "eval" for call in calls))
         self.assertTrue(any(call[0] == "zrem" for call in calls))
+
+    def test_global_provider_limit_reports_transient_slot_backpressure(self):
+        class FakeClient:
+            def eval(self, *_args):
+                return 0
+
+        class FakeRedis:
+            @staticmethod
+            def from_url(*_args, **_kwargs):
+                return FakeClient()
+
+        module = types.SimpleNamespace(Redis=FakeRedis)
+        with patch.dict(sys.modules, {"redis": module}), patch.dict(
+            os.environ,
+            {
+                "REDIS_URL": "redis://example.invalid/0",
+                "GLOBAL_PROVIDER_LIMITS_ENABLED": "1",
+                "GLOBAL_PROVIDER_SLOT_WAIT_SECONDS": "0.1",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ProviderSlotUnavailable) as ctx:
+                with distributed_provider_slot("deepseek", 2):
+                    pass
+        self.assertEqual(ctx.exception.error_code, "provider_slot_busy")
+
+    def test_postgres_health_write_retries_deadlock_inside_savepoint(self):
+        class DeadlockError(RuntimeError):
+            sqlstate = "40P01"
+
+        class FakeConn:
+            def __init__(self):
+                self.commands: list[str] = []
+
+            def execute(self, sql, *_args):
+                self.commands.append(sql)
+
+        conn = FakeConn()
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise DeadlockError("deadlock detected")
+
+        with patch("src.provider_health.is_postgres_conn", return_value=True), patch("src.provider_health.time.sleep"):
+            _run_health_write(conn, operation)
+
+        self.assertEqual(attempts, 2)
+        self.assertTrue(any(command.startswith("ROLLBACK TO SAVEPOINT") for command in conn.commands))
 
 
 if __name__ == "__main__":

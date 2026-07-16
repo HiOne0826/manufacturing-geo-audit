@@ -7,11 +7,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, import_question_content_rows, init_db, list_runs_by_batch, utc_now
-from src.runner import prepare_batch_ledger
+from src.runner import prepare_batch_ledger, restore_task_snapshot
 from src.tasks import perform_rerun_runs, perform_sampling_task
 
 
 class ImmutableTaskSnapshotTests(unittest.TestCase):
+    def test_incompatible_web_snapshot_is_not_restored_by_api_worker(self) -> None:
+        ledger = {
+            "task_snapshot": {
+                "schema_version": 1,
+                "task": {"question": "官网问题", "model": "deepseek-web-search"},
+            }
+        }
+        self.assertIsNone(restore_task_snapshot(None, ledger))
+
     def test_worker_uses_creation_time_question_and_model_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TASK_QUEUE_BACKEND": "inline"}, clear=False):
             path = Path(tmp) / "snapshot.db"

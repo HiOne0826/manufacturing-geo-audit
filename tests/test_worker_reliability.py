@@ -32,7 +32,8 @@ from src.db import (
     utc_now,
 )
 from src.reconciler import reconcile_once
-from src.tasks import mark_rq_job_failed
+from src.runner import defer_sampling_task_for_slot
+from src.tasks import _queue_rerun_tasks, mark_rq_job_failed
 from src.worker_health import task_lease_heartbeat, worker_heartbeat
 
 
@@ -115,6 +116,22 @@ class WorkerReliabilityTests(unittest.TestCase):
             stale = list_worker_heartbeats(conn, stale_after_seconds=60)[0]
             self.assertTrue(stale["stale"])
             self.assertFalse(stale["available"])
+
+    def test_worker_heartbeat_accepts_postgres_datetime_format(self) -> None:
+        with get_conn(self.db_path) as conn:
+            upsert_worker_heartbeat(conn, "worker-postgres", "geo-audit", metadata={"kind": "rq"})
+            postgres_style = datetime.now(timezone(timedelta(hours=8))).isoformat(sep=" ")
+            conn.execute(
+                "UPDATE worker_heartbeats SET heartbeat_at = ? WHERE worker_id = ?",
+                (postgres_style, "worker-postgres"),
+            )
+            worker = next(
+                item for item in list_worker_heartbeats(conn, stale_after_seconds=60)
+                if item["worker_id"] == "worker-postgres"
+            )
+
+        self.assertFalse(worker["stale"])
+        self.assertTrue(worker["available"])
 
     def test_worker_heartbeat_loop_marks_clean_shutdown(self) -> None:
         heartbeat = worker_heartbeat(
@@ -200,6 +217,41 @@ class WorkerReliabilityTests(unittest.TestCase):
         self.assertEqual(stats["task_events_created"], 0)
         self.assertEqual(dispatched, [])
 
+    def test_reconciler_completes_stuck_running_batch_from_terminal_tasks(self) -> None:
+        with get_conn(self.db_path) as conn:
+            update_sampling_task(conn, "task-heartbeat", {"status": "failed", "finished_at": utc_now()})
+            conn.execute(
+                "UPDATE sampling_batches SET status = 'running', total_count = 1, completed_count = 0 WHERE batch_id = ?",
+                ("batch-heartbeat",),
+            )
+
+        stats = reconcile_once(self.db_path)
+
+        self.assertEqual(stats["batches_completed"], 1)
+        with get_conn(self.db_path) as conn:
+            batch = conn.execute(
+                "SELECT status, completed_count, failed_count, finished_at FROM sampling_batches WHERE batch_id = ?",
+                ("batch-heartbeat",),
+            ).fetchone()
+        self.assertEqual(batch["status"], "completed")
+        self.assertEqual(batch["completed_count"], 1)
+        self.assertEqual(batch["failed_count"], 1)
+        self.assertTrue(batch["finished_at"])
+
+    def test_reconciler_never_dispatches_web_tasks_to_api_worker(self) -> None:
+        with get_conn(self.db_path) as conn:
+            web_model_id = int(next(item for item in list_model_configs(conn) if item["provider"] == "deepseek_web")["id"])
+            conn.execute(
+                "UPDATE sampling_tasks SET task_id = 'dsw-task', task_key = 'web-key', model_config_id = ? WHERE task_id = ?",
+                (web_model_id, "task-heartbeat"),
+            )
+
+        dispatched: list[str] = []
+        stats = reconcile_once(self.db_path, lambda event, batch: dispatched.append(event["event_id"]))
+
+        self.assertEqual(stats["task_events_created"], 0)
+        self.assertEqual(dispatched, [])
+
     def test_task_rq_failure_requeues_real_batch_and_is_idempotent(self) -> None:
         class FailedJob:
             id = "rq-job-1"
@@ -219,11 +271,136 @@ class WorkerReliabilityTests(unittest.TestCase):
             self.assertEqual(task["rq_job_id"], "")
             self.assertEqual(task["lease_owner"], "")
             self.assertIn("worker crashed", task["error_message"])
-            events = list_pending_outbox(conn)
+            events = conn.execute(
+                "SELECT * FROM dispatch_outbox WHERE aggregate_id = ? ORDER BY id",
+                ("task-heartbeat",),
+            ).fetchall()
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["aggregate_id"], "task-heartbeat")
             batch = conn.execute("SELECT status FROM sampling_batches WHERE batch_id = ?", ("batch-heartbeat",)).fetchone()
             self.assertEqual(batch["status"], "queued")
+
+    def test_provider_slot_backpressure_requeues_without_failing_task(self) -> None:
+        with get_conn(self.db_path) as conn:
+            create_execution_attempt(
+                conn,
+                {
+                    "attempt_id": "attempt-slot-busy", "task_id": "task-heartbeat",
+                    "task_key": "key-heartbeat", "batch_id": "batch-heartbeat",
+                },
+            )
+            self.assertTrue(claim_sampling_task(conn, "task-heartbeat", "slot-worker", 60))
+            self.assertTrue(
+                defer_sampling_task_for_slot(
+                    conn,
+                    task_id="task-heartbeat",
+                    batch_id="batch-heartbeat",
+                    lease_owner="slot-worker",
+                    attempt_id="attempt-slot-busy",
+                    message="等待信息源全局并发槽超时：deepseek",
+                )
+            )
+            task = get_sampling_task(conn, "task-heartbeat")
+            attempt = conn.execute(
+                "SELECT status, error_code FROM execution_attempts WHERE attempt_id = ?",
+                ("attempt-slot-busy",),
+            ).fetchone()
+            events = conn.execute(
+                "SELECT * FROM dispatch_outbox WHERE aggregate_id = ? ORDER BY id",
+                ("task-heartbeat",),
+            ).fetchall()
+
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["error_code"], "provider_slot_busy")
+        self.assertEqual(attempt["status"], "deferred")
+        self.assertEqual(attempt["error_code"], "provider_slot_busy")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "dispatch_sampling_task")
+        self.assertGreater(events[0]["available_at"], events[0]["created_at"])
+
+    def test_rerun_queue_clears_stale_running_task_and_is_idempotent(self) -> None:
+        with get_conn(self.db_path) as conn:
+            create_execution_attempt(
+                conn,
+                {
+                    "attempt_id": "attempt-rerun", "task_id": "task-heartbeat",
+                    "task_key": "key-heartbeat", "batch_id": "batch-heartbeat",
+                    "run_id": "run-failed",
+                },
+            )
+            update_sampling_task(
+                conn,
+                "task-heartbeat",
+                {
+                    "status": "running", "rq_job_id": "stale-job", "lease_owner": "dead-worker",
+                    "lease_expires_at": utc_now(),
+                },
+            )
+            first = _queue_rerun_tasks(conn, "batch-heartbeat", [{"run_id": "run-failed"}])
+            second = _queue_rerun_tasks(conn, "batch-heartbeat", [{"run_id": "run-failed"}])
+            task = get_sampling_task(conn, "task-heartbeat")
+            events = list_pending_outbox(conn)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 1)
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["rq_job_id"], "")
+        self.assertEqual(len(events), 1)
+        self.assertIn("rerun-run-failed", events[0]["event_id"])
+
+    def test_rerun_queue_recovers_after_prior_dispatch_was_delivered(self) -> None:
+        with get_conn(self.db_path) as conn:
+            create_execution_attempt(
+                conn,
+                {
+                    "attempt_id": "attempt-rerun-delivered", "task_id": "task-heartbeat",
+                    "task_key": "key-heartbeat", "batch_id": "batch-heartbeat",
+                    "run_id": "run-failed-delivered",
+                },
+            )
+            _queue_rerun_tasks(conn, "batch-heartbeat", [{"run_id": "run-failed-delivered"}])
+            conn.execute(
+                "UPDATE dispatch_outbox SET status = 'delivered' WHERE event_id = ?",
+                ("dispatch-task:task-heartbeat:rerun-run-failed-delivered",),
+            )
+            update_sampling_task(conn, "task-heartbeat", {"status": "failed", "attempt_count": 1})
+
+            queued = _queue_rerun_tasks(conn, "batch-heartbeat", [{"run_id": "run-failed-delivered"}])
+            events = conn.execute(
+                "SELECT event_id, status FROM dispatch_outbox WHERE aggregate_id = ? ORDER BY id",
+                ("task-heartbeat",),
+            ).fetchall()
+
+        self.assertEqual(queued, 1)
+        self.assertEqual([event["status"] for event in events], ["delivered", "pending"])
+        self.assertTrue(events[-1]["event_id"].endswith("rerun-run-failed-delivered-2"))
+
+    def test_rerun_queue_refuses_to_steal_active_task_lease(self) -> None:
+        with get_conn(self.db_path) as conn:
+            create_execution_attempt(
+                conn,
+                {
+                    "attempt_id": "attempt-rerun-active", "task_id": "task-heartbeat",
+                    "task_key": "key-heartbeat", "batch_id": "batch-heartbeat",
+                    "run_id": "run-failed-active",
+                },
+            )
+            update_sampling_task(
+                conn,
+                "task-heartbeat",
+                {
+                    "status": "running", "lease_owner": "live-worker",
+                    "lease_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "拒绝抢占重跑"):
+                _queue_rerun_tasks(conn, "batch-heartbeat", [{"run_id": "run-failed-active"}])
+
+            task = get_sampling_task(conn, "task-heartbeat")
+
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["lease_owner"], "live-worker")
 
     def test_outbox_claim_is_exclusive_and_failed_claim_uses_backoff(self) -> None:
         with get_conn(self.db_path) as conn:

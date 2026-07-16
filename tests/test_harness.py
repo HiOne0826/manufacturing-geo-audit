@@ -14,7 +14,20 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import app
-from src.adapters import AdapterError, call_configured_model, kimi_search_request, normalize_choice_text, normalize_run_options, openai_compatible_request, openai_responses_request, qwen_responses_request
+from src.adapters import (
+    AdapterError,
+    build_openai_compatible_payload,
+    build_qwen_chat_payload,
+    call_configured_model,
+    doubao_search_request,
+    gemini_request,
+    kimi_search_request,
+    normalize_choice_text,
+    normalize_run_options,
+    openai_compatible_request,
+    openai_responses_request,
+    qwen_responses_request,
+)
 from src.db import create_model_config, create_project, create_sampling_batch, get_conn, get_sampling_batch, import_question_content_rows, import_questions_rows, init_db, insert_run, list_failed_runs_by_batch, list_questions, list_runs, update_sampling_batch, utc_now
 from src.exporter import runs_to_csv, runs_to_excel_html
 from src.runner import call_model_with_retries, prepare_runtime_task, provider_concurrency_group, provider_concurrency_limit, rerun_failed_runs, retry_delay_seconds, run_batch
@@ -653,7 +666,207 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["user_location"]["country"], "CN")
         self.assertEqual(payload["tools"][0]["user_location"]["timezone"], "Asia/Shanghai")
         self.assertEqual(payload["include"], ["web_search_call.action.sources"])
+        self.assertEqual(payload["input"], "问题")
+        self.assertNotIn("instructions", payload)
         self.assertEqual(result["citations"], [{"url": "https://example.com", "title": "Example"}])
+
+    def test_all_chat_provider_payloads_are_user_only(self):
+        question = "保持原样的用户问题"
+        options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
+        providers = (
+            "doubao",
+            "deepseek",
+            "qwen",
+            "kimi",
+            "hunyuan",
+            "ernie",
+            "minimax",
+            "openrouter_gpt",
+            "openrouter_gemini",
+        )
+        for provider in providers:
+            with self.subTest(provider=provider):
+                payload = build_openai_compatible_payload(provider, "test-model", question, 0.7, options)
+                self.assertEqual(payload["messages"], [{"role": "user", "content": question}])
+
+    def test_qwen_does_not_forward_prompt_intervention(self):
+        options = normalize_run_options(
+            {
+                "search_enabled": True,
+                "thinking_type": "disabled",
+                "search_prompt_intervene": "不要发送这段强制提示词",
+            }
+        )
+        payload = build_qwen_chat_payload("qwen-test", "用户问题", 0.7, options)
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "用户问题"}])
+        self.assertNotIn("intention_options", payload["search_options"])
+
+    def test_doubao_search_payload_is_user_only(self):
+        options = normalize_run_options({"search_enabled": True, "thinking_type": "disabled"})
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "model": "doubao-test",
+                "output_text": "联网回答",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {"sources": [{"url": "https://example.com", "title": "Example"}]},
+                    }
+                ],
+            }
+            doubao_search_request(
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "doubao-test-key",
+                "doubao-test",
+                "用户问题",
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        self.assertEqual(
+            payload["input"],
+            [{"role": "user", "content": [{"type": "input_text", "text": "用户问题"}]}],
+        )
+        self.assertEqual(payload["tool_choice"], "required")
+
+    def test_doubao_search_retries_empty_response(self):
+        options = normalize_run_options({"search_enabled": True, "thinking_type": "disabled"})
+        raw_response = {"model": "doubao-test", "output": [{"type": "message", "content": []}]}
+        with mock.patch("src.adapters.post_json", return_value=raw_response):
+            with self.assertRaises(AdapterError) as ctx:
+                doubao_search_request(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    "doubao-test-key",
+                    "doubao-test",
+                    "用户问题",
+                    options,
+                )
+        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(ctx.exception.raw_response["output"], raw_response["output"])
+        self.assertEqual(ctx.exception.raw_response["_geo_audit"]["fallback_from"], "required_empty_response")
+        self.assertIn("回答内容为空", str(ctx.exception))
+
+    def test_doubao_search_falls_back_to_auto_but_still_requires_search_evidence(self):
+        options = normalize_run_options({"search_enabled": True, "thinking_type": "disabled"})
+        empty_required = {
+            "id": "resp-required-empty",
+            "status": "completed",
+            "output": [{"type": "message", "content": []}],
+        }
+        auto_success = {
+            "id": "resp-auto-success",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"sources": [{"url": "https://example.com", "title": "Example"}]},
+                },
+                {"type": "message", "content": [{"type": "output_text", "text": "联网回答"}]},
+            ],
+        }
+        with mock.patch("src.adapters.post_json", side_effect=[empty_required, auto_success]) as post_json:
+            result = doubao_search_request(
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "doubao-test-key",
+                "doubao-test",
+                "用户问题",
+                options,
+            )
+
+        self.assertEqual(post_json.call_args_list[0].args[2]["tool_choice"], "required")
+        self.assertEqual(post_json.call_args_list[1].args[2]["tool_choice"], "auto")
+        self.assertEqual(result["response_text"], "联网回答")
+        self.assertEqual(result["citations"], [{"url": "https://example.com", "title": "Example"}])
+        self.assertEqual(result["raw_response"]["_geo_audit"]["fallback_from"], "required_empty_response")
+
+    def test_doubao_pure_chat_retries_empty_response(self):
+        options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
+        raw_response = {"model": "doubao-test", "choices": [{"message": {"content": ""}}]}
+        with mock.patch("src.adapters.post_json", return_value=raw_response):
+            with self.assertRaises(AdapterError) as ctx:
+                openai_compatible_request(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    "doubao-test-key",
+                    "doubao-test",
+                    "用户问题",
+                    1,
+                    "doubao",
+                    options,
+                )
+        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(ctx.exception.raw_response, raw_response)
+        self.assertIn("回答内容为空", str(ctx.exception))
+
+    def test_doubao_forced_search_requires_real_search_call(self):
+        options = normalize_run_options({"search_enabled": True, "thinking_type": "disabled"})
+        raw_response = {
+            "model": "doubao-test",
+            "output_text": "有正文也有引用，但没有搜索调用",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "有正文也有引用，但没有搜索调用",
+                            "annotations": [
+                                {"type": "url_citation", "url": "https://example.com", "title": "Example"}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        with mock.patch("src.adapters.post_json", return_value=raw_response):
+            with self.assertRaises(AdapterError) as ctx:
+                doubao_search_request(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    "doubao-test-key",
+                    "doubao-test",
+                    "用户问题",
+                    options,
+                )
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIn("web_search_call", str(ctx.exception))
+
+    def test_doubao_forced_search_requires_citations(self):
+        options = normalize_run_options({"search_enabled": True, "thinking_type": "disabled"})
+        raw_response = {
+            "model": "doubao-test",
+            "output_text": "有正文和搜索调用，但没有引用",
+            "output": [{"type": "web_search_call", "action": {"sources": [{}]}}],
+        }
+        with mock.patch("src.adapters.post_json", return_value=raw_response):
+            with self.assertRaises(AdapterError) as ctx:
+                doubao_search_request(
+                    "https://ark.cn-beijing.volces.com/api/v3",
+                    "doubao-test-key",
+                    "doubao-test",
+                    "用户问题",
+                    options,
+                )
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIn("未返回引用", str(ctx.exception))
+
+    def test_gemini_payload_is_user_only(self):
+        options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
+        with mock.patch("src.adapters.post_json") as post_json:
+            post_json.return_value = {
+                "modelVersion": "gemini-test",
+                "candidates": [{"content": {"parts": [{"text": "回答"}]}}],
+            }
+            gemini_request(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-test-key",
+                "gemini-test",
+                "用户问题",
+                1,
+                options,
+            )
+
+        payload = post_json.call_args.args[2]
+        self.assertEqual(payload["contents"], [{"role": "user", "parts": [{"text": "用户问题"}]}])
+        self.assertNotIn("systemInstruction", payload)
 
     def test_openai_responses_payload_omits_reasoning_for_non_reasoning_model(self):
         options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
@@ -829,7 +1042,8 @@ class HarnessHttpTests(unittest.TestCase):
         payload = post_json.call_args.args[2]
         self.assertEqual(payload["input"], "OpenRouter Web Search 支持哪些 engine？")
         self.assertEqual(payload["tools"], [{"type": "web_search"}])
-        self.assertNotIn("tool_choice", payload)
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertFalse(payload["enable_thinking"])
         self.assertEqual(payload["temperature"], 0.7)
         self.assertEqual(
             result["citations"],
@@ -872,7 +1086,7 @@ class HarnessHttpTests(unittest.TestCase):
 
         payload = post_json.call_args.args[2]
         get_json.assert_not_called()
-        self.assertEqual(payload["messages"][1]["content"], "联网搜索如何开启？")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "联网搜索如何开启？"}])
         self.assertNotIn("temperature", payload)
         self.assertNotIn("enable_search", payload)
         self.assertEqual(
@@ -1047,7 +1261,7 @@ class HarnessHttpTests(unittest.TestCase):
         with mock.patch("src.runner.random.uniform", return_value=0.5):
             self.assertEqual(retry_delay_seconds(error, 0), 5.5)
 
-    def test_hunyuan_search_uses_tencent_searchpro_then_augmented_generation(self):
+    def test_hunyuan_search_uses_native_function_calling_without_prompt_injection(self):
         options = normalize_run_options(
             {
                 "search_enabled": True,
@@ -1056,8 +1270,27 @@ class HarnessHttpTests(unittest.TestCase):
             }
         )
         with mock.patch("src.adapters.resolve_tencent_search_credentials", return_value=("1300000000", "secret-id", "secret-key")), \
-             mock.patch("src.adapters.post_json") as post_json:
+            mock.patch("src.adapters.post_json") as post_json:
             post_json.side_effect = [
+                {
+                    "model": "hy3",
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_hunyuan_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "tencent_search_pro",
+                                    "arguments": '{"query":"测试问题 最新资料"}',
+                                },
+                            }],
+                        },
+                    }],
+                },
                 {
                     "Response": {
                         "Pages": [
@@ -1076,7 +1309,8 @@ class HarnessHttpTests(unittest.TestCase):
                 },
                 {
                     "model": "hy3",
-                    "choices": [{"message": {"content": "联网回答 [1]"}}],
+                    "usage": {"prompt_tokens": 40, "completion_tokens": 15},
+                    "choices": [{"message": {"role": "assistant", "content": "自然联网回答"}}],
                 },
             ]
             result = openai_compatible_request(
@@ -1089,17 +1323,183 @@ class HarnessHttpTests(unittest.TestCase):
                 options,
             )
 
-        self.assertEqual(post_json.call_args_list[0].args[0], "https://wsa.tencentcloudapi.com")
-        search_payload = post_json.call_args_list[0].args[2]
-        self.assertEqual(search_payload["Query"], "测试问题")
+        first_payload = post_json.call_args_list[0].args[2]
+        self.assertEqual(first_payload["messages"], [{"role": "user", "content": "测试问题"}])
+        self.assertEqual(first_payload["tools"][0]["function"]["name"], "tencent_search_pro")
+        self.assertEqual(
+            first_payload["tool_choice"],
+            {"type": "function", "function": {"name": "tencent_search_pro"}},
+        )
+        self.assertNotIn("enable_enhancement", first_payload)
+        self.assertNotIn("temperature", first_payload)
+        self.assertFalse(any(message["role"] == "system" for message in first_payload["messages"]))
+
+        self.assertEqual(post_json.call_args_list[1].args[0], "https://wsa.tencentcloudapi.com")
+        search_payload = post_json.call_args_list[1].args[2]
+        self.assertEqual(search_payload["Query"], "测试问题 最新资料")
         self.assertNotIn("Mode", search_payload)
-        generation_payload = post_json.call_args_list[1].args[2]
-        self.assertNotIn("enable_enhancement", generation_payload)
-        self.assertNotIn("temperature", generation_payload)
-        self.assertIn("腾讯云 SearchPro 结果", generation_payload["messages"][1]["content"])
-        self.assertIn("https://example.com/hunyuan", generation_payload["messages"][1]["content"])
+
+        final_payload = post_json.call_args_list[2].args[2]
+        self.assertEqual(final_payload["tool_choice"], "none")
+        self.assertEqual(final_payload["messages"][0], {"role": "user", "content": "测试问题"})
+        self.assertEqual(final_payload["messages"][1]["tool_calls"][0]["id"], "call_hunyuan_1")
+        self.assertEqual(final_payload["messages"][2]["role"], "tool")
+        self.assertEqual(final_payload["messages"][2]["tool_call_id"], "call_hunyuan_1")
+        self.assertIn("https://example.com/hunyuan", final_payload["messages"][2]["content"])
+        self.assertNotIn("检索结果不足以判断", json.dumps(final_payload, ensure_ascii=False))
+        self.assertEqual(result["response_text"], "自然联网回答")
         self.assertEqual(result["citations"], [{"url": "https://example.com/hunyuan", "title": "混元来源"}])
-        self.assertIn("tencent_search_results", result["raw_response"])
+        self.assertEqual(result["raw_response"]["tool_mode"], "hunyuan_function_calling")
+        self.assertEqual(result["raw_response"]["tencent_search_tool_calls"][0]["arguments"]["query"], "测试问题 最新资料")
+        self.assertEqual(result["usage"], {"prompt_tokens": 60, "completion_tokens": 23})
+
+    def test_hunyuan_search_uses_original_question_when_tool_query_is_empty(self):
+        options = normalize_run_options({"search_enabled": True, "search_mode": "force", "thinking_type": "disabled"})
+        with mock.patch("src.adapters.resolve_tencent_search_credentials", return_value=("1300000000", "id", "key")), \
+            mock.patch("src.adapters.post_json") as post_json:
+            post_json.side_effect = [
+                {
+                    "model": "hy3",
+                    "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call_empty_query",
+                        "type": "function",
+                        "function": {"name": "tencent_search_pro", "arguments": "{}"},
+                    }]}}],
+                },
+                {
+                    "Response": {"Pages": [json.dumps({
+                        "title": "来源",
+                        "url": "https://example.com/source",
+                        "passage": "摘要",
+                    }, ensure_ascii=False)]},
+                },
+                {"model": "hy3", "choices": [{"message": {"role": "assistant", "content": "最终回答"}}]},
+            ]
+            result = openai_compatible_request(
+                "https://tokenhub.tencentmaas.com/v1",
+                "hunyuan-test-key",
+                "hy3",
+                "原始用户问题",
+                None,
+                "hunyuan",
+                options,
+            )
+
+        self.assertEqual(post_json.call_args_list[1].args[2]["Query"], "原始用户问题")
+        self.assertEqual(result["raw_response"]["tencent_search_tool_calls"][0]["arguments"]["query"], "原始用户问题")
+
+    def test_hunyuan_search_completes_private_tool_protocol_round(self):
+        options = normalize_run_options({"search_enabled": True, "search_mode": "force", "thinking_type": "disabled"})
+        with mock.patch("src.adapters.resolve_tencent_search_credentials", return_value=("1300000000", "id", "key")), \
+            mock.patch("src.adapters.post_json") as post_json:
+            post_json.side_effect = [
+                {
+                    "model": "hy3",
+                    "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call_private_protocol",
+                        "type": "function",
+                        "function": {"name": "tencent_search_pro", "arguments": '{"query":"测试问题"}'},
+                    }]}}],
+                },
+                {
+                    "Response": {"Pages": [json.dumps({
+                        "title": "来源",
+                        "url": "https://example.com/source",
+                        "passage": "摘要",
+                    }, ensure_ascii=False)]},
+                },
+                {
+                    "model": "hy3",
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": '<tool_calls:6124c78e>\\n<tool_call:6124c78e>tencent_search_pro\\n<arg_value:6124c78e>第二次检索词',
+                    }}],
+                },
+                {
+                    "Response": {"Pages": [json.dumps({
+                        "title": "补充来源",
+                        "url": "https://example.com/second-source",
+                        "passage": "补充摘要",
+                    }, ensure_ascii=False)]},
+                },
+                {
+                    "model": "hy3",
+                    "choices": [{"message": {"role": "assistant", "content": "多轮搜索后的自然回答"}}],
+                },
+            ]
+            result = openai_compatible_request(
+                "https://tokenhub.tencentmaas.com/v1",
+                "hunyuan-test-key",
+                "hy3",
+                "测试问题",
+                None,
+                "hunyuan",
+                options,
+            )
+
+        self.assertEqual(result["response_text"], "多轮搜索后的自然回答")
+        self.assertEqual(len(result["raw_response"]["hunyuan_rounds"]), 3)
+        self.assertEqual(len(result["raw_response"]["tencent_search_tool_calls"]), 2)
+        self.assertEqual(result["raw_response"]["tencent_search_tool_calls"][1]["queries"], ["第二次检索词"])
+        self.assertEqual(len(result["citations"]), 2)
+
+    def test_hunyuan_search_executes_nested_tokenhub_queries(self):
+        options = normalize_run_options({"search_enabled": True, "search_mode": "force", "thinking_type": "disabled"})
+        nested_arguments = json.dumps({
+            "thought": "需要两次检索",
+            "tool_calls": [
+                {"name": "tencent_search_pro", "arguments": {"query": "检索词一"}},
+                {"name": "tencent_search_pro", "arguments": {"query": "检索词二"}},
+            ],
+        }, ensure_ascii=False)
+        with mock.patch("src.adapters.resolve_tencent_search_credentials", return_value=("1300000000", "id", "key")), \
+            mock.patch("src.adapters.post_json") as post_json:
+            post_json.side_effect = [
+                {"model": "hy3", "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_nested",
+                    "type": "function",
+                    "function": {"name": "tencent_search_pro", "arguments": nested_arguments},
+                }]}}]},
+                {"Response": {"Pages": [json.dumps({"title": "来源一", "url": "https://example.com/one", "passage": "一"})]}},
+                {"Response": {"Pages": [json.dumps({"title": "来源二", "url": "https://example.com/two", "passage": "二"})]}},
+                {"model": "hy3", "choices": [{"message": {"role": "assistant", "content": "综合回答"}}]},
+            ]
+            result = openai_compatible_request(
+                "https://tokenhub.tencentmaas.com/v1", "key", "hy3", "原始问题", None, "hunyuan", options
+            )
+
+        self.assertEqual(post_json.call_args_list[1].args[2]["Query"], "检索词一")
+        self.assertEqual(post_json.call_args_list[2].args[2]["Query"], "检索词二")
+        self.assertEqual(result["response_text"], "综合回答")
+        self.assertEqual(result["raw_response"]["tencent_search_tool_calls"][0]["queries"], ["检索词一", "检索词二"])
+
+    def test_hunyuan_search_recovers_queries_from_concatenated_arguments(self):
+        options = normalize_run_options({"search_enabled": True, "search_mode": "force", "thinking_type": "disabled"})
+        malformed_arguments = '{"query":"检索词一"}\n{"query":"检索词二"}'
+        with mock.patch("src.adapters.resolve_tencent_search_credentials", return_value=("1300000000", "id", "key")), \
+            mock.patch("src.adapters.post_json") as post_json:
+            post_json.side_effect = [
+                {"model": "hy3", "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_malformed",
+                    "type": "function",
+                    "function": {"name": "tencent_search_pro", "arguments": malformed_arguments},
+                }]}}]},
+                {"Response": {"Pages": [json.dumps({"title": "来源一", "url": "https://example.com/one", "passage": "一"})]}},
+                {"Response": {"Pages": [json.dumps({"title": "来源二", "url": "https://example.com/two", "passage": "二"})]}},
+                {"model": "hy3", "choices": [{"message": {"role": "assistant", "content": "恢复后的综合回答"}}]},
+            ]
+            result = openai_compatible_request(
+                "https://tokenhub.tencentmaas.com/v1", "key", "hy3", "原始问题", None, "hunyuan", options
+            )
+
+        self.assertEqual(post_json.call_args_list[1].args[2]["Query"], "检索词一")
+        self.assertEqual(post_json.call_args_list[2].args[2]["Query"], "检索词二")
+        final_payload = post_json.call_args_list[3].args[2]
+        returned_arguments = final_payload["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(json.loads(returned_arguments), {"query": "检索词一"})
+        self.assertNotIn("\n", returned_arguments)
+        self.assertNotIn("raw_arguments", returned_arguments)
+        self.assertEqual(result["response_text"], "恢复后的综合回答")
 
     def test_kimi_search_payload_uses_builtin_web_search_tool(self):
         options = normalize_run_options(
@@ -1123,6 +1523,7 @@ class HarnessHttpTests(unittest.TestCase):
             )
 
         payload = post_json.call_args.args[2]
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "测试问题"}])
         self.assertEqual(payload["tools"][0]["type"], "builtin_function")
         self.assertEqual(payload["tools"][0]["function"]["name"], "$web_search")
         self.assertEqual(payload["thinking"], {"type": "disabled"})

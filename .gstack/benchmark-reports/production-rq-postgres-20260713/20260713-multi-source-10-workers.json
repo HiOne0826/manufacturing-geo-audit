@@ -1,0 +1,69 @@
+{
+  "mode": "multi",
+  "batch_id": "load-multi-4e895cee9b",
+  "project_id": 24,
+  "batch_status": "completed",
+  "task_statuses": {
+    "failed": 2,
+    "success": 8
+  },
+  "total": 10,
+  "success": 8,
+  "failed": 2,
+  "wall_seconds": 32.458,
+  "sum_provider_latency_seconds": 110.005,
+  "effective_parallelism": 3.39,
+  "max_running_tasks": 10,
+  "max_queue_depth": 0,
+  "max_provider_slots": {
+    "hunyuan": 2,
+    "qwen": 2,
+    "doubao": 2,
+    "openrouter": 2,
+    "openrouter_gemini": 2
+  },
+  "max_postgres_connections": 4,
+  "max_worker_rss_mb": 873.1,
+  "samples": 110,
+  "providers": {
+    "hunyuan": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 6372,
+      "errors": []
+    },
+    "qwen": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 16784,
+      "errors": []
+    },
+    "doubao": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 24087,
+      "errors": []
+    },
+    "openrouter_gpt": {
+      "total": 2,
+      "success": 1,
+      "failed": 1,
+      "avg_latency_ms": 3618,
+      "errors": [
+        "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1007)>"
+      ]
+    },
+    "openrouter_gemini": {
+      "total": 2,
+      "success": 1,
+      "failed": 1,
+      "avg_latency_ms": 4142,
+      "errors": [
+        "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1007)>"
+      ]
+    }
+  }
+}

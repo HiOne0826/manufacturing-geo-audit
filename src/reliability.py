@@ -94,9 +94,19 @@ _PATTERNS: tuple[tuple[ErrorCode, re.Pattern[str], bool, bool], ...] = (
     (ErrorCode.MODEL_NOT_FOUND, re.compile(r"\b(model[_ -]?not[_ -]?found|unknown model|404.*model|模型不存在)\b", re.I), False, True),
     (ErrorCode.TIMEOUT, re.compile(r"\b(timeout|timed out|deadline exceeded|超时)\b", re.I), True, False),
     (ErrorCode.SEARCH_DEPENDENCY, re.compile(r"\b(bocha|searchpro|web.?search|搜索依赖|联网搜索|博查)\b", re.I), True, False),
-    (ErrorCode.MALFORMED_RESPONSE, re.compile(r"\b(json|parse|decode|malformed|invalid response|解析失败|响应格式)\b", re.I), True, False),
+    (
+        ErrorCode.MALFORMED_RESPONSE,
+        re.compile(r"\b(json|parse|decode|malformed|invalid response|empty (response|output)|解析失败|响应格式)\b|回答内容为空|空响应", re.I),
+        True,
+        False,
+    ),
     (ErrorCode.NETWORK, re.compile(r"\b(dns|tls|ssl|connection|network|urlerror|网络|连接失败)\b", re.I), True, False),
-    (ErrorCode.UPSTREAM, re.compile(r"\b(408|409|425|500|502|503|504|upstream|service unavailable)\b", re.I), True, False),
+    (
+        ErrorCode.UPSTREAM,
+        re.compile(r"\b(408|409|425|500|502|503|504|upstream|service unavailable|circuit.?open|half.?open)\b|信息源熔断中|信息源正在半开试探", re.I),
+        True,
+        False,
+    ),
     (ErrorCode.CONFIGURATION, re.compile(r"缺少|未配置|unsupported|暂不支持|configuration", re.I), False, True),
     (ErrorCode.CANCELLED, re.compile(r"cancelled|canceled|已取消", re.I), False, True),
 )

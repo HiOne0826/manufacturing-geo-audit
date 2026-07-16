@@ -1,0 +1,16 @@
+[Unit]
+Description=Manufacturing GEO Audit RQ Worker %i
+After=network.target redis-server.service postgresql.service
+Wants=redis-server.service postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/manufacturing-geo-audit
+ExecStart=/usr/bin/python3 /opt/manufacturing-geo-audit/worker.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/manufacturing-geo-audit/.env
+
+[Install]
+WantedBy=multi-user.target

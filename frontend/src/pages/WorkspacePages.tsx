@@ -1,10 +1,10 @@
-import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Archive, CheckCircle2, ClipboardCheck, Edit3, FileDown, FileSpreadsheet, KeyRound, Pause, Play, RefreshCw, RotateCcw, Trash2, Upload } from "lucide-react";
+import { Archive, CheckCircle2, ChevronDown, ChevronUp, ClipboardCheck, Edit3, ExternalLink, FileDown, FileSpreadsheet, KeyRound, Pause, Play, RefreshCw, RotateCcw, Trash2, Upload } from "lucide-react";
 import { ApiError, apiPath } from "../api/client";
 import { analyticsApi, batchesApi, modelsApi, projectsApi, qualityApi, questionsApi, reportsApi, runsApi, settingsApi, systemApi } from "../api/resources";
-import type { AnalyticsSummary, BochaSearchConfig, ModelConfig, ModelRun, Project, QualityDecision, Question, ReportStatus, SamplingBatch, SourceRunStatus } from "../api/types";
+import type { AnalyticsSummary, BochaSearchConfig, Citation, ModelConfig, ModelRun, Project, QualityDecision, Question, ReportStatus, SamplingBatch, SourceRunStatus } from "../api/types";
 import { EmptyState, Metric, PageTitle, Pagination, StatusBadge, statusLabel } from "../components/common";
 import { AsyncBoundary, ConfirmDialog, useDialogFocus, useToast } from "../components/ui";
 import { asCount, formatDateTime, pct } from "../utils/format";
@@ -19,16 +19,29 @@ function runPlatform(row: Pick<ModelRun, "test_platform" | "provider">) {
   return row.test_platform || row.provider || "unknown";
 }
 
-function citationUrls(value?: string) {
+export function citationUrls(value?: string | Citation[]) {
   if (!value) return "";
   try {
-    const parsed = JSON.parse(value);
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
     const items = Array.isArray(parsed) ? parsed : [];
-    const urls = items.map((item) => String(item?.url || item?.link || item?.uri || "").trim()).filter(Boolean);
+    const urls = items
+      .map((item) => String(item?.url || item?.link || item?.uri || "").trim())
+      .filter((url) => {
+        try {
+          const protocol = new URL(url).protocol;
+          return protocol === "http:" || protocol === "https:";
+        } catch {
+          return false;
+        }
+      });
     return Array.from(new Set(urls)).join("; ");
   } catch {
     return "";
   }
+}
+
+function citationUrlList(value?: string | Citation[]) {
+  return citationUrls(value).split("; ").filter(Boolean);
 }
 
 function isTerminalStatus(status?: string) {
@@ -639,6 +652,17 @@ export function splitModelsForManagement(models: ModelConfig[]) {
   return { current, archived };
 }
 
+const SAMPLING_ARCHIVED_MODEL_PROVIDERS = new Set(["openai", "gemini", "deepseek_web"]);
+
+export function splitModelsForSampling(models: ModelConfig[]) {
+  const archived: ModelConfig[] = [];
+  const current: ModelConfig[] = [];
+  for (const model of models) {
+    (SAMPLING_ARCHIVED_MODEL_PROVIDERS.has(model.provider) ? archived : current).push(model);
+  }
+  return { current, archived };
+}
+
 export function SamplingPage() {
   const { projectId } = useSelectionStore();
   const questions = useQuery({ queryKey: ["questions", projectId], queryFn: () => questionsApi.list(projectId), enabled: Boolean(projectId) });
@@ -695,12 +719,62 @@ export function SamplingPage() {
     const running = batches.data.batches.find((batch) => !isTerminalStatus(batch.status));
     if (running) setActiveBatch(running.batch_id);
   }, [activeBatch, batches.data?.batches]);
-  const activeModels = (models.data?.models || []).filter((m) => m.active);
+  const samplingModelGroups = useMemo(
+    () => splitModelsForSampling((models.data?.models || []).filter((model) => model.active)),
+    [models.data?.models]
+  );
   const searchTaskCount = runModels.filter((item) => item.search_enabled).length;
   const totalTasks = (questions.data?.questions.length || 0) * runModels.length * repeatCount;
   const activeStatus = progress.data?.status;
   const batchRunning = Boolean(activeBatch && !isTerminalStatus(activeStatus));
   const failedSources = (progress.data?.source_statuses || []).some((item) => item.failed > 0);
+  const renderModelCard = (model: ModelConfig) => {
+    const config = selected[model.id];
+    const enabled = Boolean(config);
+    const mode = config?.mode || "pure";
+    const defaultMode: SamplingMode = model.supports_pure ? "pure" : "search";
+    return (
+      <article key={model.id} className={`matrix-card ${enabled ? "is-selected" : ""}`}>
+        <header>
+          <label className="matrix-select">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) =>
+                setSelected((prev) =>
+                  event.target.checked
+                    ? { ...prev, [model.id]: { mode: defaultMode, reasoning_enabled: false } }
+                    : (Object.fromEntries(Object.entries(prev).filter(([id]) => Number(id) !== model.id)) as typeof prev)
+                )
+              }
+            />
+            <strong>{model.label}</strong>
+          </label>
+          <span className={model.has_key ? "key-ok" : "key-missing"}>{model.has_key ? "Key 已配置" : "缺少 Key"}</span>
+        </header>
+        <p>测试平台：{model.test_platform || model.label}</p>
+        <div className="sampling-mode-group">
+          <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
+          <button className={mode === "search" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "search" } }))}>联网</button>
+          <button className={mode === "compare" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "compare" } }))}>本体+联网</button>
+        </div>
+        <label className="matrix-toggle">
+          <input
+            type="checkbox"
+            disabled={!enabled || !model.supports_reasoning}
+            checked={Boolean(config?.reasoning_enabled)}
+            onChange={(event) => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], reasoning_enabled: event.target.checked } }))}
+          />
+          深度思考
+        </label>
+        <dl>
+          <dt>默认温度</dt><dd>{String(model.sampling_defaults?.temperature ?? "模型默认")}</dd>
+          <dt>联网能力</dt><dd>{model.supports_search ? "支持" : "不支持"}</dd>
+          <dt>说明</dt><dd>{model.supports_pure && model.supports_search ? "支持联网采样与本体对照" : model.supports_search ? "仅支持联网采样" : "仅支持本体采样"}</dd>
+        </dl>
+      </article>
+    );
+  };
   return (
     <main className="page sampling-page" data-dirty={batchName.trim() || batchDescription.trim() || batchTags.trim() || Object.keys(selected).length || repeatCount !== 1 ? "true" : undefined}>
       <PageTitle title="采样" description="选择问题范围和模型矩阵，对比模型本体与联网搜索结果。" />
@@ -731,55 +805,14 @@ export function SamplingPage() {
         </Panel>
       </section>
       <Panel title="模型矩阵">
-        <div className="model-matrix">
-          {activeModels.map((model) => {
-            const config = selected[model.id];
-            const enabled = Boolean(config);
-            const mode = config?.mode || "pure";
-            const defaultMode: SamplingMode = model.supports_pure ? "pure" : "search";
-            return (
-              <article key={model.id} className={`matrix-card ${enabled ? "is-selected" : ""}`}>
-                <header>
-                  <label className="matrix-select">
-                    <input
-                      type="checkbox"
-                      checked={enabled}
-                      onChange={(event) =>
-                        setSelected((prev) =>
-                          event.target.checked
-                            ? { ...prev, [model.id]: { mode: defaultMode, reasoning_enabled: false } }
-                            : (Object.fromEntries(Object.entries(prev).filter(([id]) => Number(id) !== model.id)) as typeof prev)
-                        )
-                      }
-                    />
-                    <strong>{model.label}</strong>
-                  </label>
-                  <span className={model.has_key ? "key-ok" : "key-missing"}>{model.has_key ? "Key 已配置" : "缺少 Key"}</span>
-                </header>
-                <p>测试平台：{model.test_platform || model.label}</p>
-                <div className="sampling-mode-group">
-                  <button className={mode === "pure" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "pure" } }))}>本体</button>
-                  <button className={mode === "search" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "search" } }))}>联网</button>
-                  <button className={mode === "compare" ? "is-active" : ""} type="button" disabled={!enabled || !model.supports_pure || !model.supports_search} onClick={() => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], mode: "compare" } }))}>本体+联网</button>
-                </div>
-                <label className="matrix-toggle">
-                  <input
-                    type="checkbox"
-                    disabled={!enabled || !model.supports_reasoning}
-                    checked={Boolean(config?.reasoning_enabled)}
-                    onChange={(event) => setSelected((prev) => ({ ...prev, [model.id]: { ...prev[model.id], reasoning_enabled: event.target.checked } }))}
-                  />
-                  深度思考
-                </label>
-                <dl>
-                  <dt>默认温度</dt><dd>{String(model.sampling_defaults?.temperature ?? "模型默认")}</dd>
-                  <dt>联网能力</dt><dd>{model.supports_search ? "支持" : "不支持"}</dd>
-                  <dt>说明</dt><dd>{model.supports_pure && model.supports_search ? "支持联网采样与本体对照" : model.supports_search ? "仅支持联网采样" : "仅支持本体采样"}</dd>
-                </dl>
-              </article>
-            );
-          })}
-        </div>
+        {samplingModelGroups.current.length ? <div className="model-matrix">{samplingModelGroups.current.map(renderModelCard)}</div> : null}
+        {samplingModelGroups.archived.length ? (
+          <details className="archived-models sampling-archived-models">
+            <summary><span>归档模型</span><span>{samplingModelGroups.archived.length} 个历史配置</span></summary>
+            <p>GPT、Gemini 和 DeepSeek 官网联网搜索默认收起；展开后仍可选入采样。</p>
+            <div className="model-matrix">{samplingModelGroups.archived.map(renderModelCard)}</div>
+          </details>
+        ) : null}
       </Panel>
       <ConfirmDialog open={confirmStart} title="确认启动采样" confirmLabel={start.isPending ? "正在创建…" : `启动 ${totalTasks} 个任务`} onClose={() => setConfirmStart(false)} onConfirm={() => start.mutate()} description={<dl className="start-summary"><dt>批次</dt><dd>{batchName || "未命名"}</dd><dt>用途</dt><dd>{batchPurpose}</dd><dt>问题</dt><dd>{questions.data?.questions.length || 0} 个</dd><dt>模型配置</dt><dd>{runModels.length} 个</dd><dt>重复</dt><dd>{repeatCount} 次</dd><dt>总任务</dt><dd><strong>{totalTasks}</strong> 个</dd><dt>预计耗时</dt><dd>暂不可估算</dd></dl>} />
     </main>
@@ -961,7 +994,7 @@ function classifyRunError(run: ModelRun) {
   return "unknown";
 }
 
-function errorCategoryLabel(category: string) { return ({ auth: "鉴权失败", authentication: "鉴权失败", rate_limit: "限流", timeout: "超时", region: "区域限制", parse: "解析错误", dependency: "依赖故障", model_not_found: "模型不存在", unknown: "未知错误" } as Record<string, string>)[category] || category || "未知错误"; }
+function errorCategoryLabel(category: string) { return ({ auth: "鉴权失败", authentication: "鉴权失败", rate_limit: "限流", timeout: "超时", region: "区域限制", parse: "解析错误", malformed_response: "响应格式错误", upstream: "上游服务错误", dependency: "依赖故障", model_not_found: "模型不存在", unknown: "未知错误" } as Record<string, string>)[category] || category || "未知错误"; }
 
 function groupFailures(rows: ModelRun[]) {
   const grouped = new Map<string, number>();
@@ -1182,6 +1215,7 @@ function BatchTable({ batches }: { batches: SamplingBatch[] }) {
 }
 
 function RunsTable({ runs, onReview, focusedRunId = "" }: { runs: ModelRun[]; onReview?: (run: ModelRun) => void; focusedRunId?: string }) {
+  const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
   if (!runs.length) return <EmptyState title="暂无运行明细" />;
   return (
     <div className="data-table dense run-detail-table">
@@ -1203,30 +1237,73 @@ function RunsTable({ runs, onReview, focusedRunId = "" }: { runs: ModelRun[]; on
             <th>状态（内部信息）</th>
             <th>耗时（内部信息）</th>
             <th>错误信息（内部信息）</th>
+            <th>详情</th>
             {onReview ? <th>质检</th> : null}
           </tr>
         </thead>
         <tbody>
-          {runs.map((run) => (
-            <tr key={run.id} id={`run-${run.run_id || run.id}`} className={focusedRunId === String(run.run_id || run.id) ? "is-focused" : undefined}>
-              <td>{run.source_question_id || "-"}</td>
-              <td className="question-content-cell">{run.question || "-"}</td>
-              <td>{run.question_type || "-"}</td>
-              <td>{run.product_line || "-"}</td>
-              <td>{runPlatform(run)}</td>
-              <td className="answer-text-cell">{run.response_text || "-"}</td>
-              <td className="citation-source-cell">{citationUrls(run.citations_json) || "-"}</td>
-              <td>{formatDateTime(run.requested_at)}</td>
-              <td>{run.run_id || "-"}</td>
-              <td>{run.batch_id || "-"}</td>
-              <td>{runPlatform(run)}</td>
-              <td>{run.search_enabled ? "是" : "否"}</td>
-              <td>{run.status || "-"}</td>
-              <td>{run.latency_ms || 0} ms</td>
-              <td className="error-message-cell">{run.error_message || "-"}</td>
-              {onReview ? <td><button className="ghost" type="button" onClick={() => onReview(run)}><ClipboardCheck size={14} />标记</button></td> : null}
-            </tr>
-          ))}
+          {runs.map((run) => {
+            const runKey = String(run.run_id || run.id);
+            const detailId = `run-detail-${runKey}`;
+            const expanded = expandedRunIds.has(runKey);
+            const citations = citationUrlList(run.citations_json);
+            const toggleExpanded = () => setExpandedRunIds((current) => {
+              const next = new Set(current);
+              if (next.has(runKey)) next.delete(runKey);
+              else next.add(runKey);
+              return next;
+            });
+            return (
+              <Fragment key={run.id}>
+                <tr id={`run-${runKey}`} className={`run-summary-row ${focusedRunId === runKey ? "is-focused" : ""} ${expanded ? "is-expanded" : ""}`.trim()}>
+                  <td><div className="run-cell-clamp">{run.source_question_id || "-"}</div></td>
+                  <td className="question-content-cell"><div className="run-cell-clamp">{run.question || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{run.question_type || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{run.product_line || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{runPlatform(run)}</div></td>
+                  <td className="answer-text-cell"><div className="run-cell-clamp">{run.response_text || "-"}</div></td>
+                  <td className="citation-source-cell"><div className="run-cell-clamp">{citations.join("; ") || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{formatDateTime(run.requested_at)}</div></td>
+                  <td><div className="run-cell-clamp">{run.run_id || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{run.batch_id || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{runPlatform(run)}</div></td>
+                  <td><div className="run-cell-clamp">{run.search_enabled ? "是" : "否"}</div></td>
+                  <td><div className="run-cell-clamp">{run.status || "-"}</div></td>
+                  <td><div className="run-cell-clamp">{run.latency_ms || 0} ms</div></td>
+                  <td className="error-message-cell"><div className="run-cell-clamp">{run.error_message || "-"}</div></td>
+                  <td><button className="ghost run-detail-toggle" type="button" aria-expanded={expanded} aria-controls={detailId} onClick={toggleExpanded}>{expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}{expanded ? "收起" : "展开"}</button></td>
+                  {onReview ? <td><button className="ghost" type="button" onClick={() => onReview(run)}><ClipboardCheck size={14} />标记</button></td> : null}
+                </tr>
+                {expanded ? (
+                  <tr className="run-expanded-row">
+                    <td colSpan={onReview ? 17 : 16}>
+                      <section id={detailId} className="run-expanded-detail" aria-label={`${run.source_question_id || runKey} 运行详情`}>
+                        <div className="run-detail-copy">
+                          <article><h3>问题内容</h3><p>{run.question || "-"}</p></article>
+                          <article><h3>回答原文</h3><p>{run.response_text || "-"}</p></article>
+                        </div>
+                        <aside>
+                          <article>
+                            <h3>引用来源</h3>
+                            {citations.length ? <ol>{citations.map((url) => <li key={url}><a href={url} target="_blank" rel="noreferrer">{url}<ExternalLink size={12} /></a></li>)}</ol> : <p>暂无引用</p>}
+                          </article>
+                          <dl>
+                            <dt>运行 ID</dt><dd>{run.run_id || "-"}</dd>
+                            <dt>批次 ID</dt><dd>{run.batch_id || "-"}</dd>
+                            <dt>平台</dt><dd>{runPlatform(run)}</dd>
+                            <dt>状态</dt><dd>{run.status || "-"}</dd>
+                            <dt>耗时</dt><dd>{run.latency_ms || 0} ms</dd>
+                            <dt>测试时间</dt><dd>{formatDateTime(run.requested_at)}</dd>
+                          </dl>
+                          {run.error_message ? <article className="run-detail-error"><h3>错误信息</h3><p>{run.error_message}</p></article> : null}
+                        </aside>
+                      </section>
+                    </td>
+                  </tr>
+                ) : null}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>

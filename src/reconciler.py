@@ -34,7 +34,7 @@ def reconcile_once(
 ) -> dict[str, int]:
     stale_after_seconds = stale_after_seconds or int(os.environ.get("RECONCILER_STALE_SECONDS", "600"))
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(60, stale_after_seconds))).isoformat()
-    stats = {"outbox_delivered": 0, "outbox_failed": 0, "leases_requeued": 0, "task_events_created": 0, "attempts_uncertain": 0, "batches_recounted": 0}
+    stats = {"outbox_delivered": 0, "outbox_failed": 0, "leases_requeued": 0, "task_events_created": 0, "attempts_uncertain": 0, "batches_recounted": 0, "batches_completed": 0}
     with get_conn(db_target) as conn:
         upsert_worker_heartbeat(
             conn,
@@ -89,8 +89,10 @@ def reconcile_once(
             SELECT t.task_id, t.batch_id, t.attempt_count
             FROM sampling_tasks t
             JOIN sampling_batches b ON b.batch_id = t.batch_id
+            JOIN model_configs m ON m.id = t.model_config_id
             WHERE t.status = 'queued' AND COALESCE(t.rq_job_id, '') = ''
               AND b.status IN ('queued', 'running') AND b.archived_at IS NULL
+              AND m.provider <> 'deepseek_web'
             ORDER BY t.id ASC
             """
         ).fetchall()
@@ -110,7 +112,10 @@ def reconcile_once(
             if event.get("event_type") == "dispatch_sampling_task":
                 task = get_sampling_task(conn, str(event.get("aggregate_id") or ""))
                 batch = get_sampling_batch(conn, str((task or {}).get("batch_id") or ""))
-                dispatchable = bool(task and task.get("status") == "queued" and not task.get("rq_job_id"))
+                dispatchable = bool(
+                    task and task.get("provider") != "deepseek_web"
+                    and task.get("status") == "queued" and not task.get("rq_job_id")
+                )
             else:
                 batch = get_sampling_batch(conn, str(event.get("aggregate_id") or ""))
                 dispatchable = True
@@ -151,7 +156,14 @@ def reconcile_once(
                 "failed_count": counts["failed"] + counts["blocked"],
                 "updated_at": utc_now(),
             }
-            if any(int(batch.get(key, 0) or 0) != int(value) for key, value in desired.items() if key.endswith("_count")):
+            should_complete = (
+                batch.get("status") in {"queued", "running"}
+                and counts["completed"] >= counts["total"]
+            )
+            if should_complete:
+                desired.update({"status": "completed", "finished_at": utc_now(), "error_message": ""})
+            if should_complete or any(int(batch.get(key, 0) or 0) != int(value) for key, value in desired.items() if key.endswith("_count")):
                 update_sampling_batch(conn, batch["batch_id"], desired)
                 stats["batches_recounted"] += 1
+                stats["batches_completed"] += int(should_complete)
     return stats

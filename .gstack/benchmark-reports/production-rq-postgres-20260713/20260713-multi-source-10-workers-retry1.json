@@ -1,0 +1,65 @@
+{
+  "mode": "multi",
+  "retry_count": 1,
+  "batch_id": "load-multi-66e06d5d1b",
+  "project_id": 25,
+  "batch_status": "completed",
+  "task_statuses": {
+    "success": 10
+  },
+  "total": 10,
+  "success": 10,
+  "failed": 0,
+  "wall_seconds": 59.057,
+  "sum_provider_latency_seconds": 167.366,
+  "effective_parallelism": 2.83,
+  "max_running_tasks": 10,
+  "max_queue_depth": 0,
+  "max_provider_slots": {
+    "hunyuan": 2,
+    "qwen": 2,
+    "doubao": 2,
+    "openrouter": 2,
+    "openrouter_gemini": 2
+  },
+  "max_postgres_connections": 7,
+  "max_worker_rss_mb": 879.1,
+  "samples": 202,
+  "providers": {
+    "hunyuan": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 6072,
+      "errors": []
+    },
+    "qwen": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 15619,
+      "errors": []
+    },
+    "doubao": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 46008,
+      "errors": []
+    },
+    "openrouter_gpt": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 6849,
+      "errors": []
+    },
+    "openrouter_gemini": {
+      "total": 2,
+      "success": 2,
+      "failed": 0,
+      "avg_latency_ms": 9136,
+      "errors": []
+    }
+  }
+}

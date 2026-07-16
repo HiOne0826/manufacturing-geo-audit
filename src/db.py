@@ -57,6 +57,9 @@ class PostgresConnection:
     def commit(self) -> None:
         self._conn.commit()
 
+    def rollback(self) -> None:
+        self._conn.rollback()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -84,8 +87,22 @@ def json_db_value(conn, value: Any) -> Any:
             from psycopg.types.json import Jsonb
         except ImportError as exc:
             raise RuntimeError("缺少 PostgreSQL JSON 依赖，请先安装：python3 -m pip install -r requirements-worker.txt") from exc
-        return Jsonb(serializable)
+        return Jsonb(_sanitize_postgres_json(serializable))
     return json.dumps(serializable, ensure_ascii=False)
+
+
+def _sanitize_postgres_json(value: Any) -> Any:
+    """Remove NUL characters that PostgreSQL JSONB cannot store."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_sanitize_postgres_json(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key).replace("\x00", ""): _sanitize_postgres_json(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def parse_json_field(value: Any, fallback: Any) -> Any:
@@ -325,8 +342,8 @@ DEFAULT_MODEL_CONFIGS = [
         "daily_limit": 0,
         "supports_pure": 1,
         "supports_search": 1,
-        "web_search_mode": "腾讯云联网搜索 API SearchPro + hy3 生成",
-        "web_search_param_path": "wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY",
+        "web_search_mode": "TokenHub hy3 Function Calling → 腾讯云 SearchPro",
+        "web_search_param_path": "tools[].function.name=tencent_search_pro; assistant.tool_calls → wsa.tencentcloudapi.com SearchPro → role=tool",
         "supports_reasoning": 1,
         "reasoning_param_path": "按模型能力控制，当前预置仅记录能力",
         "reasoning_levels": "按模型能力",
@@ -337,7 +354,7 @@ DEFAULT_MODEL_CONFIGS = [
         "supports_user_location": 0,
         "supports_tool_calling": 1,
         "active": 1,
-        "notes": "腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。",
+        "notes": "腾讯元宝数据源走 TokenHub hy3；联网时由 hy3 原生 Function Calling 调用腾讯云 WSA SearchPro，只传原始用户问题，不附加 system prompt 或检索结果拼接提示词。",
     },
     {
         "provider": "kimi",
@@ -1005,11 +1022,11 @@ def sync_default_model_capabilities(conn: sqlite3.Connection) -> None:
         """
         UPDATE model_configs
         SET supports_search = 1,
-            web_search_mode = '腾讯云联网搜索 API SearchPro + hy3 生成',
-            web_search_param_path = 'wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY',
+            web_search_mode = 'TokenHub hy3 Function Calling → 腾讯云 SearchPro',
+            web_search_param_path = 'tools[].function.name=tencent_search_pro; assistant.tool_calls → wsa.tencentcloudapi.com SearchPro → role=tool',
             supports_citation = 1,
             citation_param_path = 'SearchPro Response.Pages[].url/title/passage/site',
-            notes = '腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。'
+            notes = '腾讯元宝数据源走 TokenHub hy3；联网时由 hy3 原生 Function Calling 调用腾讯云 WSA SearchPro，只传原始用户问题，不附加 system prompt 或检索结果拼接提示词。'
         WHERE provider = 'hunyuan'
         """
     )
@@ -1021,6 +1038,15 @@ def row_to_dict(row: Any | None) -> dict[str, Any] | None:
 
 def run_row_to_dict(row: Any) -> dict[str, Any]:
     item = dict(row)
+    item["citations_json"] = json_text_value(parse_json_field(item.get("citations_json"), []))
+    item["raw_response_json"] = json_text_value(parse_json_field(item.get("raw_response_json"), {}))
+    item.pop("import_row_json", None)
+    for field in (
+        "search_enabled", "is_current", "target_brand_mentioned",
+        "owned_site_cited", "third_party_cited",
+    ):
+        if field in item and item[field] is not None:
+            item[field] = bool(item[field])
     item["test_platform"] = test_platform_name(item.get("provider"), item.get("model"))
     return item
 
@@ -1236,7 +1262,7 @@ def _insert_question_row(
             pick("locale", "地区", default="zh-CN"),
             pick("priority", "优先级", default="medium"),
             pick("notes", "备注", default=""),
-            json_text_value(row),
+            json_db_value(conn, row),
             utc_now(),
         ),
     )
@@ -1841,26 +1867,18 @@ def ensure_sampling_task_dispatch_event(
     """
     suffix = dispatch_key.strip() or str(max(0, int(attempt_count or 0)))
     event_id = f"dispatch-task:{task_id}:{suffix}"
-    existing = conn.execute(
-        "SELECT status FROM dispatch_outbox WHERE event_id = ?",
-        (event_id,),
-    ).fetchone()
-    if existing:
-        return False
-    try:
-        create_outbox_event(
-            conn,
-            event_id,
-            "dispatch_sampling_task",
-            task_id,
-            {"task_id": task_id, "batch_id": batch_id},
-        )
-    except Exception:
-        # Another reconciler may have inserted the same deterministic event.
-        if conn.execute("SELECT 1 FROM dispatch_outbox WHERE event_id = ?", (event_id,)).fetchone():
-            return False
-        raise
-    return True
+    now = utc_now()
+    cursor = conn.execute(
+        """
+        INSERT INTO dispatch_outbox (
+            event_id, event_type, aggregate_id, payload_json, status,
+            attempt_count, available_at, delivered_at, last_error, created_at, updated_at
+        ) VALUES (?, 'dispatch_sampling_task', ?, ?, 'pending', 0, ?, NULL, '', ?, ?)
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        (event_id, task_id, json_db_value(conn, {"task_id": task_id, "batch_id": batch_id}), now, now, now),
+    )
+    return getattr(cursor, "rowcount", 0) == 1
 
 
 def mark_outbox_delivered(conn, event_id: str, claim_token: str = "") -> None:
@@ -2114,8 +2132,25 @@ def upsert_worker_heartbeat(
     )
 
 
+def _as_utc_datetime(value: Any) -> datetime | None:
+    """Normalize SQLite text and PostgreSQL timestamptz values for comparisons."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def list_worker_heartbeats(conn, *, stale_after_seconds: int = 60) -> list[dict[str, Any]]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_after_seconds))).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_after_seconds))
     rows = conn.execute(
         "SELECT * FROM worker_heartbeats ORDER BY queue_name, worker_id"
     ).fetchall()
@@ -2123,7 +2158,8 @@ def list_worker_heartbeats(conn, *, stale_after_seconds: int = 60) -> list[dict[
     for row in rows:
         item = dict(row)
         item["metadata"] = parse_json_field(item.pop("metadata_json", None), {})
-        item["stale"] = str(item.get("heartbeat_at") or "") < cutoff
+        heartbeat_at = _as_utc_datetime(item.get("heartbeat_at"))
+        item["stale"] = heartbeat_at is None or heartbeat_at < cutoff
         item["available"] = item.get("status") == "running" and not item["stale"]
         result.append(item)
     return result
@@ -2265,7 +2301,7 @@ def recent_sampling_task_error_codes(conn, batch_id: str, limit: int = 3) -> lis
         """
         SELECT status, error_code FROM sampling_tasks
         WHERE batch_id = ? AND status IN ('success', 'failed', 'blocked')
-        ORDER BY finished_at DESC, id DESC
+        ORDER BY (finished_at IS NULL) ASC, finished_at DESC, id DESC
         LIMIT ?
         """,
         (batch_id, limit),
@@ -2315,7 +2351,7 @@ def refresh_current_run_flags(conn: sqlite3.Connection, batch_id: str | None = N
     if current_ids:
         placeholders = ",".join("?" for _ in current_ids)
         conn.execute(
-            f"UPDATE model_runs SET is_current = 1, superseded_at = '' WHERE id IN ({placeholders})",
+            f"UPDATE model_runs SET is_current = 1, superseded_at = NULL WHERE id IN ({placeholders})",
             tuple(current_ids),
         )
     return {"total": len(rows), "current": len(current_ids), "historical": len(rows) - len(current_ids)}
@@ -2512,7 +2548,7 @@ def list_runs(conn: sqlite3.Connection, project_id: int, limit: int = 200, inclu
         """,
         (project_id, limit),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [run_row_to_dict(row) for row in rows]
 
 
 def analytics(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:

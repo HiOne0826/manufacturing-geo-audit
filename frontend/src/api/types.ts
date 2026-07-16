@@ -8,7 +8,7 @@ export type Project = {
   website_domain?: string;
   competitors?: string;
   notes?: string;
-  created_at?: string;
+  created_at?: string | null;
   archived_at?: string | null;
   question_count?: number;
   run_count?: number;
@@ -110,11 +110,11 @@ export type SamplingBatch = {
   success?: number;
   failed?: number;
   error?: string;
-  created_at?: string;
-  started_at?: string;
-  finished_at?: string;
+  created_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
   archived_at?: string | null;
-  updated_at?: string;
+  updated_at?: string | null;
   task_queue_backend?: string;
   job_id?: string;
   source_statuses?: SourceRunStatus[];
@@ -153,7 +153,7 @@ export type ModelRun = {
   reasoning_effort?: string;
   thinking_budget?: number;
   latency_ms?: number;
-  requested_at?: string;
+  requested_at?: string | null;
   question?: string;
   question_type?: string;
   product_category?: string;
@@ -164,7 +164,7 @@ export type ModelRun = {
   suggested_platforms?: string;
   target_brand_mentioned?: boolean;
   recommendation_strength?: string;
-  citations_json?: string;
+  citations_json?: string | Citation[];
   response_text?: string;
   error_message?: string;
   error_category?: string;
@@ -179,9 +179,17 @@ export type ModelRun = {
   actual_model?: string;
   mode?: string;
   is_current?: boolean;
-  started_at?: string;
-  finished_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
   cost_estimate?: number;
+};
+
+export type Citation = {
+  url?: string;
+  link?: string;
+  uri?: string;
+  title?: string;
+  [key: string]: unknown;
 };
 
 export type QualityDecision = "valid" | "excluded" | "needs_review";

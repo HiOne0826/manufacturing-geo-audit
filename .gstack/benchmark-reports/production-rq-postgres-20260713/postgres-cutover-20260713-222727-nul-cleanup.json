@@ -1,0 +1,162 @@
+{
+  "created_at": "2026-07-13T22:27:43.749742+08:00",
+  "source_sqlite": "/opt/manufacturing-geo-audit/data/geo_audit.db",
+  "source_sha256_before": "649d2c01a47dfc764682f9c319552997f1660bb73bc38756ab8715c0c091ee99",
+  "source_sha256_after": "649d2c01a47dfc764682f9c319552997f1660bb73bc38756ab8715c0c091ee99",
+  "source_unchanged": true,
+  "cleanup_scope": "PostgreSQL copy JSON/JSONB only",
+  "nul_affected_rows": [
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-f141a77210174071aaca63a7eb1b67b5",
+      "batch_id": "batch-f7ff014cd5",
+      "id": 3523
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-7a2f183e5acb4ec79594737533df0eaf",
+      "batch_id": "batch-7abd578d6c",
+      "id": 3941
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-b6ec36a4aab54d7d874ab5a72c8db6f6",
+      "batch_id": "batch-fca5087dfe",
+      "id": 4759
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-85dbcb93057c4c888b6f0432613069b5",
+      "batch_id": "batch-fca5087dfe",
+      "id": 4818
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-aefa5b51ee6e4843809ca8978760c463",
+      "batch_id": "batch-fca5087dfe",
+      "id": 4819
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-71f42617b3c84137944e0598ec52d9ea",
+      "batch_id": "batch-cb95b8703d",
+      "id": 5620
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-4476771383f0439083a4047564a115f3",
+      "batch_id": "batch-940bdea2b6",
+      "id": 5795
+    },
+    {
+      "table": "model_runs",
+      "columns": [
+        "raw_response_json"
+      ],
+      "run_id": "run-55750774007e4dbd9a95d4a4147a9ab9",
+      "batch_id": "batch-940bdea2b6",
+      "id": 5796
+    }
+  ],
+  "affected_run_ids": [
+    "run-4476771383f0439083a4047564a115f3",
+    "run-55750774007e4dbd9a95d4a4147a9ab9",
+    "run-71f42617b3c84137944e0598ec52d9ea",
+    "run-7a2f183e5acb4ec79594737533df0eaf",
+    "run-85dbcb93057c4c888b6f0432613069b5",
+    "run-aefa5b51ee6e4843809ca8978760c463",
+    "run-b6ec36a4aab54d7d874ab5a72c8db6f6",
+    "run-f141a77210174071aaca63a7eb1b67b5"
+  ],
+  "table_counts": {
+    "projects": {
+      "sqlite": 5,
+      "postgres": 5
+    },
+    "model_configs": {
+      "sqlite": 12,
+      "postgres": 12
+    },
+    "questions": {
+      "sqlite": 312,
+      "postgres": 312
+    },
+    "sampling_batches": {
+      "sqlite": 18,
+      "postgres": 18
+    },
+    "model_runs": {
+      "sqlite": 4259,
+      "postgres": 4259
+    },
+    "sampling_tasks": {
+      "sqlite": 490,
+      "postgres": 490
+    },
+    "answer_evaluations": {
+      "sqlite": 3755,
+      "postgres": 3755
+    },
+    "execution_attempts": {
+      "sqlite": 332,
+      "postgres": 332
+    },
+    "dispatch_outbox": {
+      "sqlite": 68,
+      "postgres": 68
+    },
+    "worker_heartbeats": {
+      "sqlite": 19,
+      "postgres": 19
+    },
+    "provider_health": {
+      "sqlite": 6,
+      "postgres": 6
+    },
+    "provider_health_scopes": {
+      "sqlite": 6,
+      "postgres": 6
+    },
+    "provider_health_events": {
+      "sqlite": 331,
+      "postgres": 331
+    },
+    "report_versions": {
+      "sqlite": 0,
+      "postgres": 0
+    },
+    "run_review_events": {
+      "sqlite": 0,
+      "postgres": 0
+    },
+    "operation_audit_log": {
+      "sqlite": 19,
+      "postgres": 19
+    },
+    "schema_migrations": {
+      "sqlite": 6,
+      "postgres": 6
+    }
+  }
+}

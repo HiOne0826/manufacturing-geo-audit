@@ -29,7 +29,7 @@ class MigrationRunnerTests(unittest.TestCase):
     def test_status_does_not_create_tracking_table(self) -> None:
         status = MigrationRunner(self.conn, "sqlite").status()
         self.assertEqual(status["current_version"], 0)
-        self.assertEqual([item["version"] for item in status["pending"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([item["version"] for item in status["pending"]], [item.version for item in MIGRATIONS])
         table = self.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'schema_migrations'").fetchone()
         self.assertIsNone(table)
 
@@ -37,11 +37,11 @@ class MigrationRunnerTests(unittest.TestCase):
         runner = MigrationRunner(self.conn, "sqlite")
         first = runner.apply()
         second = runner.apply()
-        self.assertEqual([item["version"] for item in first["applied"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([item["version"] for item in first["applied"]], [item.version for item in MIGRATIONS])
         self.assertEqual(second["applied"], [])
         self.assertTrue(second["status"]["up_to_date"])
         count = self.conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-        self.assertEqual(count, 6)
+        self.assertEqual(count, len(MIGRATIONS))
         delivery_tables = {
             row[0]
             for row in self.conn.execute(
@@ -64,7 +64,7 @@ class MigrationRunnerTests(unittest.TestCase):
         self.assertIsNone(self.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'schema_migrations'").fetchone())
 
     def test_failed_migration_rolls_back_schema_and_version(self) -> None:
-        broken = Migration(7, "broken", ("CREATE TABLE transient_table (id INTEGER)", "INVALID SQL"), ("SELECT 1",))
+        broken = Migration(max(item.version for item in MIGRATIONS) + 1, "broken", ("CREATE TABLE transient_table (id INTEGER)", "INVALID SQL"), ("SELECT 1",))
         runner = MigrationRunner(self.conn, "sqlite", (*MIGRATIONS, broken))
         with self.assertRaises(sqlite3.Error):
             runner.apply()
@@ -94,6 +94,22 @@ class MigrationRunnerTests(unittest.TestCase):
         migration = MIGRATIONS[1]
         self.assertTrue(any("CREATE TABLE IF NOT EXISTS report_versions" in sql for sql in migration.statements("postgres")))
         self.assertIn("%s", MigrationRunner(self.conn, "postgres")._markers(2))
+
+    def test_postgres_contract_migration_adds_columns_before_current_run_index(self) -> None:
+        migration = next(item for item in MIGRATIONS if item.name == "postgres_schema_contract_compat")
+        statements = migration.statements("postgres")
+        add_column_index = next(i for i, sql in enumerate(statements) if "model_config_id BIGINT" in sql)
+        create_index_index = next(i for i, sql in enumerate(statements) if "idx_model_runs_one_current" in sql)
+        self.assertLess(add_column_index, create_index_index)
+        self.assertTrue(any("import_row_json JSONB" in sql for sql in statements))
+        self.assertTrue(any("task_snapshot_json JSONB" in sql for sql in statements))
+
+    def test_provider_health_type_alignment_migrates_legacy_text_columns(self) -> None:
+        migration = next(item for item in MIGRATIONS if item.name == "provider_health_type_alignment")
+        statements = migration.statements("postgres")
+        self.assertTrue(any("scope_json TYPE JSONB" in sql for sql in statements))
+        self.assertTrue(any("half_open_trial_until TYPE TIMESTAMPTZ" in sql for sql in statements))
+        self.assertTrue(any("observed_at TYPE TIMESTAMPTZ" in sql for sql in statements))
 
     def test_legacy_duplicate_active_batches_are_preserved_and_reconciled_idempotently(self) -> None:
         self.conn.executescript(

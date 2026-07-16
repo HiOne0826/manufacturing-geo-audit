@@ -1,13 +1,79 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import ensure_sampling_task_dispatch_event, get_conn, get_project, get_sampling_batch, get_sampling_task, list_failed_runs_by_batch, list_runs_by_batch, reset_resumable_sampling_tasks, update_sampling_batch, update_sampling_batch_cas, update_sampling_task, utc_now
+from .db import _as_utc_datetime, ensure_sampling_task_dispatch_event, get_conn, get_project, get_sampling_batch, get_sampling_task, list_failed_runs_by_batch, list_runs_by_batch, reset_resumable_sampling_tasks, update_sampling_batch, update_sampling_batch_cas, update_sampling_task, utc_now
 from .runner import build_missing_tasks_for_batch, estimate_batch_total, execute_sampling_task, prepare_batch_ledger, provider_concurrency_group, provider_concurrency_limits, rerun_failed_runs, restore_task_snapshot, retry_count, run_batch, run_prepared_tasks
 
 
 ProgressHook = Callable[[dict[str, Any]], None]
+
+
+class ActiveTaskLeaseError(ValueError):
+    """A rerun request must not steal work from a live worker."""
+
+
+def _uses_rq_backend() -> bool:
+    return os.environ.get("TASK_QUEUE_BACKEND", "inline").strip().lower() == "rq"
+
+
+def _queue_rerun_tasks(conn, batch_id: str, runs: list[dict[str, Any]]) -> int:
+    queued = 0
+    missing: list[str] = []
+    for run in runs:
+        row = conn.execute(
+            """
+            SELECT a.task_id, t.status, t.attempt_count, t.rq_job_id, t.lease_expires_at
+            FROM execution_attempts a
+            JOIN sampling_tasks t ON t.task_id = a.task_id
+            WHERE a.run_id = ? AND a.task_id <> ''
+            ORDER BY a.id DESC LIMIT 1
+            """,
+            (run.get("run_id", ""),),
+        ).fetchone()
+        if not row:
+            missing.append(str(run.get("run_id") or run.get("id") or "unknown"))
+            continue
+        task = dict(row)
+        lease_expires_at = _as_utc_datetime(task.get("lease_expires_at"))
+        if task.get("status") == "running" and lease_expires_at and lease_expires_at >= datetime.now(timezone.utc):
+            raise ActiveTaskLeaseError(f"任务仍由有效 worker 租约执行，拒绝抢占重跑：{task['task_id']}")
+        dispatch_key = f"rerun-{run.get('run_id') or run.get('id')}"
+        event_id = f"dispatch-task:{task['task_id']}:{dispatch_key}"
+        existing_event = conn.execute(
+            "SELECT status FROM dispatch_outbox WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if existing_event and str(existing_event["status"]) != "delivered" and task.get("status") in {"queued", "running"}:
+            queued += 1
+            continue
+        if existing_event and str(existing_event["status"]) == "delivered":
+            dispatch_key = f"{dispatch_key}-{int(task.get('attempt_count') or 0) + 1}"
+        task_id = str(task["task_id"])
+        update_sampling_task(
+            conn,
+            task_id,
+            {
+                "status": "queued", "rq_job_id": "", "lease_owner": "",
+                "lease_expires_at": None, "heartbeat_at": None,
+                "error_code": "", "error_message": "", "finished_at": None,
+                "updated_at": utc_now(),
+            },
+        )
+        ensure_sampling_task_dispatch_event(
+            conn,
+            task_id,
+            batch_id,
+            int(task.get("attempt_count") or 0),
+            dispatch_key,
+        )
+        queued += 1
+    if missing:
+        raise ValueError(f"无法将 {len(missing)} 条重跑记录映射到持久化采样任务")
+    return queued
 
 
 def perform_sampling_task(task_id: str, db_target: Path | str | None = None) -> dict[str, Any]:
@@ -23,6 +89,11 @@ def perform_sampling_task(task_id: str, db_target: Path | str | None = None) -> 
             raise ValueError("批次不存在")
         if batch.get("status") in {"pause_requested", "paused", "cancelled", "completed"}:
             return {"task_id": task_id, "status": "skipped", "batch_status": batch.get("status")}
+        if ledger.get("provider") == "deepseek_web":
+            # Web tasks are owned by deepseek_web_worker.py. A stale main-queue
+            # job must be harmless and must not interpret the web snapshot as
+            # an API sampling task.
+            return {"task_id": task_id, "status": "skipped", "reason": "wrong_worker"}
         if batch.get("status") == "queued":
             update_sampling_batch_cas(conn, batch["batch_id"], {"queued"}, {"status": "running", "started_at": utc_now(), "updated_at": utc_now()})
             batch = get_sampling_batch(conn, batch["batch_id"]) or batch
@@ -48,19 +119,24 @@ def perform_sampling_task(task_id: str, db_target: Path | str | None = None) -> 
     )
     with get_conn(db_target) as conn:
         counts = sampling_task_counts(conn, batch["batch_id"])
-        current = get_sampling_batch(conn, batch["batch_id"]) or batch
-        status = "completed" if counts["completed"] >= counts["total"] else "pause_requested" if current.get("status") == "pause_requested" else "running"
-        update_sampling_batch_cas(
-            conn,
-            batch["batch_id"],
-            {str(current.get("status") or "running")},
-            {
-                "status": status,
-                "total_count": counts["total"], "completed_count": counts["completed"],
-                "success_count": counts["success"], "failed_count": counts["failed"] + counts["blocked"],
-                "finished_at": utc_now() if status == "completed" else None, "updated_at": utc_now(),
-            },
-        )
+        # Concurrent task completions can race on lock_version. Re-read and
+        # retry a bounded number of times so the final task reliably persists
+        # the completed terminal state instead of silently leaving running.
+        for _ in range(3):
+            current = get_sampling_batch(conn, batch["batch_id"]) or batch
+            status = "completed" if counts["total"] and counts["completed"] >= counts["total"] else "pause_requested" if current.get("status") == "pause_requested" else "running"
+            if update_sampling_batch_cas(
+                conn,
+                batch["batch_id"],
+                {str(current.get("status") or "running")},
+                {
+                    "status": status,
+                    "total_count": counts["total"], "completed_count": counts["completed"],
+                    "success_count": counts["success"], "failed_count": counts["failed"] + counts["blocked"],
+                    "finished_at": utc_now() if status == "completed" else None, "updated_at": utc_now(),
+                },
+            ):
+                break
     return result
 
 
@@ -330,7 +406,8 @@ def perform_rerun_failed(
                     "success": int((batch or {}).get("success_count", 0) or 0),
                     "status": (batch or {}).get("status", "completed"),
                 }
-            reset_resumable_sampling_tasks(conn, batch_id)
+            if not _uses_rq_backend():
+                reset_resumable_sampling_tasks(conn, batch_id)
             update_sampling_batch(
                 conn,
                 batch_id,
@@ -347,6 +424,27 @@ def perform_rerun_failed(
                 },
             )
             conn.commit()
+            if _uses_rq_backend():
+                queued = _queue_rerun_tasks(conn, batch_id, failed_runs)
+                full_counts = _full_batch_counts(conn, batch_id)
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": "running", "total_count": full_counts["total"],
+                        "completed_count": full_counts["success"],
+                        "failed_count": full_counts["failed"], "success_count": full_counts["success"],
+                        "finished_at": None, "updated_at": utc_now(),
+                    },
+                )
+                conn.commit()
+                result = {
+                    "batch_id": batch_id, "total": len(failed_runs), "queued": queued,
+                    "failed": full_counts["failed"], "success": full_counts["success"], "status": "running",
+                }
+                if progress_hook:
+                    progress_hook(result)
+                return result
             result = rerun_failed_runs(conn, batch_id, failed_runs, payload)
             full_counts = _full_batch_counts(conn, batch_id)
             update_sampling_batch(
@@ -365,6 +463,8 @@ def perform_rerun_failed(
         if progress_hook:
             progress_hook({"batch_id": batch_id, **result})
         return result
+    except ActiveTaskLeaseError:
+        raise
     except Exception as exc:
         mark_batch_failed(batch_id, str(exc), db_target=db_target)
         raise
@@ -405,17 +505,18 @@ def perform_rerun_runs(
                 f"SELECT DISTINCT task_id FROM execution_attempts WHERE run_id IN ({attempt_placeholders}) AND task_id <> ''",
                 selected_run_ids,
             ).fetchall()
-            for task_row in task_rows:
-                update_sampling_task(
-                    conn,
-                    str(task_row["task_id"]),
-                    {
-                        "status": "queued", "rq_job_id": "", "lease_owner": "",
-                        "lease_expires_at": None, "heartbeat_at": None,
-                        "error_code": "", "error_message": "", "finished_at": None,
-                        "updated_at": utc_now(),
-                    },
-                )
+            if not _uses_rq_backend():
+                for task_row in task_rows:
+                    update_sampling_task(
+                        conn,
+                        str(task_row["task_id"]),
+                        {
+                            "status": "queued", "rq_job_id": "", "lease_owner": "",
+                            "lease_expires_at": None, "heartbeat_at": None,
+                            "error_code": "", "error_message": "", "finished_at": None,
+                            "updated_at": utc_now(),
+                        },
+                    )
             counts = _full_batch_counts(conn, batch_id)
             update_sampling_batch(
                 conn,
@@ -432,6 +533,24 @@ def perform_rerun_runs(
                 },
             )
             conn.commit()
+            if _uses_rq_backend():
+                queued = _queue_rerun_tasks(conn, batch_id, runs)
+                full_counts = _full_batch_counts(conn, batch_id)
+                update_sampling_batch(
+                    conn,
+                    batch_id,
+                    {
+                        "status": "running", "total_count": full_counts["total"],
+                        "completed_count": max(0, int(full_counts["completed"]) - len(runs)),
+                        "failed_count": full_counts["failed"], "success_count": full_counts["success"],
+                        "finished_at": None, "updated_at": utc_now(),
+                    },
+                )
+                conn.commit()
+                return {
+                    "batch_id": batch_id, "total": len(runs), "queued": queued,
+                    "failed": full_counts["failed"], "success": full_counts["success"], "status": "running",
+                }
             result = rerun_failed_runs(conn, batch_id, runs, payload)
             full_counts = _full_batch_counts(conn, batch_id)
             update_sampling_batch(
@@ -449,6 +568,8 @@ def perform_rerun_runs(
             )
             conn.commit()
         return {**result, "status": full_counts["status"]}
+    except ActiveTaskLeaseError:
+        raise
     except Exception as exc:
         mark_batch_failed(batch_id, str(exc), db_target=db_target)
         raise

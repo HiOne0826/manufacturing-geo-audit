@@ -80,7 +80,7 @@ PROVIDER_SAMPLING_DEFAULTS: dict[str, dict[str, Any]] = {
         "temperature": None,
         "reasoning_effort": "",
         "search_mode": "force",
-        "defaults_note": "腾讯元宝/混元：不传 temperature，使用腾讯官方模型推荐默认值；联网搜索使用腾讯官方 WSA SearchPro，再把搜索结果作为引用材料交给 hy3 生成。",
+        "defaults_note": "腾讯元宝/混元：不传 temperature，使用腾讯官方模型推荐默认值；联网搜索由 TokenHub hy3 通过 Function Calling 调用腾讯云 WSA SearchPro，不附加提示词。",
     },
     "kimi": {
         "temperature": 0.6,
@@ -337,8 +337,8 @@ PROVIDER_PRESETS = {
         "api_base": "https://api.hunyuan.cloud.tencent.com/v1",
         "supports_pure": True,
         "supports_search": True,
-        "web_search_mode": "腾讯云联网搜索 API SearchPro + hy3 生成",
-        "web_search_param_path": "wsa.tencentcloudapi.com; Action=SearchPro; Query/Mode/Site/Freshness/Cnt; TENCENT_SEARCH_SECRET_ID/TENCENT_SEARCH_SECRET_KEY",
+        "web_search_mode": "TokenHub hy3 Function Calling → 腾讯云 SearchPro",
+        "web_search_param_path": "tools[].function.name=tencent_search_pro; assistant.tool_calls → wsa.tencentcloudapi.com SearchPro → role=tool",
         "supports_reasoning": True,
         "reasoning_param_path": "按模型能力控制，当前预置仅记录能力",
         "reasoning_levels": "按模型能力",
@@ -348,7 +348,7 @@ PROVIDER_PRESETS = {
         "supports_time_filter": True,
         "supports_user_location": False,
         "supports_tool_calling": True,
-        "notes": "腾讯元宝数据源当前走 TokenHub hy3 生成；联网搜索使用腾讯官方 WSA SearchPro，引用来自 SearchPro Pages。",
+        "notes": "腾讯元宝数据源走 TokenHub hy3；联网时由 hy3 原生 Function Calling 调用腾讯云 WSA SearchPro，只传原始用户问题，不附加 system prompt 或检索结果拼接提示词。",
     },
     "kimi": {
         "label": "Kimi",
@@ -594,6 +594,21 @@ def extract_openai_response_citations(data: dict[str, Any]) -> list[dict[str, st
     return dedupe_citations(citations)
 
 
+def has_openai_web_search_call(data: dict[str, Any]) -> bool:
+    return any(
+        isinstance(item, dict) and item.get("type") == "web_search_call"
+        for item in data.get("output") or []
+    )
+
+
+def has_valid_http_citation(citations: list[dict[str, str]]) -> bool:
+    for citation in citations:
+        parsed = urllib.parse.urlsplit(str(citation.get("url") or "").strip())
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return True
+    return False
+
+
 def extract_generic_citations(data: dict[str, Any]) -> list[dict[str, str]]:
     citations: list[dict[str, str]] = []
     for item in data.get("citations") or data.get("search_results") or []:
@@ -741,31 +756,255 @@ def tencent_search_citations(results: list[dict[str, str]]) -> list[dict[str, st
     )
 
 
-def build_tencent_augmented_question(question: str, results: list[dict[str, str]]) -> str:
-    source_blocks = []
-    for idx, item in enumerate(results, start=1):
-        parts = [
-            f"[{idx}] 标题: {item.get('title') or '-'}",
-            f"URL: {item.get('url') or '-'}",
-        ]
-        if item.get("site"):
-            parts.append(f"站点: {item['site']}")
-        if item.get("date"):
-            parts.append(f"日期: {item['date']}")
-        parts.append(f"摘要: {item.get('description') or '-'}")
-        source_blocks.append("\n".join(parts))
-    return (
-        "你是制造业品牌 GEO 审计助手。\n"
-        "以下是腾讯云联网搜索 API SearchPro 返回的公开网页检索结果。请只基于这些资料回答用户问题。\n"
-        "如果资料不足，请明确说明“检索结果不足以判断”。\n\n"
-        "要求：\n"
-        "1. 客观回答，不要编造未出现在资料中的事实。\n"
-        "2. 涉及品牌、厂家、产品能力时尽量引用来源编号，例如 [1]。\n"
-        "3. 不要声称你自己进行了联网搜索；信息来源是下方腾讯云 SearchPro 结果。\n\n"
-        f"用户问题：\n{question}\n\n"
-        "腾讯云 SearchPro 结果：\n"
-        + "\n\n".join(source_blocks)
+TENCENT_SEARCH_TOOL_NAME = "tencent_search_pro"
+HUNYUAN_TOOL_PROTOCOL_PREFIXES = ("<tool_calls:", "<tool_call:")
+
+
+def is_hunyuan_tool_protocol_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.lstrip().lower().startswith(HUNYUAN_TOOL_PROTOCOL_PREFIXES)
+
+
+def hunyuan_tool_queries(arguments: Any, fallback_question: str = "") -> list[str]:
+    if not isinstance(arguments, dict):
+        return []
+    queries: list[str] = []
+    direct_query = str(arguments.get("query") or "").strip()
+    if direct_query:
+        queries.append(direct_query)
+    for nested_call in arguments.get("tool_calls") or []:
+        if not isinstance(nested_call, dict) or nested_call.get("name") not in {None, "", TENCENT_SEARCH_TOOL_NAME}:
+            continue
+        nested_arguments = nested_call.get("arguments") or {}
+        if isinstance(nested_arguments, str):
+            try:
+                nested_arguments = json.loads(nested_arguments)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(nested_arguments, dict):
+            nested_query = str(nested_arguments.get("query") or "").strip()
+            if nested_query:
+                queries.append(nested_query)
+    if not queries and fallback_question.strip():
+        queries.append(fallback_question.strip())
+    return list(dict.fromkeys(queries))
+
+
+def hunyuan_private_tool_queries(value: Any) -> list[str]:
+    if not is_hunyuan_tool_protocol_text(value):
+        return []
+    return hunyuan_text_queries(str(value))
+
+
+def hunyuan_text_queries(text: str) -> list[str]:
+    queries = [item.strip() for item in re.findall(r'"query"\s*:\s*"([^"\r\n]+)', text) if item.strip()]
+    queries.extend(
+        item.strip()
+        for item in re.findall(r"<arg_value:[^>]+>\s*([^<\r\n]+)", text)
+        if item.strip()
     )
+    return list(dict.fromkeys(queries))
+
+
+def parse_hunyuan_tool_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        queries = hunyuan_text_queries(text)
+        if not queries:
+            raise
+        return {
+            "tool_calls": [
+                {"name": TENCENT_SEARCH_TOOL_NAME, "arguments": {"query": query}}
+                for query in queries
+            ],
+            "raw_arguments": text,
+        }
+    if not isinstance(parsed, dict):
+        raise ValueError("tool arguments must be an object")
+    return parsed
+
+
+def tencent_search_tool_definition() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": TENCENT_SEARCH_TOOL_NAME,
+            "description": "调用腾讯云 SearchPro 检索公开网页，获取回答用户问题所需的最新或可验证资料。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "适合网页搜索的精确检索词"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def execute_tencent_search_tool(arguments: Any, options: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise AdapterError("腾讯混元返回的 SearchPro 工具参数不是 JSON 对象。", retryable=True)
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise AdapterError("腾讯混元返回的 SearchPro 工具参数缺少 query。", retryable=True)
+    return tencent_search_request(query, options)
+
+
+def hunyuan_search_tool_request(
+    base: str,
+    api_key: str,
+    model: str,
+    question: str,
+    temperature: float | None,
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
+    rounds: list[dict[str, Any]] = []
+    tool_audit: list[dict[str, Any]] = []
+    citations: list[dict[str, str]] = []
+    usage: dict[str, int] = {}
+    tool = tencent_search_tool_definition()
+
+    for round_index in range(4):
+        payload = build_hunyuan_chat_payload(model, question, temperature, options)
+        payload["messages"] = deepcopy(messages)
+        payload["tools"] = [tool]
+        payload["tool_choice"] = (
+            {"type": "function", "function": {"name": TENCENT_SEARCH_TOOL_NAME}}
+            if round_index == 0
+            else "none"
+        )
+        data = post_json(
+            f"{normalize_base(base)}/chat/completions",
+            {"Authorization": f"Bearer {api_key}"},
+            payload,
+        )
+        rounds.append(data)
+        for key, value in (data.get("usage") or {}).items():
+            if isinstance(value, int):
+                usage[key] = usage.get(key, 0) + value
+
+        choices = data.get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        tool_calls = message.get("tool_calls") or []
+        response_text = normalize_choice_text(data)
+        private_queries = hunyuan_private_tool_queries(response_text)
+        if not tool_calls and not private_queries:
+            if round_index == 0:
+                raise AdapterError(
+                    "腾讯混元未按要求发起 SearchPro 工具调用。",
+                    retryable=True,
+                    raw_response=data,
+                )
+            if not response_text.strip():
+                raise AdapterError(
+                    "腾讯混元完成 SearchPro 工具调用后未返回最终回答。",
+                    retryable=True,
+                    raw_response=data,
+                )
+            return {
+                "response_text": response_text,
+                "citations": dedupe_citations(citations),
+                "usage": usage,
+                "raw_response": {
+                    "tool_mode": "hunyuan_function_calling",
+                    "hunyuan_rounds": rounds,
+                    "tencent_search_tool_calls": tool_audit,
+                    "messages": messages + [
+                        {key: value for key, value in message.items() if key in {"role", "content"}}
+                    ],
+                },
+                "returned_model": data.get("model", model),
+            }
+
+        if private_queries:
+            private_call_id = f"tokenhub-private-{round_index}-{hashlib.sha256(response_text.encode()).hexdigest()[:12]}"
+            tool_calls = [{
+                "id": private_call_id,
+                "type": "function",
+                "function": {
+                    "name": TENCENT_SEARCH_TOOL_NAME,
+                    "arguments": json.dumps({"tool_calls": [
+                        {"name": TENCENT_SEARCH_TOOL_NAME, "arguments": {"query": query}}
+                        for query in private_queries
+                    ]}, ensure_ascii=False),
+                },
+            }]
+            assistant_message = {"role": "assistant", "content": "", "tool_calls": deepcopy(tool_calls)}
+        else:
+            assistant_message = {
+                key: deepcopy(value)
+                for key, value in message.items()
+                if key in {"role", "content", "tool_calls", "reasoning_content"}
+            }
+            assistant_message.setdefault("role", "assistant")
+        messages.append(assistant_message)
+        for tool_call_index, tool_call in enumerate(tool_calls):
+            function = tool_call.get("function") or {}
+            if function.get("name") != TENCENT_SEARCH_TOOL_NAME:
+                raise AdapterError(f"腾讯混元请求了不受支持的工具：{function.get('name') or '-'}", retryable=True)
+            try:
+                arguments = parse_hunyuan_tool_arguments(function.get("arguments"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AdapterError("腾讯混元返回的 SearchPro 工具参数不是有效 JSON。", retryable=True) from exc
+            queries = hunyuan_tool_queries(arguments, question)
+            if not queries:
+                raise AdapterError("腾讯混元返回的 SearchPro 工具参数缺少 query。", retryable=True)
+            if isinstance(arguments, dict) and not arguments.get("query") and not arguments.get("tool_calls"):
+                arguments = {**arguments, "query": queries[0]}
+            assistant_tool_calls = assistant_message.get("tool_calls") or []
+            if tool_call_index < len(assistant_tool_calls):
+                assistant_function = assistant_tool_calls[tool_call_index].setdefault("function", {})
+                assistant_function["arguments"] = json.dumps(
+                    {"query": queries[0]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            search_requests = []
+            results = []
+            for query in queries:
+                try:
+                    search_payload = execute_tencent_search_tool({"query": query}, options)
+                except AdapterError as exc:
+                    raise AdapterError(f"腾讯混元调用腾讯云 SearchPro 失败：{exc}", retryable=exc.retryable) from exc
+                results.extend(search_payload["results"])
+                search_requests.append({
+                    "query": query,
+                    "results": search_payload["results"],
+                    "raw_response": search_payload["raw_response"],
+                })
+            results = list({item.get("url") or json.dumps(item, sort_keys=True): item for item in results}.values())
+            citations.extend(tencent_search_citations(results))
+            tool_call_id = str(tool_call.get("id") or "").strip()
+            if not tool_call_id:
+                raise AdapterError("腾讯混元工具调用缺少 tool_call_id。", retryable=True)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"queries": queries, "results": results}, ensure_ascii=False),
+                }
+            )
+            tool_audit.append(
+                {
+                    "tool_call_id": tool_call_id,
+                    "name": TENCENT_SEARCH_TOOL_NAME,
+                    "arguments": arguments,
+                    "queries": queries,
+                    "results": results,
+                    "search_requests": search_requests,
+                }
+            )
+
+    raise AdapterError("腾讯混元 SearchPro 工具调用未正常结束。", retryable=True)
 
 
 def extract_qwen_citations(data: dict[str, Any]) -> list[dict[str, str]]:
@@ -997,7 +1236,6 @@ def build_openai_responses_payload(model: str, question: str, options: dict[str,
     payload: dict[str, Any] = {
         "model": model,
         "input": question,
-        "instructions": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。",
     }
     if openai_model_supports_reasoning(model):
         reasoning_effort = options["reasoning_effort"]
@@ -1018,10 +1256,7 @@ def openai_model_supports_reasoning(model: str) -> bool:
 def build_openai_chat_payload(model: str, question: str, temperature: float | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。"},
-            {"role": "user", "content": question},
-        ],
+        "messages": [{"role": "user", "content": question}],
     }
     if temperature is not None:
         payload["temperature"] = temperature
@@ -1261,8 +1496,6 @@ def build_qwen_chat_payload(
             search_options["assigned_site_list"] = [
                 item.strip() for item in options["search_site_filter"].split(",") if item.strip()
             ]
-        if options["search_prompt_intervene"]:
-            search_options["intention_options"] = {"prompt_intervene": options["search_prompt_intervene"]}
         if options["search_citation_format"]:
             search_options["citation_format"] = options["search_citation_format"]
         else:
@@ -1312,6 +1545,10 @@ def build_qwen_responses_payload(
         "model": model,
         "input": question,
         "tools": [{"type": "web_search"}],
+        # GEO sampling requires auditable web evidence. Qwen rejects required
+        # tool selection while thinking is enabled, so disable it explicitly.
+        "tool_choice": "required",
+        "enable_thinking": False,
     }
     if temperature is not None:
         payload["temperature"] = temperature
@@ -1446,18 +1683,9 @@ def openai_compatible_request(
 ) -> dict[str, Any]:
     if provider == "deepseek" and options["search_enabled"]:
         return deepseek_bocha_tool_request(base, api_key, model, question, temperature, options)
-    tencent_search_payload: dict[str, Any] | None = None
-    external_citations: list[dict[str, str]] = []
-    request_question = question
     if provider == "hunyuan" and options["search_enabled"]:
-        try:
-            tencent_search_payload = tencent_search_request(question, options)
-            tencent_results = tencent_search_payload["results"]
-            external_citations = tencent_search_citations(tencent_results)
-            request_question = build_tencent_augmented_question(question, tencent_results)
-        except AdapterError as exc:
-            raise AdapterError(f"腾讯元宝联网口径依赖腾讯云 SearchPro 失败：{exc}") from exc
-    payload = build_openai_compatible_payload(provider, model, request_question, temperature, options)
+        return hunyuan_search_tool_request(base, api_key, model, question, temperature, options)
+    payload = build_openai_compatible_payload(provider, model, question, temperature, options)
     data = post_json(
         f"{normalize_base(base)}/chat/completions",
         {"Authorization": f"Bearer {api_key}"},
@@ -1472,22 +1700,16 @@ def openai_compatible_request(
         citations = extract_ernie_citations(data)
     elif provider in {"openrouter_gpt", "openrouter_gemini"}:
         citations = extract_openrouter_citations(data)
-    citations = dedupe_citations(external_citations + citations)
-    raw_response: dict[str, Any] = data
-    if tencent_search_payload is not None:
-        raw_response = {
-            f"{provider}_response": data,
-            "tencent_search": tencent_search_payload["raw_response"],
-            "tencent_search_results": tencent_search_payload["results"],
-        }
     response_text = normalize_choice_text(data)
+    if provider == "doubao" and not response_text.strip():
+        raise AdapterError("豆包返回成功但回答内容为空", retryable=True, raw_response=data)
     if provider in {"openrouter_gpt", "openrouter_gemini"}:
         ensure_openrouter_complete_response(data, response_text)
     return {
         "response_text": response_text,
         "citations": citations,
         "usage": data.get("usage", {}),
-        "raw_response": raw_response,
+        "raw_response": data,
         "returned_model": data.get("model", model),
     }
 
@@ -1553,10 +1775,6 @@ def doubao_search_request(
         "model": model,
         "input": [
             {
-                "role": "system",
-                "content": [{"type": "input_text", "text": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。"}],
-            },
-            {
                 "role": "user",
                 "content": [{"type": "input_text", "text": question}],
             },
@@ -1574,6 +1792,9 @@ def doubao_search_request(
     if options["search_user_location"]:
         tool["user_location"] = {"type": "approximate", "city": options["search_user_location"]}
     payload["tools"] = [tool]
+    # The batch's search mode is an evidence contract, not a suggestion. Without
+    # this, the model may answer from parametric knowledge and return no source.
+    payload["tool_choice"] = "required"
     try:
         data = post_json(
             f"{normalize_base(base)}/responses",
@@ -1586,13 +1807,32 @@ def doubao_search_request(
         raise
     response_text = normalize_responses_text(data)
     citations = extract_openai_response_citations(data)
-    if not citations and (
-        "搜索服务暂时无法使用" in response_text
-        or "搜索服务当前无法正常响应" in response_text
-        or "搜索服务当前无法正常获取信息" in response_text
-        or "无法正常获取信息" in response_text
-    ):
-        raise AdapterError("豆包已触发联网搜索，但当前搜索服务未返回可用结果，请稍后重试或先关闭联网搜索。")
+    if not response_text.strip():
+        # Ark currently can return HTTP 200/completed with an empty message when
+        # hosted web_search is forced. Retry once with auto, then keep the audit
+        # contract below: a real search call and a valid citation are mandatory.
+        fallback_payload = deepcopy(payload)
+        fallback_payload["tool_choice"] = "auto"
+        fallback_data = post_json(
+            f"{normalize_base(base)}/responses",
+            {"Authorization": f"Bearer {api_key}"},
+            fallback_payload,
+        )
+        fallback_data = deepcopy(fallback_data)
+        fallback_data["_geo_audit"] = {
+            "tool_choice": "auto",
+            "fallback_from": "required_empty_response",
+            "required_response_id": data.get("id"),
+        }
+        data = fallback_data
+        response_text = normalize_responses_text(data)
+        citations = extract_openai_response_citations(data)
+    if not response_text.strip():
+        raise AdapterError("豆包返回成功但回答内容为空", retryable=True, raw_response=data)
+    if not has_openai_web_search_call(data):
+        raise AdapterError("豆包强制联网未返回 web_search_call，不能作为成功结果保存", retryable=True, raw_response=data)
+    if not has_valid_http_citation(citations):
+        raise AdapterError("豆包强制联网未返回引用，不能作为成功结果保存", retryable=True, raw_response=data)
     return {
         "response_text": response_text,
         "citations": citations,
@@ -1612,10 +1852,7 @@ def kimi_search_request(
 ) -> dict[str, Any]:
     if options["thinking_type"] != "disabled":
         raise AdapterError("Kimi 官方联网搜索要求关闭深度思考，请在采样页关闭深度思考后再试。")
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": "你是制造业品牌 GEO 审计助手。请基于公开信息客观回答。"},
-        {"role": "user", "content": question},
-    ]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
     tool_spec = {
         "type": "builtin_function",
         "function": {
@@ -1908,6 +2145,13 @@ def enrich_model_config(item: dict[str, Any]) -> dict[str, Any]:
     resolved_api_key = resolve_provider_api_key(item.get("provider", ""), api_key)
     safe_item = {**item}
     safe_item.pop("api_key", None)
+    for field in (
+        "supports_pure", "supports_search", "supports_reasoning", "supports_citation",
+        "supports_site_filter", "supports_time_filter", "supports_user_location",
+        "supports_tool_calling", "active",
+    ):
+        if field in safe_item and safe_item[field] is not None:
+            safe_item[field] = bool(safe_item[field])
     return {
         **preset,
         **safe_item,

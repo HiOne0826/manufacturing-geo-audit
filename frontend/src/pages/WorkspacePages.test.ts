@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeQuestionImport, splitModelsForManagement } from "./WorkspacePages";
+import { analyzeQuestionImport, citationUrls, splitModelsForManagement, splitModelsForSampling } from "./WorkspacePages";
 
 describe("question paste import", () => {
   it("recognizes Windows, Unix and classic macOS line endings", () => {
@@ -55,5 +55,48 @@ describe("model management grouping", () => {
 
     expect(groups.current).toEqual([]);
     expect(groups.archived).toHaveLength(2);
+  });
+});
+
+describe("sampling model grouping", () => {
+  it("archives direct GPT, Gemini and DeepSeek official search while keeping current sampling sources visible", () => {
+    const groups = splitModelsForSampling([
+      { id: 1, provider: "openai", label: "GPT", model: "gpt-5.5" },
+      { id: 2, provider: "gemini", label: "Gemini", model: "gemini-2.5-flash" },
+      { id: 3, provider: "deepseek_web", label: "DeepSeek 官网联网搜索", model: "DeepSeek Web" },
+      { id: 4, provider: "minimax", label: "MiniMax", model: "minimax-m2.7" },
+      { id: 5, provider: "openrouter_gpt", label: "OpenRouter-GPT", model: "openai/gpt-5.2" },
+      { id: 6, provider: "openrouter_gemini", label: "OpenRouter-Gemini", model: "google/gemini-2.5-flash" }
+    ]);
+
+    expect(groups.archived.map((model) => model.id)).toEqual([1, 2, 3]);
+    expect(groups.current.map((model) => model.id)).toEqual([4, 5, 6]);
+  });
+});
+
+describe("citation source compatibility", () => {
+  it("renders the same citations from SQLite JSON text and PostgreSQL JSON arrays", () => {
+    const citations = [
+      { url: "https://example.com/a" },
+      { link: "https://example.com/b" },
+      { uri: "https://example.com/a" }
+    ];
+
+    expect(citationUrls(JSON.stringify(citations))).toBe("https://example.com/a; https://example.com/b");
+    expect(citationUrls(citations)).toBe("https://example.com/a; https://example.com/b");
+  });
+
+  it("ignores malformed or unsupported citation payloads", () => {
+    expect(citationUrls("not-json")).toBe("");
+    expect(citationUrls(JSON.stringify({ url: "https://example.com" }))).toBe("");
+    expect(citationUrls()).toBe("");
+  });
+
+  it("rejects unsafe citation protocols from provider responses", () => {
+    expect(citationUrls([
+      { url: "javascript:alert(1)" },
+      { url: "data:text/html,unsafe" },
+      { url: "https://example.com/safe" }
+    ])).toBe("https://example.com/safe");
   });
 });

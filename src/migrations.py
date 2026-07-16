@@ -48,6 +48,8 @@ ACTIVE_BATCH_RECONCILIATION_POSTGRES_PATH = (
     ROOT / "deploy" / "postgres" / "migrations" / "005_active_batch_conflict_reconciliation.sql"
 )
 RELIABILITY_GUARDS_POSTGRES_PATH = ROOT / "deploy" / "postgres" / "migrations" / "006_reliability_concurrency_guards.sql"
+SCHEMA_CONTRACT_COMPAT_POSTGRES_PATH = ROOT / "deploy" / "postgres" / "migrations" / "007_schema_contract_compat.sql"
+PROVIDER_HEALTH_TYPE_ALIGNMENT_POSTGRES_PATH = ROOT / "deploy" / "postgres" / "migrations" / "008_provider_health_type_alignment.sql"
 
 RELIABILITY_GUARDS_SQLITE = """
 ALTER TABLE dispatch_outbox ADD COLUMN claim_token TEXT DEFAULT '';
@@ -171,6 +173,18 @@ MIGRATIONS: tuple[Migration, ...] = (
         name="reliability_concurrency_guards",
         sqlite_sql=_split_sql(RELIABILITY_GUARDS_SQLITE),
         postgres_sql=_split_sql(RELIABILITY_GUARDS_POSTGRES_PATH.read_text(encoding="utf-8")),
+    ),
+    Migration(
+        version=7,
+        name="postgres_schema_contract_compat",
+        sqlite_sql=("SELECT 1",),
+        postgres_sql=_split_sql(SCHEMA_CONTRACT_COMPAT_POSTGRES_PATH.read_text(encoding="utf-8")),
+    ),
+    Migration(
+        version=8,
+        name="provider_health_type_alignment",
+        sqlite_sql=("SELECT 1",),
+        postgres_sql=_split_sql(PROVIDER_HEALTH_TYPE_ALIGNMENT_POSTGRES_PATH.read_text(encoding="utf-8")),
     ),
 )
 

@@ -19,11 +19,17 @@ class ReliabilityContractTests(unittest.TestCase):
     def test_error_taxonomy_distinguishes_terminal_and_retryable_failures(self):
         auth = classify_error("HTTP 401: invalid api key", 401)
         rate_limit = classify_error("HTTP 429: too many requests", 429)
+        empty_response = classify_error("豆包返回成功但回答内容为空", retryable=True)
+        circuit_half_open = classify_error("信息源正在半开试探：doubao/model/search")
         self.assertEqual(auth.code, ErrorCode.AUTH)
         self.assertTrue(auth.terminal)
         self.assertFalse(auth.retryable)
         self.assertEqual(rate_limit.code, ErrorCode.RATE_LIMIT)
         self.assertTrue(rate_limit.retryable)
+        self.assertEqual(empty_response.code, ErrorCode.MALFORMED_RESPONSE)
+        self.assertTrue(empty_response.retryable)
+        self.assertEqual(circuit_half_open.code, ErrorCode.UPSTREAM)
+        self.assertTrue(circuit_half_open.retryable)
 
     def test_batch_outcome_separates_partial_failure_from_system_failure(self):
         self.assertEqual(batch_outcome("completed", 9, 1, 10, 10), "partial_failure")

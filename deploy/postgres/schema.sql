@@ -264,6 +264,16 @@ CREATE TABLE IF NOT EXISTS provider_health_events (
     observed_at TIMESTAMPTZ NOT NULL
 );
 
+-- Existing PostgreSQL tables are not altered by CREATE TABLE IF NOT EXISTS.
+-- Add every column used by the indexes below before creating those indexes.
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS model_config_id BIGINT DEFAULT 0;
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS search_mode TEXT DEFAULT 'off';
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS thinking_type TEXT DEFAULT 'disabled';
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS reasoning_effort TEXT DEFAULT '';
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS thinking_budget INTEGER;
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS repeat_index INTEGER DEFAULT 1;
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS is_current INTEGER DEFAULT 1;
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_model_runs_batch_id ON model_runs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_model_runs_project_id ON model_runs(project_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_runs_one_current

@@ -80,7 +80,7 @@ from src.runtime_env import BOCHA_SEARCH_ENV_KEYS, load_dotenv_file, provider_ha
 from src.runner import estimate_batch_total, prepare_batch_ledger
 from src.reliability import batch_outcome as reliability_batch_outcome, classify_error, stable_config_fingerprint
 from src.reconciler import reconcile_once
-from src.provider_health import credential_fingerprint, list_provider_health, safe_endpoint
+from src.provider_health import circuit_blocks_start, credential_fingerprint, list_provider_health, safe_endpoint
 from src.provider_probes import run_active_probe, start_optional_probe_scheduler
 from src.delivery import (
     DeliveryError,
@@ -120,6 +120,12 @@ SAMPLING_JOBS_LOCK = threading.Lock()
 AUTH_PUBLIC_PATHS = {"/api/health", "/api/health/live", "/api/health/ready", "/api/auth/login", "/api/auth/logout", "/api/auth/status"}
 AUTH_SESSION_TTL_SECONDS = 60 * 60 * 12
 UI_PROVIDER_PRESETS = {key: value for key, value in PROVIDER_PRESETS.items() if key != "mock"}
+
+
+def api_json_default(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def update_env_file_values(path: Path, values: dict[str, str]) -> None:
@@ -338,7 +344,7 @@ def start_preflight(conn, payload: dict) -> dict:
         elif not mode_health.get("ready"):
             blockers.append({"code": "SOURCE_NOT_READY", "message": f"{config.get('label')} 的{mode}模式未就绪", "model_config_id": model_id, "mode": mode, "fix_path": "/settings"})
         passive = [item for item in (health.get("passive") or []) if item.get("model") == config.get("model") and item.get("mode") == mode]
-        if any(item.get("status") in {"open", "half_open"} for item in passive):
+        if any(circuit_blocks_start(item) for item in passive):
             blockers.append({"code": "SOURCE_CIRCUIT_OPEN", "message": f"{config.get('label')} 的{mode}模式正在熔断", "model_config_id": model_id, "mode": mode, "fix_path": "/settings"})
     ready_snapshot, _ = readiness_status(conn)
     for name in ("database", "database_write", "schema", "disk", "redis", "queue", "workers", "worker_heartbeats"):
@@ -1034,7 +1040,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "code": str(data.get("code") or (f"HTTP_{status}" if status >= 400 else "API_ERROR")),
                 "retryable": bool(data.get("retryable", status == 429 or status >= 500)),
             }
-        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        body = json.dumps(data, ensure_ascii=False, default=api_json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

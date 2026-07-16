@@ -17,6 +17,7 @@ from .db import (
     get_model_config,
     get_project,
     get_sampling_task,
+    ensure_sampling_task_dispatch_event,
     insert_evaluation,
     insert_run,
     create_execution_attempt,
@@ -27,11 +28,12 @@ from .db import (
     update_sampling_task,
     is_postgres_conn,
     list_questions,
+    mark_outbox_failed,
     utc_now,
 )
 from .evaluator import evaluate_answer
 from .reliability import classify_error, stable_config_fingerprint
-from .provider_health import assert_circuit_closed, distributed_provider_slot, record_provider_failure, record_provider_success
+from .provider_health import CircuitOpenError, ProviderSlotUnavailable, assert_circuit_closed, distributed_provider_slot, record_provider_failure, record_provider_success
 from .runtime_env import resolve_provider_api_key
 from .worker_health import task_lease_heartbeat
 
@@ -326,6 +328,11 @@ def restore_task_snapshot(conn, ledger: dict[str, Any]) -> tuple[dict[str, Any],
     if snapshot.get("schema_version") != 1 or not snapshot.get("task"):
         return None
     task = json.loads(json.dumps(snapshot["task"], ensure_ascii=False))
+    # DeepSeek web tasks share the sampling_tasks ledger but intentionally use
+    # a different snapshot schema. Never let an incompatible snapshot crash an
+    # API worker if a stale/misrouted RQ job reaches this code path.
+    if not isinstance(task.get("base"), dict) or not isinstance(task.get("model_config"), dict):
+        return None
     task["base"] = {**task["base"], "run_id": f"run-{uuid.uuid4().hex}", "requested_at": utc_now()}
     current_model = get_model_config(conn, int(ledger["model_config_id"])) or {}
     task["model_config"] = {**task["model_config"], "api_key": current_model.get("api_key", "")}
@@ -470,6 +477,21 @@ def execute_sampling_task(
                 latency_ms=int(result.get("latency_ms", 0) or 0), **provider_scope,
             )
         return {**base, "status": "success"}
+    except ProviderSlotUnavailable as exc:
+        if not ledger_task_id:
+            return {**base, "status": "deferred", "error_message": str(exc), "error_code": exc.error_code}
+        with get_conn(db_target) as conn:
+            deferred = defer_sampling_task_for_slot(
+                conn,
+                task_id=ledger_task_id,
+                batch_id=base["batch_id"],
+                lease_owner=lease_owner,
+                attempt_id=attempt_id,
+                message=str(exc),
+            )
+            if not deferred:
+                return {**base, "status": "skipped", "task_id": ledger_task_id, "reason": "lease_lost"}
+        return {**base, "status": "deferred", "task_id": ledger_task_id, "error_message": str(exc), "error_code": exc.error_code}
     except Exception as exc:
         classified = classify_error(str(exc), getattr(exc, "status_code", None), getattr(exc, "retryable", None))
         with get_conn(db_target) as conn:
@@ -516,14 +538,61 @@ def execute_sampling_task(
                     "updated_at": utc_now(),
                 },
             )
-            record_provider_failure(
-                conn, base["provider"], base["model"], "search" if base["search_enabled"] else "pure",
-                classified, str(exc), latency_ms=int((time.monotonic() - call_started) * 1000), **provider_scope,
-            )
+            # CircuitOpenError is a local gate decision, not a fresh upstream
+            # failure. Recording it would extend/reopen the provider circuit.
+            if not isinstance(exc, CircuitOpenError):
+                record_provider_failure(
+                    conn, base["provider"], base["model"], "search" if base["search_enabled"] else "pure",
+                    classified, str(exc), latency_ms=int((time.monotonic() - call_started) * 1000), **provider_scope,
+                )
         return {**base, "status": "failed", "error_message": str(exc), "error_code": classified.code.value}
     finally:
         if heartbeat:
             heartbeat.stop()
+
+
+def defer_sampling_task_for_slot(
+    conn,
+    *,
+    task_id: str,
+    batch_id: str,
+    lease_owner: str,
+    attempt_id: str,
+    message: str,
+) -> bool:
+    """Release a fenced task lease and durably requeue it with outbox backoff."""
+    cursor = conn.execute(
+        """
+        UPDATE sampling_tasks
+        SET status = 'queued', rq_job_id = '', lease_owner = '', lease_expires_at = NULL,
+            heartbeat_at = NULL, error_code = 'provider_slot_busy', error_message = ?, updated_at = ?
+        WHERE task_id = ? AND status = 'running' AND lease_owner = ?
+        """,
+        (message, utc_now(), task_id, lease_owner),
+    )
+    if getattr(cursor, "rowcount", 0) != 1:
+        update_execution_attempt(
+            conn,
+            attempt_id,
+            {
+                "status": "uncertain", "error_code": "lease_lost",
+                "error_message": "任务租约已失效，未重新排队",
+                "finished_at": utc_now(), "updated_at": utc_now(),
+            },
+        )
+        return False
+    update_execution_attempt(
+        conn,
+        attempt_id,
+        {
+            "status": "deferred", "error_code": "provider_slot_busy",
+            "error_message": message, "finished_at": utc_now(), "updated_at": utc_now(),
+        },
+    )
+    dispatch_key = f"slot-{attempt_id}"
+    if ensure_sampling_task_dispatch_event(conn, task_id, batch_id, 0, dispatch_key):
+        mark_outbox_failed(conn, f"dispatch-task:{task_id}:{dispatch_key}", message)
+    return True
 
 
 def build_tasks(
@@ -676,7 +745,7 @@ def run_prepared_tasks(
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 outcome = future.result()
-                if outcome["status"] == "skipped":
+                if outcome["status"] in {"skipped", "deferred"}:
                     continue
                 completed += 1
                 if outcome["status"] == "failed":
