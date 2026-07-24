@@ -22,6 +22,7 @@ from src.adapters import (
     doubao_search_request,
     gemini_request,
     kimi_search_request,
+    normalize_base,
     normalize_choice_text,
     normalize_run_options,
     openai_compatible_request,
@@ -616,6 +617,20 @@ class HarnessHttpTests(unittest.TestCase):
         self.assertTrue(all(item["product_line"] == "FDS" for item in questions))
         self.assertIn("ChatGPT", raw)
 
+    def test_normalize_base_accepts_full_openai_compatible_endpoint(self):
+        self.assertEqual(
+            normalize_base("https://ark.cn-beijing.volces.com/api/v3/chat/completions/"),
+            "https://ark.cn-beijing.volces.com/api/v3",
+        )
+        self.assertEqual(
+            normalize_base("https://ark.cn-beijing.volces.com/api/v3/chat/completions/chat/completions"),
+            "https://ark.cn-beijing.volces.com/api/v3",
+        )
+        self.assertEqual(
+            normalize_base("https://ark.cn-beijing.volces.com/api/v3/responses"),
+            "https://ark.cn-beijing.volces.com/api/v3",
+        )
+
     def test_openai_model_settings_match_hosted_web_search(self):
         self.create_mock_project()
         models = self.request_json("GET", "/api/models")["models"]
@@ -782,10 +797,10 @@ class HarnessHttpTests(unittest.TestCase):
     def test_doubao_pure_chat_retries_empty_response(self):
         options = normalize_run_options({"search_enabled": False, "thinking_type": "disabled"})
         raw_response = {"model": "doubao-test", "choices": [{"message": {"content": ""}}]}
-        with mock.patch("src.adapters.post_json", return_value=raw_response):
+        with mock.patch("src.adapters.post_json", return_value=raw_response) as post_json:
             with self.assertRaises(AdapterError) as ctx:
                 openai_compatible_request(
-                    "https://ark.cn-beijing.volces.com/api/v3",
+                    "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
                     "doubao-test-key",
                     "doubao-test",
                     "用户问题",
@@ -793,6 +808,10 @@ class HarnessHttpTests(unittest.TestCase):
                     "doubao",
                     options,
                 )
+        self.assertEqual(
+            post_json.call_args.args[0],
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        )
         self.assertTrue(ctx.exception.retryable)
         self.assertEqual(ctx.exception.raw_response, raw_response)
         self.assertIn("回答内容为空", str(ctx.exception))

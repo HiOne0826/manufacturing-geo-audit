@@ -478,7 +478,12 @@ def get_json(url: str, headers: dict[str, str]) -> dict[str, Any]:
 
 
 def normalize_base(base: str) -> str:
-    return (base or "").rstrip("/")
+    normalized = (base or "").strip().rstrip("/")
+    # The settings form calls this value "API 地址", so operators sometimes
+    # paste a complete OpenAI-compatible endpoint instead of its base URL.
+    # Request helpers append the route themselves; remove any pasted terminal
+    # route (including an already duplicated one) before doing so.
+    return re.sub(r"(?:/(?:chat/completions|responses))+$", "", normalized)
 
 
 def dashscope_generation_url(base: str) -> str:
